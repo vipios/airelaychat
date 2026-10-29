@@ -75,6 +75,15 @@ enum NetInfo {
         interfaces().first(where: { $0.isWiFi })?.ipv4.first
     }
 
+    /// 是否有「可用的」WiFi IPv4。
+    /// 比看 en0 存不存在更严格：en0 有时存在但没拿到地址（正在连/连了但没 DHCP），
+    /// 那种情况其实等于没有内网，不该按"在家"处理。
+    static func hasUsableWiFi() -> Bool {
+        guard let ip = wifiIPv4() else { return false }
+        // 169.254.x.x 是自分配地址，说明 DHCP 失败，没有真实内网
+        return !ip.hasPrefix("169.254.")
+    }
+
     /// 判断两个 IPv4 是否在同一 /24 网段
     static func sameSubnet24(_ a: String, _ b: String) -> Bool {
         func prefix(_ s: String) -> String? {
