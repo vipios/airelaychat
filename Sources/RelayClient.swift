@@ -179,7 +179,25 @@ final class RelayClient {
         return (hit.base, hit.health)
     }
 
-    // MARK: - 在外判定（先试缓存地址）
+    // MARK: - 在外判定（先试域名，再试缓存 IPv6）
+
+    /// 探测固定域名（Cloudflare 隧道）。
+    ///
+    /// 单独一个方法而不是塞进 probePublic(addrs:)：那条走的是
+    /// `http://[IPv6]:8080`，这条走 `https://域名`（443 + 证书），
+    /// 拼装规则完全不同。
+    ///
+    /// 超时给 8 秒：隧道是设备主动外连、经 Cloudflare 边缘中转，
+    /// 首次握手实测 1~3 秒，8 秒足够；比内网的 0.9 秒宽，但比不带域名的
+    /// IPv6 直连（4 秒×N 个地址串行）总耗时短得多。
+    func probeDomain() async -> (base: String, health: HealthInfo)? {
+        let base = await MainActor.run { settings.domainBase }
+        guard let base = base else { return nil }
+        if let h = await probeHealth(base, timeout: 8.0, session: session) {
+            return (base, h)
+        }
+        return nil
+    }
 
     func probePublic(addrs: [String]) async -> String? {
         let port = await MainActor.run { settings.port }
@@ -300,14 +318,44 @@ final class RelayClient {
         return (.unknown, nil, nil)
     }
 
-    /// 公网地址候选：先试缓存（最快），不行再去 Gist 问最新。
-    /// 缓存和 Gist 的结果都不保留到下次以外的情况，所以这里不用做状态机。
+    /// 公网地址候选：域名和裸 IPv6 同时并发试，谁先回来用谁。
+    ///
+    /// 为什么要并发而不是先域名后 IPv6：IPv6 直连现在基本走不通
+    /// （家宽入站被光猫丢弃，这一点已用防火墙计数器证实），
+    /// 串行的话每次都要先等它超时，在外面冷启动会白等好几秒。
+    /// 并发后总耗时约等于最快那条路的时间。
+    ///
+    /// 域名这条路更可靠，所以它先命中就用它；IPv6 命中说明用户网络
+    /// 恰好可达，也不拦着。
     private func publicCandidate() async -> String? {
         let cached = await MainActor.run { settings.publicAddrs }
-        if let pub = await probePublic(addrs: cached) {
-            return pub
+        let hasDomain = await MainActor.run { !settings.publicDomain.isEmpty }
+
+        if !hasDomain && cached.isEmpty { return nil }
+
+        let hit = await withTaskGroup(of: String?.self) { group -> String? in
+            if hasDomain {
+                group.addTask { [weak self] in
+                    guard let self = self else { return nil }
+                    return await self.probeDomain()?.base
+                }
+            }
+            if !cached.isEmpty {
+                group.addTask { [weak self] in
+                    guard let self = self else { return nil }
+                    return await self.probePublic(addrs: cached)
+                }
+            }
+            var first: String?
+            for await r in group {
+                if let r = r { first = r; break }
+            }
+            group.cancelAll()
+            return first
         }
-        // 缓存失效（运营商换了 IPv6 前缀）：问 Gist 要最新的
+        if let hit = hit { return hit }
+
+        // 缓存全失效（运营商换了 IPv6 前缀）：问 Gist 要最新的
         if let g = await fetchGistAddr(), let ips = g.ipv6, !ips.isEmpty {
             let newPort = (g.port ?? 0) > 0 ? g.port! : 0
             await MainActor.run {
