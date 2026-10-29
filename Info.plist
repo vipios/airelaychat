@@ -17,9 +17,9 @@
 	<key>CFBundlePackageType</key>
 	<string>APPL</string>
 	<key>CFBundleShortVersionString</key>
-	<string>1.0.0</string>
+	<string>1.3.0</string>
 	<key>CFBundleVersion</key>
-	<string>1</string>
+	<string>13</string>
 	<key>LSRequiresIPhoneOS</key>
 	<true/>
 
@@ -46,6 +46,15 @@
 	<!-- 按住说话转文字 -->
 	<key>NSSpeechRecognitionUsageDescription</key>
 	<string>把你说的话转成文字，填进输入框。</string>
+
+	<!-- 家里地址上报渠道。
+	     真实值不写进源码：仓库是公开的，写死等于把家里的公网地址公开。
+	     构建时由 workflow 从 GitHub Secret 注入（GIST_ID / GIST_OWNER）。
+	     本地手动构建可以自己填，填了才有「在外自动找地址」的能力。 -->
+	<key>AIRelayGistId</key>
+	<string>$(GIST_ID)</string>
+	<key>AIRelayGistOwner</key>
+	<string>$(GIST_OWNER)</string>
 
 	<key>UILaunchScreen</key>
 	<dict>
