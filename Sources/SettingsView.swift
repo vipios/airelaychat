@@ -190,10 +190,19 @@ struct SettingsView: View {
                     .autocorrectionDisabled()
                     .textInputAutocapitalization(.never)
             }
+            HStack {
+                Text("固定域名")
+                Spacer()
+                TextField("在外面用", text: $settings.publicDomain)
+                    .multilineTextAlignment(.trailing)
+                    .keyboardType(.URL)
+                    .autocorrectionDisabled()
+                    .textInputAutocapitalization(.never)
+            }
         } header: {
             Text("家里中转站")
         } footer: {
-            Text("地址留空会自动试常见网段，哪个通用哪个并记住。密钥就是中转站后台的访问密钥。")
+            Text("地址留空会自动试常见网段，哪个通用哪个并记住。密钥就是中转站后台的访问密钥。\n\n固定域名填中转站的公网域名（如 your.domain.com）。填了之后在外面优先走它，不依赖手机有没有 IPv6。")
         }
     }
 
