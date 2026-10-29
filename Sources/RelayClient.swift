@@ -88,6 +88,13 @@ private func probeHealth(_ base: String, timeout: TimeInterval,
     }
 }
 
+/// 并发探测的两种结果：家里内网命中 / 公网命中。
+/// 定义成文件级类型而不是函数内嵌套，为了能安全地跨 TaskGroup 传递。
+private enum ProbeHit {
+    case lan(String, HealthInfo)
+    case pub(String)
+}
+
 /// 并发探一批地址，返回第一个通的。
 ///
 /// 为什么要并发：串行时每个不通的地址都要等满自己的超时（内网 2 秒、公网 4 秒），
@@ -135,6 +142,19 @@ final class RelayClient {
         return URLSession(configuration: c)
     }()
 
+    /// 专门给内网探测用的会话：超时短、不走缓存。
+    /// 单独一个的好处是 request 级 timeoutInterval 不会被连接复用后的行为影响，
+    /// 探测结果更接近真实耗时。
+    private let lanSession: URLSession = {
+        let c = URLSessionConfiguration.ephemeral
+        c.timeoutIntervalForRequest = 1.0
+        c.timeoutIntervalForResource = 1.5
+        c.waitsForConnectivity = false
+        c.requestCachePolicy = .reloadIgnoringLocalCacheData
+        c.httpShouldUsePipelining = true
+        return URLSession(configuration: c)
+    }()
+
     private func get(_ urlString: String, timeout: TimeInterval = 3) async throws -> (Int, Data) {
         try await httpGet(urlString, timeout: timeout, session: session)
     }
@@ -143,12 +163,14 @@ final class RelayClient {
 
     /// 内网通了 = 在家。比读 WiFi 名字可靠得多，也不需要定位权限。
     /// 按多个候选地址并发试：不同 WiFi 下手机拿到的网段不同，只试一个会误判成"在外"。
+    ///
+    /// 超时压到 0.9 秒：同一网段的路由器 20~50 毫秒就回，0.9 秒还不回来
+    /// 基本可以断定不在这个网段，继续等只是浪费用户时间。
     func probeLAN() async -> (base: String, health: HealthInfo)? {
         let hosts = await MainActor.run { settings.lanCandidates }
         let port = await MainActor.run { settings.port }
         let bases = hosts.map { "http://\($0):\(port)" }
-        // 内网响应极快，2 秒不回来基本就是不在家
-        guard let hit = await firstAlive(bases, timeout: 2.0, session: session) else { return nil }
+        guard let hit = await firstAlive(bases, timeout: 0.9, session: lanSession) else { return nil }
         let host = hosts[hit.index]
         // 记住这次能通的地址，下次优先试它（只有真的变了才写，避免反复落盘）
         await MainActor.run {
@@ -219,34 +241,82 @@ final class RelayClient {
     /// 返回 (场景, 可用 base, health)。会顺带更新缓存的公网地址。
     /// 注意：settings 的 @Published 属性只能在主线程改，否则 SwiftUI 会
     /// 报 "Publishing changes from background threads"，界面还可能不刷新。
+    ///
+    /// 设计要点（2026-10-29 重构）：
+    /// 用户的原话是「连 WiFi 就是在家里，没连 WiFi 就是外面」。
+    /// 所以第一判断不用"能不能连通"（那要等超时），而是"手机有没有拿 WiFi IP"——
+    /// 这个从网卡直接读，零权限、零延迟、不会猜错。
+    ///
+    /// 有 WiFi 时也不再去猜家里是哪个地址：内网候选和 Gist 地址同时并发探，
+    /// 谁先回来用谁。这样「连了别的 WiFi（比如公司）」也能自动落到公网地址，
+    /// 不会傻等内网超时。
     func resolve() async -> (place: NetPlace, base: String?, health: HealthInfo?) {
-        // 1) 在家：内网通了就是在家，顺手把服务器自己报的公网地址存下来
-        if let lan = await probeLAN() {
-            if let addrs = lan.health.addrs, !addrs.isEmpty {
-                await MainActor.run { settings.publicAddrs = addrs }
+        let onWiFi = NetInfo.hasUsableWiFi()
+
+        if onWiFi {
+            // 在家/在别的 WiFi：内网候选 + 公网地址 并行探，谁通用谁。
+            // 用 TaskGroup 而不是 async let：内网先回来时能显式中断另一路，
+            // 也不会因为 return 提前离开作用域产生"未 await"的警告。
+            let hit = await withTaskGroup(of: ProbeHit?.self) { group -> ProbeHit? in
+                group.addTask { [weak self] in
+                    guard let self = self else { return nil }
+                    if let l = await self.probeLAN() { return .lan(l.base, l.health) }
+                    return nil
+                }
+                group.addTask { [weak self] in
+                    guard let self = self else { return nil }
+                    if let p = await self.publicCandidate() { return .pub(p) }
+                    return nil
+                }
+                var lanHit: ProbeHit?
+                var pubHit: ProbeHit?
+                for await r in group {
+                    guard let r = r else { continue }
+                    if case .lan = r { lanHit = r; group.cancelAll(); break }
+                    if case .pub = r, pubHit == nil { pubHit = r }
+                    // 内网结果还没来之前，公网先到了也先记着，不立刻中断：
+                    // 连 WiFi 时优先内网（更快更稳），但万一内网全不通还能兜底。
+                }
+                return lanHit ?? pubHit
             }
-            return (.home, lan.base, lan.health)
+
+            switch hit {
+            case .lan(let base, let health):
+                if let addrs = health.addrs, !addrs.isEmpty {
+                    await MainActor.run { settings.publicAddrs = addrs }
+                }
+                return (.home, base, health)
+            case .pub(let pub):
+                return (.away, pub, nil)
+            case .none:
+                return (.unknown, nil, nil)
+            }
         }
 
-        // 2) 在外：先用上次缓存的地址（绝大多数时候这一步就通了，最快）
-        let cached = await MainActor.run { settings.publicAddrs }
-        if let pub = await probePublic(addrs: cached) {
+        // 没连 WiFi（流量）：直接走公网，一步到位
+        if let pub = await publicCandidate() {
             return (.away, pub, nil)
         }
+        return (.unknown, nil, nil)
+    }
 
-        // 3) 缓存失效（运营商换了前缀）：问 Gist 要最新地址再试一次
+    /// 公网地址候选：先试缓存（最快），不行再去 Gist 问最新。
+    /// 缓存和 Gist 的结果都不保留到下次以外的情况，所以这里不用做状态机。
+    private func publicCandidate() async -> String? {
+        let cached = await MainActor.run { settings.publicAddrs }
+        if let pub = await probePublic(addrs: cached) {
+            return pub
+        }
+        // 缓存失效（运营商换了 IPv6 前缀）：问 Gist 要最新的
         if let g = await fetchGistAddr(), let ips = g.ipv6, !ips.isEmpty {
             let newPort = (g.port ?? 0) > 0 ? g.port! : 0
             await MainActor.run {
                 settings.publicAddrs = ips
                 if newPort > 0 { settings.port = newPort }
             }
-            if let pub = await probePublic(addrs: ips) {
-                return (.away, pub, nil)
-            }
+            return await probePublic(addrs: ips)
         }
-
-        return (.unknown, nil, nil)
+        return nil
     }
 
     /// 解析某个来源实际要用的 base。
