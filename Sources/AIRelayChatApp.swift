@@ -22,6 +22,8 @@ struct AIRelayChatApp: App {
                         Task { await store.refreshIfNeeded() }
                     }
                 }
+                // 深色模式下顶部状态文字要看清
+                .preferredColorScheme(nil)
         }
     }
 }
