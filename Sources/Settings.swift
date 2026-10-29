@@ -194,12 +194,30 @@ final class Settings: ObservableObject {
     var lanBase: String { "http://\(lanHost.isEmpty ? "192.168.1.88" : lanHost):\(port)" }
 
     /// 在家判定要试的内网地址，按优先级排列。
+    ///
     /// 为什么不止一个：路由器在内网是 192.168.2.1，同时挂了个 192.168.1.x 别名；
     /// 手机连光猫 WiFi 和连路由器 WiFi 拿到的网段不一样，只写死一个会出现
     /// "明明在家却判定成在外面"。
+    ///
+    /// 更进一步：手机当前 WiFi 是 192.168.31.x 这种从没见过的网段时，
+    /// 上面几个固定地址全都试不通。所以这里还会根据手机自己的 IP
+    /// 推导出同网段的 .1 / .88 / .250，覆盖绝大多数路由器默认地址。
     var lanCandidates: [String] {
         var list: [String] = []
         if !lanHost.isEmpty { list.append(lanHost) }
+
+        // 手机当前所在网段推导出来的候选（最能反映"现在这个 WiFi"）
+        if let myIP = NetInfo.wifiIPv4() {
+            let parts = myIP.split(separator: ".")
+            if parts.count == 4 {
+                let seg = "\(parts[0]).\(parts[1]).\(parts[2])"
+                for tail in ["1", "88", "250"] {
+                    let h = "\(seg).\(tail)"
+                    if !list.contains(h) { list.append(h) }
+                }
+            }
+        }
+
         for h in ["192.168.2.1", "192.168.1.88", "192.168.1.250"] where !list.contains(h) {
             list.append(h)
         }
