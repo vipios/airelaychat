@@ -59,7 +59,7 @@ struct ChatView: View {
                 Text(store.currentModel.isEmpty ? "选择模型" : store.currentModel)
                     .font(.system(size: 15, weight: .semibold))
                     .lineLimit(1)
-                Text(store.place.rawValue)
+                Text(store.detecting ? "检测中…" : store.place.rawValue)
                     .font(.system(size: 11))
                     .foregroundStyle(.secondary)
             }
