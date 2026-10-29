@@ -9,9 +9,23 @@ import SwiftUI
 ///
 /// 为什么用 SFSpeechRecognizer 而不是先录音再发：要「按住就说、松手出字」，
 /// 边说边识别体验最好，也省去一次文件读写。识别走系统服务，不消耗中转站的额度。
+///
+/// ## 2026-10-29 修的两个 bug
+///
+/// **1. 识别结果重复（说一句"喂"出来"喂喂喂喂"）**
+/// 根因是 `start()` 里 `recording` 是在最后才置 true，而这之前有
+/// `await ensurePermission()` 的异步等待。按钮的 onChanged 每帧都触发，
+/// 于是这个守卫形同虚设 —— 一次按住会真的启动好几个 AVAudioEngine，
+/// 每个都往自己的识别请求里塞同一段麦克风数据，识别器就听到了 N 遍。
+/// 现在用 `starting` 同步置位堵死并发，并用 `generation` 让过期回调失效。
+///
+/// **2. 权限弹窗期间松手，麦克风停不下来**
+/// `stop()` 里 `guard recording` 会在 start 还没完成时直接返回，
+/// 之后 start 完成把 recording 置 true，录音就一直开着。
+/// 现在 stop 会先记 `pendingStop`，start 一完成立刻自我收尾。
 @MainActor
 final class VoiceInput: ObservableObject {
-    /// 正在录
+    /// 正在录（麦克风已开、识别已开始）
     @Published var recording = false
     /// 实时识别的中间结果（按住时显示）
     @Published var partial = ""
@@ -25,13 +39,20 @@ final class VoiceInput: ObservableObject {
     private var task: SFSpeechRecognitionTask?
     private let recognizer = SFSpeechRecognizer(locale: Locale(identifier: "zh-CN"))
 
+    /// 启动流程进行中（含等待权限）。同步置位，用来挡住重复启动。
+    private var starting = false
+    /// 启动还没完成时用户就松手了
+    private var pendingStop = false
+    /// 每次启动递增，回调里比对不上就丢弃（防止上一轮的迟到结果污染这一轮）
+    private var generation = 0
+
     /// 松手时回调，参数是最终文字。空字符串表示没识别出来。
     var onFinish: ((String) -> Void)?
 
     // MARK: 权限
 
     /// 麦克风 + 语音识别两套权限都要。任何一个是拒绝状态就返回 false。
-    func ensurePermission() async -> Bool {
+    private func ensurePermission() async -> Bool {
         let mic = await withCheckedContinuation { (c: CheckedContinuation<Bool, Never>) in
             AVAudioSession.sharedInstance().requestRecordPermission { c.resume(returning: $0) }
         }
@@ -69,12 +90,28 @@ final class VoiceInput: ObservableObject {
     // MARK: 开始 / 结束
 
     func start() async {
-        guard !recording else { return }
+        // 这两行是同步的，能挡住 onChanged 的连发
+        guard !starting, !recording else { return }
+        starting = true
+        pendingStop = false
+        generation += 1
+        let gen = generation
+
         error = nil
         partial = ""
         denied = false
 
+        // 上一轮如果还留了东西，先彻底清掉（避免 tap 叠加导致重复识别）
+        teardown()
+
+        defer {
+            // 走到这里说明启动流程结束（无论成功失败）
+            if generation == gen { starting = false }
+        }
+
         guard await ensurePermission() else { return }
+        // 等权限期间用户可能已经松手
+        guard generation == gen, !pendingStop else { return }
 
         do {
             let session = AVAudioSession.sharedInstance()
@@ -104,35 +141,52 @@ final class VoiceInput: ObservableObject {
 
             task = recognizer?.recognitionTask(with: req) { [weak self] result, err in
                 Task { @MainActor in
-                    guard let self = self else { return }
+                    guard let self = self, self.generation == gen else { return }
                     if let r = result {
                         self.partial = r.bestTranscription.formattedString
                     }
                     if err != nil {
                         // 识别结束或出错；没拿到字就报个温和的提示
-                        if self.partial.isEmpty { self.error = "没听清，再说一次？" }
+                        if self.partial.isEmpty, self.recording {
+                            self.error = "没听清，再说一次？"
+                        }
                     }
                 }
             }
 
             recording = true
+
+            // 关键：启动期间用户已经松手了，这里立刻自我收尾
+            if pendingStop {
+                pendingStop = false
+                stop()
+            }
         } catch {
             self.error = "录音启动失败：\(error.localizedDescription)"
-            cleanup()
+            teardown()
         }
     }
 
     /// 松手：结束识别，把最终文字回调出去
     func stop() {
+        // 还在启动（比如权限弹窗）——记下来，start 完成时会自动收尾
+        if starting && !recording {
+            pendingStop = true
+            return
+        }
         guard recording else { return }
+
         let text = partial.trimmingCharacters(in: .whitespacesAndNewlines)
         recording = false
+        let gen = generation
 
         request?.endAudio()
         // 给识别器一点时间吐出最后几个字，再收尾
         Task {
             try? await Task.sleep(nanoseconds: 350_000_000)
-            self.cleanup()
+            // 这期间用户又按下了新的一轮，就别清掉新的状态
+            guard self.generation == gen else { return }
+            self.teardown()
             let final = self.partial.trimmingCharacters(in: .whitespacesAndNewlines)
             let out = final.isEmpty ? text : final
             self.partial = ""
@@ -146,15 +200,21 @@ final class VoiceInput: ObservableObject {
 
     /// 用户中途取消（比如手指滑开了）
     func cancel() {
+        if starting && !recording {
+            pendingStop = true
+            return
+        }
         guard recording else { return }
         recording = false
         partial = ""
-        cleanup()
+        generation += 1   // 让这一轮的迟到回调全部失效
+        teardown()
     }
 
-    private func cleanup() {
+    private func teardown() {
         if let e = engine {
             if e.isRunning { e.stop() }
+            // removeTap 在没装过 tap 时会抛异常，判一下更稳
             e.inputNode.removeTap(onBus: 0)
         }
         engine = nil
@@ -162,6 +222,6 @@ final class VoiceInput: ObservableObject {
         task?.cancel()
         task = nil
         try? AVAudioSession.sharedInstance().setActive(false,
-                                                     options: .notifyOthersOnDeactivation)
+                                                    options: .notifyOthersOnDeactivation)
     }
 }
