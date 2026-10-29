@@ -106,6 +106,9 @@ final class Settings: ObservableObject {
     static let shared = Settings()
 
     @Published var lanHost: String { didSet { store() } }
+    /// 固定域名（Cloudflare 隧道）。这条路径不依赖 IPv6 前缀、不需要端口、
+    /// 不受运营商 CGNAT 影响，是「在外面」最稳的一条路，所以排在最前面试。
+    @Published var publicDomain: String { didSet { store() } }
     @Published var publicAddrs: [String] { didSet { store() } }
     @Published var gatewayKey: String { didSet { store() } }
     @Published var homeModel: String { didSet { store() } }
@@ -122,6 +125,7 @@ final class Settings: ObservableObject {
 
     private struct Stored: Codable {
         var lanHost: String
+        var publicDomain: String?
         var publicAddrs: [String]
         var gatewayKey: String
         var homeModel: String
@@ -152,7 +156,7 @@ final class Settings: ObservableObject {
         // 从 v1 迁移（老用户不用重新填 key）
         if s == nil, let old = UserDefaults.standard.data(forKey: oldKey),
            let v1 = try? JSONDecoder().decode(StoredV1.self, from: old) {
-            s = Stored(lanHost: v1.lanHost, publicAddrs: v1.publicAddrs,
+            s = Stored(lanHost: v1.lanHost, publicDomain: nil, publicAddrs: v1.publicAddrs,
                        gatewayKey: v1.gatewayKey, homeModel: v1.homeModel,
                        awayModel: v1.awayModel, port: v1.port, gistId: v1.gistId,
                        gistOwner: v1.gistOwner, providers: nil, activeProvider: nil)
@@ -161,6 +165,10 @@ final class Settings: ObservableObject {
         // 默认值故意留空：第一次打开会按常见网段依次并发试，谁通用谁并记住。
         // 写死一个 IP 在不同 WiFi 下必然连不上。
         lanHost = s?.lanHost ?? ""
+        // 默认值从 Info.plist 读（构建时注入），和 Gist 一样不在源码里写死域名
+        publicDomain = s?.publicDomain
+            ?? Bundle.main.infoDictionary?["AIRelayPublicDomain"] as? String
+            ?? ""
         publicAddrs = s?.publicAddrs ?? []
         gatewayKey = s?.gatewayKey ?? ""
         homeModel = s?.homeModel ?? ""
@@ -181,7 +189,8 @@ final class Settings: ObservableObject {
     }
 
     private func store() {
-        let s = Stored(lanHost: lanHost, publicAddrs: publicAddrs, gatewayKey: gatewayKey,
+        let s = Stored(lanHost: lanHost, publicDomain: publicDomain, publicAddrs: publicAddrs,
+                       gatewayKey: gatewayKey,
                        homeModel: homeModel, awayModel: awayModel, port: port,
                        gistId: gistId, gistOwner: gistOwner,
                        providers: providers, activeProvider: activeProvider)
@@ -231,6 +240,23 @@ final class Settings: ObservableObject {
     }
 
     // MARK: 来源
+
+    /// 固定域名基地址（没有配置就返回 nil）。
+    ///
+    /// 为什么单列一条而不是塞进 publicAddrs：publicAddrs 里存的是裸 IPv6，
+    /// 拼装方式是 `http://[ip]:port`；域名走的是 `https://域`（443、带证书）。
+    /// 两者协议、端口、证书校验都不同，混在一个数组里会互相污染。
+    var domainBase: String? {
+        let d = publicDomain.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !d.isEmpty else { return nil }
+        // 用户可能连 https:// 一起粘进来，剥掉再统一拼
+        var host = d
+        for p in ["https://", "http://"] where host.lowercased().hasPrefix(p) {
+            host = String(host.dropFirst(p.count))
+        }
+        while host.hasSuffix("/") { host.removeLast() }
+        return host.isEmpty ? nil : "https://" + host
+    }
 
     var homeProvider: Provider? { providers.first(where: { $0.isHome }) }
 
