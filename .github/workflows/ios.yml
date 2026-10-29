@@ -29,6 +29,7 @@ jobs:
           # 真实值从 GitHub Secret 注入，公开仓库也不会泄露。
           GIST_ID: ${{ secrets.GIST_ID }}
           GIST_OWNER: ${{ secrets.GIST_OWNER }}
+          PUBLIC_DOMAIN: ${{ secrets.PUBLIC_DOMAIN }}
         run: |
           xcodegen generate
           ls -d *.xcodeproj
@@ -62,6 +63,16 @@ jobs:
           fi
           echo "=== 注入结果（不打印真实值） ==="
           /usr/libexec/PlistBuddy -c "Print :AIRelayGistId" Info.plist 2>/dev/null | head -c 4 | sed 's/$/****/' || echo "(无)"
+
+          # 固定域名同样从 Secret 注入。没有 Secret 时留空，
+          # App 会自动跳过域名这条路（退回裸 IPv6），不会崩。
+          if [ -n "${PUBLIC_DOMAIN}" ]; then
+            /usr/libexec/PlistBuddy -c "Set :AIRelayPublicDomain ${PUBLIC_DOMAIN}" Info.plist
+            echo "PUBLIC_DOMAIN 已注入 (${#PUBLIC_DOMAIN} 字符)"
+          else
+            /usr/libexec/PlistBuddy -c "Delete :AIRelayPublicDomain" Info.plist 2>/dev/null || true
+            echo "::warning::PUBLIC_DOMAIN 为空 —— 在外面只能退回裸 IPv6"
+          fi
 
       - name: 编译（不签名）
         run: |
