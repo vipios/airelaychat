@@ -29,24 +29,25 @@ enum NetInfo {
         var out: [NetIface] = []
         var addrs: UnsafeMutablePointer<ifaddrs>?
         guard getifaddrs(&addrs) == 0, let first = addrs else { return [] }
-        defer { freeifaddrs(addrs) }
+        defer { freeifaddrs(first) }
 
         var table: [String: (v4: [String], v6: [String])] = [:]
-        var p = first
-        while true {
-            let ifa = p.pointee
+        var p: UnsafeMutablePointer<ifaddrs>? = first
+        while let cur = p {
+            let ifa = cur.pointee
             let name = String(cString: ifa.ifa_name)
             if let sa = ifa.ifa_addr {
-                let family = sa.pointee.sa_family
-                if family == UInt8(AF_INET) || family == UInt8(AF_INET6) {
+                let family = Int32(sa.pointee.sa_family)
+                if family == AF_INET || family == AF_INET6 {
                     var host = [CChar](repeating: 0, count: Int(NI_MAXHOST))
+                    // sa_len 在 iOS 上是 UInt8，直接转 socklen_t
                     let len = socklen_t(sa.pointee.sa_len)
                     if getnameinfo(sa, len, &host, socklen_t(host.count),
                                    nil, 0, NI_NUMERICHOST) == 0 {
                         let ip = String(cString: host)
                         var e = table[name] ?? ([], [])
                         // 过滤链路本地地址，对判断没意义还占篇幅
-                        if family == UInt8(AF_INET) {
+                        if family == AF_INET {
                             e.v4.append(ip)
                         } else if !ip.hasPrefix("fe80") {
                             e.v6.append(ip)
@@ -55,8 +56,7 @@ enum NetInfo {
                     }
                 }
             }
-            guard let next = ifa.ifa_next else { break }
-            p = next
+            p = ifa.ifa_next
         }
 
         // en0 排前面，其余按名字
