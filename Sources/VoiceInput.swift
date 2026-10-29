@@ -41,7 +41,7 @@ final class VoiceInput: ObservableObject {
             return false
         }
 
-        let speech = await withCheckedContinuation { (c: CheckedContinuation<SFSpeechRecognizer.Status, Never>) in
+        let speech = await withCheckedContinuation { (c: CheckedContinuation<SFSpeechRecognizerAuthorizationStatus, Never>) in
             SFSpeechRecognizer.requestAuthorization { c.resume(returning: $0) }
         }
         guard speech == .authorized else {
