@@ -36,6 +36,14 @@
 	<key>NSLocalNetworkUsageDescription</key>
 	<string>需要访问你家里路由器上的 AI 中转站，才能聊天。</string>
 
+	<!-- 选照片/视频、拍照 -->
+	<key>NSPhotoLibraryUsageDescription</key>
+	<string>选择照片或视频发给 AI 分析。</string>
+	<key>NSCameraUsageDescription</key>
+	<string>拍一张照片发给 AI 分析。</string>
+	<key>NSMicrophoneUsageDescription</key>
+	<string>录制视频时需要使用麦克风。</string>
+
 	<key>UILaunchScreen</key>
 	<dict>
 		<key>UIColorName</key>
