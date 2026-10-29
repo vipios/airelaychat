@@ -136,8 +136,8 @@ final class Diagnostics: ObservableObject {
             return "手机没有网络"
         case NSURLErrorNoPermissionsToReadFile:
             return "没有权限"
-        case NSURLErrorAppTransportSecurityRequiresSecureConnection:
-            return "被 ATS 拦截（Info.plist 没放开 http）"
+        case NSURLErrorSecureConnectionFailed:
+            return "安全连接失败（若要访问 http 需在 Info.plist 放开 ATS）"
         default:
             return "错误 \(e.code)：\(e.localizedDescription)"
         }
