@@ -30,6 +30,7 @@ struct HoldToTalkButton: View {
                     .onChanged { g in
                         guard !disabled else { return }
                         if !pressing {
+                            // pressing 是 @State，同步置位，onChanged 每帧连发也只会进一次
                             pressing = true
                             cancelled = false
                             voice.onFinish = { text in onText(text) }
@@ -49,10 +50,13 @@ struct HoldToTalkButton: View {
                         }
                     }
                     .onEnded { _ in
+                        guard pressing else { return }
                         pressing = false
-                        guard !disabled else { return }
-                        if voice.recording { voice.stop() }
+                        let wasCancelled = cancelled
                         cancelled = false
+                        guard !disabled else { return }
+                        // 取消过的不要再 stop（否则会把已经丢掉的结果又送一遍）
+                        if !wasCancelled { voice.stop() }
                     }
             )
             .overlay(alignment: .top) {
