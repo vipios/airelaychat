@@ -25,11 +25,18 @@ jobs:
 
       - name: 生成 Xcode 工程
         run: |
-          echo "当前目录: $(pwd)"
-          ls -la
           xcodegen generate
-          echo "--- 生成结果 ---"
           ls -d *.xcodeproj
+          echo "=== 原始工程格式 ==="
+          grep -m1 "objectVersion" AIRelayChat.xcodeproj/project.pbxproj || true
+
+          # XcodeGen 新版输出 objectVersion=77（Xcode 16 格式），
+          # runner 上是 Xcode 15.x 会报 "future Xcode project file format"。
+          # 直接把格式号改成 56（Xcode 15 兼容），工程结构本身没变，可安全降级。
+          sed -i '' 's/objectVersion = 77;/objectVersion = 56;/' AIRelayChat.xcodeproj/project.pbxproj
+          sed -i '' 's/objectVersion = 70;/objectVersion = 56;/' AIRelayChat.xcodeproj/project.pbxproj
+          echo "=== 修正后格式 ==="
+          grep -m1 "objectVersion" AIRelayChat.xcodeproj/project.pbxproj || true
 
       - name: 编译（不签名）
         run: |
