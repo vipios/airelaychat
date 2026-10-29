@@ -21,6 +21,9 @@ struct AIRelayChatApp: App {
                     // 从后台切回来时轻量重连：出门/回家立刻生效，不用杀 App
                     if phase == .active {
                         Task { await store.refreshIfNeeded() }
+                    } else if phase == .background {
+                        // 进后台时把对话落盘，避免被系统回收后丢历史
+                        store.syncCurrentSession()
                     }
                 }
                 .modifier(NetworkChangeWatcher {

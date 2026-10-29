@@ -22,8 +22,122 @@ final class ChatStore: ObservableObject {
     /// 当前模型不支持附件时，提示里给的一键换模型候选
     @Published var capSuggestion: String?
 
+    // MARK: 会话（抽屉里的任务列表）
+
+    @Published var sessions: [Session] = []
+    @Published var currentSessionId: String = ""
+
     private let client = RelayClient.shared
     private let settings = Settings.shared
+
+    init() {
+        let loaded = SessionStore.load()
+        if loaded.isEmpty {
+            let s = Session()
+            sessions = [s]
+            currentSessionId = s.id
+        } else {
+            sessions = loaded
+            // 默认打开最近用过的那一个
+            let top = loaded.max(by: { $0.updatedAt < $1.updatedAt }) ?? loaded[0]
+            currentSessionId = top.id
+            messages = top.messages.map { $0.toChatMessage() }
+        }
+    }
+
+    // MARK: 会话操作
+
+    /// 把界面上的消息写回当前会话，并落盘。
+    /// 流式输出过程中不调用（太频繁），只在发送结束、切会话、进后台时调。
+    func syncCurrentSession() {
+        guard let i = sessions.firstIndex(where: { $0.id == currentSessionId }) else { return }
+        sessions[i].messages = messages.map { StoredMessage($0) }
+        sessions[i].updatedAt = Date()
+        // 标题自动取第一条用户消息，用户手动改过的就不再覆盖
+        if sessions[i].title.isEmpty,
+           let first = messages.first(where: { $0.role == "user" && !$0.text.isEmpty }) {
+            let t = first.text.replacingOccurrences(of: "\n", with: " ")
+            sessions[i].title = String(t.prefix(20))
+        }
+        SessionStore.save(sessions)
+    }
+
+    func newSession() {
+        syncCurrentSession()
+        // 当前已经是空会话就复用，别堆一堆空壳
+        if let cur = sessions.first(where: { $0.id == currentSessionId }), cur.isEmpty {
+            messages = []
+            input = ""
+            pending = []
+            errorText = nil
+            capSuggestion = nil
+            return
+        }
+        let s = Session()
+        sessions.insert(s, at: 0)
+        currentSessionId = s.id
+        messages = []
+        input = ""
+        pending = []
+        errorText = nil
+        capSuggestion = nil
+        SessionStore.save(sessions)
+    }
+
+    func openSession(_ id: String) {
+        guard id != currentSessionId else { return }
+        syncCurrentSession()
+        guard let s = sessions.first(where: { $0.id == id }) else { return }
+        currentSessionId = id
+        messages = s.messages.map { $0.toChatMessage() }
+        input = ""
+        pending = []
+        errorText = nil
+        capSuggestion = nil
+        if base == nil { Task { await bootstrap(loadModels: false) } }
+    }
+
+    func renameSession(_ id: String, to title: String) {
+        let t = title.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !t.isEmpty, let i = sessions.firstIndex(where: { $0.id == id }) else { return }
+        sessions[i].title = t
+        SessionStore.save(sessions)
+    }
+
+    func deleteSession(_ id: String) {
+        sessions.removeAll { $0.id == id }
+        if sessions.isEmpty {
+            let s = Session()
+            sessions = [s]
+            currentSessionId = s.id
+            messages = []
+        } else if currentSessionId == id {
+            let top = sessions.max(by: { $0.updatedAt < $1.updatedAt }) ?? sessions[0]
+            currentSessionId = top.id
+            messages = top.messages.map { $0.toChatMessage() }
+        }
+        SessionStore.save(sessions)
+    }
+
+    /// 抽屉里要显示的分组
+    func groupedSessions(query q: String) -> [SessionBucket] {
+        let key = q.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        var pool = sessions.filter { !$0.isEmpty }
+        if !key.isEmpty {
+            pool = pool.filter {
+                $0.displayTitle.lowercased().contains(key)
+                || $0.previewText.lowercased().contains(key)
+            }
+        }
+        pool.sort { $0.updatedAt > $1.updatedAt }
+
+        var buckets: [SessionGroup: [Session]] = [:]
+        for s in pool { buckets[SessionGroup.group(of: s.updatedAt), default: []].append(s) }
+        return SessionGroup.allCases.compactMap { g in
+            guard let items = buckets[g], !items.isEmpty else { return nil }
+            return SessionBucket(group: g, items: items)
+        }
+    }
 
     // MARK: 来源
 
@@ -277,6 +391,7 @@ final class ChatStore: ObservableObject {
             await bootstrap(loadModels: false)
         }
         sending = false
+        syncCurrentSession()
     }
 
     /// 重发最后一条用户消息
@@ -302,6 +417,7 @@ final class ChatStore: ObservableObject {
         pending = []
         errorText = nil
         capSuggestion = nil
+        syncCurrentSession()
     }
 
     /// 切到建议的模型，并把刚被拦下的附件放回去让用户直接重发
@@ -310,5 +426,13 @@ final class ChatStore: ObservableObject {
         currentModel = s
         capSuggestion = nil
         errorText = nil
+    }
+
+    /// 把模型切成能处理当前附件的那一个（顶栏一个按钮直达）
+    func switchToFitModel() {
+        guard let fit = capFitModels.first else { return }
+        currentModel = fit.id
+        errorText = nil
+        capSuggestion = nil
     }
 }

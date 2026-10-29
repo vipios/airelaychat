@@ -241,6 +241,30 @@ final class Settings: ObservableObject {
 
     func provider(_ id: String) -> Provider? { providers.first(where: { $0.id == id }) }
 
+    /// 整体替换一个来源（改名、改地址都走这里）。
+    /// 用整条替换而不是逐字段赋值，是为了让 didSet 一定能触发落盘。
+    func updateProvider(_ p: Provider) {
+        guard let i = providers.firstIndex(where: { $0.id == p.id }) else { return }
+        var next = providers
+        next[i] = p
+        providers = next
+    }
+
+    /// 删除来源。不许删掉最后一个，否则 App 会变成没有任何来源的砖。
+    @discardableResult
+    func removeProvider(_ id: String) -> Bool {
+        guard providers.count > 1 else { return false }
+        var next = providers.filter { $0.id != id }
+        if next.isEmpty { return false }
+        providers = next
+        if activeProvider == id { activeProvider = next.first?.id ?? "" }
+        return true
+    }
+
+    func addProvider(_ p: Provider) {
+        providers.append(p)
+    }
+
     /// 中转站的密钥：优先用 Provider 自己的，没填才回落到全局 gatewayKey
     func key(for p: Provider) -> String {
         let k = p.apiKey.trimmingCharacters(in: .whitespacesAndNewlines)
