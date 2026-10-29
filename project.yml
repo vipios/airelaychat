@@ -1,0 +1,44 @@
+name: AIRelayChat
+options:
+  bundleIdPrefix: com.vipios
+  deploymentTarget:
+    iOS: "16.0"
+  createIntermediateGroups: true
+  xcodeVersion: "15.0"
+
+settings:
+  base:
+    SWIFT_VERSION: "5.9"
+    IPHONEOS_DEPLOYMENT_TARGET: "16.0"
+
+targets:
+  AIRelayChat:
+    type: application
+    platform: iOS
+    sources:
+      - path: Sources
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.vipios.airelaychat
+        PRODUCT_NAME: AIRelayChat
+        # 用仓库里手写的 Info.plist（含 ATS 放行、本地网络说明）。
+        # 注意不能用 XcodeGen 的 info: 块，那会重新生成并覆盖手写内容。
+        INFOPLIST_FILE: Info.plist
+        GENERATE_INFOPLIST_FILE: NO
+        TARGETED_DEVICE_FAMILY: "1,2"
+        MARKETING_VERSION: "1.0.0"
+        CURRENT_PROJECT_VERSION: "1"
+        # 无签名编译：巨魔直接装，或用证书自行重签
+        CODE_SIGNING_ALLOWED: NO
+        CODE_SIGNING_REQUIRED: NO
+        CODE_SIGN_IDENTITY: ""
+
+schemes:
+  AIRelayChat:
+    build:
+      targets:
+        AIRelayChat: all
+    run:
+      config: Debug
+    archive:
+      config: Release
