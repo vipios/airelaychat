@@ -40,6 +40,7 @@ jobs:
 
       - name: 编译（不签名）
         run: |
+          set -o pipefail
           xcodebuild \
             -project AIRelayChat.xcodeproj \
             -scheme AIRelayChat \
@@ -49,7 +50,20 @@ jobs:
             CODE_SIGNING_ALLOWED=NO \
             CODE_SIGNING_REQUIRED=NO \
             CODE_SIGN_IDENTITY="" \
-            build
+            build 2>&1 | tee /tmp/build.log
+
+      # 编译失败时，把 error 行写进 job summary。
+      # 这样即使 artifact 日志下载不了（blob 鉴权/未生成），
+      # 也能通过 API 读到具体报错，不用反复猜。
+      - name: 失败时导出错误摘要
+        if: failure()
+        run: |
+          {
+            echo "## 编译错误"
+            echo '```'
+            grep -E "error:" /tmp/build.log | sed 's/^[[:space:]]*//' | sort -u | head -40
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY" || true
 
       - name: 打包成 .ipa
         run: |
