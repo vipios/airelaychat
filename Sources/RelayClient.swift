@@ -281,6 +281,7 @@ final class RelayClient {
         guard let url = URL(string: base + "/v1/chat/completions") else {
             throw RelayError.noEndpoint
         }
+        let key = await MainActor.run { settings.gatewayKey }
         var req = URLRequest(url: url)
         req.httpMethod = "POST"
         req.timeoutInterval = 120
