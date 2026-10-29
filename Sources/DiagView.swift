@@ -1,4 +1,5 @@
 import SwiftUI
+import UIKit
 
 // MARK: - 诊断界面
 
