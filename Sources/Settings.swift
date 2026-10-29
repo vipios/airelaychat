@@ -5,7 +5,7 @@ import SwiftUI
 enum NetPlace: String, Codable {
     case home = "在家"
     case away = "在外"
-    case unknown = "检测中"
+    case unknown = "未连接"
 
     var symbol: String {
         switch self {
@@ -46,7 +46,9 @@ final class Settings: ObservableObject {
     private init() {
         let d = UserDefaults.standard.data(forKey: key)
         let s = d.flatMap { try? JSONDecoder().decode(Stored.self, from: $0) }
-        lanHost = s?.lanHost ?? "192.168.2.1"
+        // 默认值故意留空：第一次打开会按 192.168.2.1 → 192.168.1.88 → 192.168.1.250
+        // 依次并发试，谁通用谁，并把它存下来。写死一个 IP 在不同 WiFi 下必然连不上。
+        lanHost = s?.lanHost ?? ""
         publicAddrs = s?.publicAddrs ?? []
         gatewayKey = s?.gatewayKey ?? ""
         homeModel = s?.homeModel ?? ""
@@ -65,8 +67,21 @@ final class Settings: ObservableObject {
         }
     }
 
-    /// 内网基地址
-    var lanBase: String { "http://\(lanHost):\(port)" }
+    /// 内网基地址（用户没填时给个兜底显示值）
+    var lanBase: String { "http://\(lanHost.isEmpty ? "192.168.1.88" : lanHost):\(port)" }
+
+    /// 在家判定要试的内网地址，按优先级排列。
+    /// 为什么不止一个：路由器在内网是 192.168.2.1，同时挂了个 192.168.1.x 别名；
+    /// 手机连光猫 WiFi 和连路由器 WiFi 拿到的网段不一样，只写死一个会出现
+    /// "明明在家却判定成在外面"。
+    var lanCandidates: [String] {
+        var list: [String] = []
+        if !lanHost.isEmpty { list.append(lanHost) }
+        for h in ["192.168.2.1", "192.168.1.88", "192.168.1.250"] where !list.contains(h) {
+            list.append(h)
+        }
+        return list
+    }
 
     /// 按顺序要试的外网地址
     var publicBases: [String] {
