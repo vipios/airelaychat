@@ -502,12 +502,17 @@ struct ChatView: View {
 
                     // 按住说话：放在发送键左边
                     HoldToTalkButton(voice: voice, disabled: store.sending) { text in
-                        // 识别结果拼到输入框（已有文字就接在后面），由用户确认后发送
+                        // 识别结果直接填进输入栏，光标放到末尾，弹出键盘，
+                        // 由你自己确认没问题再点发送 —— 不自动发出去。
                         if store.input.isEmpty {
                             store.input = text
-                        } else {
+                        } else if store.input.hasSuffix(" ") || store.input.hasSuffix("\n") {
                             store.input += text
+                        } else {
+                            store.input += " " + text
                         }
+                        // 让键盘弹出来，方便你直接改字或按发送
+                        inputFocused = true
                     }
 
                     Button { sendIfPossible() } label: {
