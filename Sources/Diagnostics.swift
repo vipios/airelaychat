@@ -180,9 +180,18 @@ final class Diagnostics: ObservableObject {
             if r.ok { lanHit = true; hitHost = host }
         }
 
-        // ---------- 第三步：公网 ----------
+        // ---------- 第三步：公网（先域名，再裸 IPv6） ----------
         var pubHit = false
+        var domainHit = false
         if !lanHit {
+            // 域名这条路是现在最可靠的，先单独探一次并单独列一行，
+            // 用户一眼能看出"是域名通了"还是"靠 IPv6 通了"。
+            if let dBase = settings.domainBase {
+                let r = await probe(dBase + "/health")
+                rows.append(DiagRow(target: dBase, label: "域名", ok: r.ok, detail: r.detail))
+                if r.ok { domainHit = true; pubHit = true }
+            }
+
             let addrs = settings.publicAddrs
             if addrs.isEmpty {
                 rows.append(DiagRow(target: "—", label: "公网", ok: false,
@@ -203,6 +212,9 @@ final class Diagnostics: ObservableObject {
         // ---------- 结论 ----------
         if lanHit {
             summary = "内网通了（\(hitHost ?? "")）。如果聊天还失败，问题在密钥或模型，不是网络。"
+        } else if domainHit {
+            summary = "固定域名通了。在外面也能正常用。"
+            suggestion = "这条走 Cloudflare 隧道，不依赖手机 IPv6，最稳妥。"
         } else if pubHit {
             summary = "内网不通但公网通。说明你现在不在家里 WiFi 上，或者手机连的是别的 WiFi。"
             suggestion = "想在家走内网的话：连上家里 WiFi 再点一次诊断。"
