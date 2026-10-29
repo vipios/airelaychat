@@ -24,6 +24,11 @@ jobs:
         run: brew install xcodegen
 
       - name: 生成 Xcode 工程
+        env:
+          # 家里的地址上报渠道（Gist）。源码里只留占位符，
+          # 真实值从 GitHub Secret 注入，公开仓库也不会泄露。
+          GIST_ID: ${{ secrets.GIST_ID }}
+          GIST_OWNER: ${{ secrets.GIST_OWNER }}
         run: |
           xcodegen generate
           ls -d *.xcodeproj
@@ -37,6 +42,26 @@ jobs:
           sed -i '' 's/objectVersion = 70;/objectVersion = 56;/' AIRelayChat.xcodeproj/project.pbxproj
           echo "=== 修正后格式 ==="
           grep -m1 "objectVersion" AIRelayChat.xcodeproj/project.pbxproj || true
+
+          # 把 Secret 直接替换进 Info.plist 里的占位符。
+          # 只改 CI 工作区里的这份副本，仓库里的源文件保持 $(GIST_ID) 不变，
+          # 所以公开仓库看不到真实 ID。
+          if [ -n "${GIST_ID}" ]; then
+            /usr/libexec/PlistBuddy -c "Set :AIRelayGistId ${GIST_ID}" Info.plist
+            echo "GIST_ID 已注入 (${#GIST_ID} 字符)"
+          else
+            /usr/libexec/PlistBuddy -c "Delete :AIRelayGistId" Info.plist 2>/dev/null || true
+            echo "::warning::GIST_ID 为空 —— 在外自动找地址会失效"
+          fi
+          if [ -n "${GIST_OWNER}" ]; then
+            /usr/libexec/PlistBuddy -c "Set :AIRelayGistOwner ${GIST_OWNER}" Info.plist
+            echo "GIST_OWNER 已注入"
+          else
+            /usr/libexec/PlistBuddy -c "Delete :AIRelayGistOwner" Info.plist 2>/dev/null || true
+            echo "::warning::GIST_OWNER 为空"
+          fi
+          echo "=== 注入结果（不打印真实值） ==="
+          /usr/libexec/PlistBuddy -c "Print :AIRelayGistId" Info.plist 2>/dev/null | head -c 4 | sed 's/$/****/' || echo "(无)"
 
       - name: 编译（不签名）
         run: |
