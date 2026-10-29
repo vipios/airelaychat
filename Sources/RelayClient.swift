@@ -30,6 +30,9 @@ struct ChatMessage: Identifiable, Equatable {
     var role: String        // user / assistant
     var text: String
     var failed: Bool = false
+    var attachments: [Attachment] = []
+    /// 用了哪个模型答的（助手消息上显示，方便对照）
+    var model: String = ""
 }
 
 // MARK: - 错误
@@ -38,23 +41,27 @@ enum RelayError: LocalizedError {
     case noEndpoint
     case http(Int, String)
     case empty
+    case notConfigured
 
     var errorDescription: String? {
         switch self {
         case .noEndpoint:
-            return "连不上中转站。在家请确认连着家里 WiFi；在外面请确认手机有 IPv6 网络。"
+            return "连不上。在家请确认连着家里 WiFi；在外面请确认手机有 IPv6 网络。"
         case .http(let code, let msg):
             let brief = msg.trimmingCharacters(in: .whitespacesAndNewlines)
-            if code == 401 { return "访问密钥不对或没填，去「设置」里填一下。" }
+            if code == 401 { return "密钥不对或没填，去「设置」里填一下。" }
+            if code == 404 { return "接口地址不对，检查「设置」里的服务器地址。" }
             if brief.isEmpty { return "上游返回 HTTP \(code)" }
             return "HTTP \(code)：\(brief.prefix(160))"
         case .empty:
             return "上游没有返回内容，请重试。"
+        case .notConfigured:
+            return "这个来源还没配置好，去「设置 → 模型来源」里填服务器地址和密钥。"
         }
     }
 }
 
-// MARK: - 底层探测（写成文件级函数，并发任务里不用捕获 self）
+// MARK: - 底层请求（文件级函数，并发探测时不用捕获 self）
 
 private func httpGet(_ urlString: String, timeout: TimeInterval,
                      session: URLSession) async throws -> (Int, Data) {
@@ -128,14 +135,8 @@ final class RelayClient {
         return URLSession(configuration: c)
     }()
 
-    // MARK: - 基础请求
-
     private func get(_ urlString: String, timeout: TimeInterval = 3) async throws -> (Int, Data) {
         try await httpGet(urlString, timeout: timeout, session: session)
-    }
-
-    private func alive(_ base: String, timeout: TimeInterval) async -> HealthInfo? {
-        await probeHealth(base, timeout: timeout, session: session)
     }
 
     // MARK: - 在家判定（探测内网，不需要任何权限）
@@ -181,10 +182,7 @@ final class RelayClient {
     }
 
     /// 从 Gist 拿路由器最新公网地址。只在「缓存地址连不上」时才走，
-    /// 所以平时不会给对话增加任何延迟。
-    ///
-    /// 三路也是并发：直连通常 0.6 秒就回来了，没必要等加速站；
-    /// 三路全挂才会耗满 5 秒。
+    /// 所以平时不会给对话增加任何延迟。三路也是并发：直连通常 0.6 秒就回来。
     func fetchGistAddr() async -> GistAddr? {
         let urls = await gistURLs()
         guard !urls.isEmpty else { return nil }
@@ -203,26 +201,20 @@ final class RelayClient {
 
         if urls.count == 1 { return await tryOne(urls[0]) }
 
-        return await withTaskGroup(of: (Int, GistAddr)?.self) { group in
-            for (i, u) in urls.enumerated() {
-                group.addTask {
-                    if let g = await tryOne(u) { return (i, g) }
-                    return nil
-                }
+        return await withTaskGroup(of: GistAddr?.self) { group in
+            for u in urls {
+                group.addTask { await tryOne(u) }
             }
-            var best: (Int, GistAddr)?
+            var hit: GistAddr?
             for await r in group {
-                if let r = r {
-                    if best == nil || r.0 < best!.0 { best = r }
-                    break
-                }
+                if let r = r { hit = r; break }
             }
             group.cancelAll()
-            return best?.1
+            return hit
         }
     }
 
-    // MARK: - 核心：判定场景并给出本次要用的地址
+    // MARK: - 核心：判定场景并给出家里的地址
 
     /// 返回 (场景, 可用 base, health)。会顺带更新缓存的公网地址。
     /// 注意：settings 的 @Published 属性只能在主线程改，否则 SwiftUI 会
@@ -257,14 +249,33 @@ final class RelayClient {
         return (.unknown, nil, nil)
     }
 
+    /// 解析某个来源实际要用的 base。
+    /// 家里的走自动探测（内网优先，公网兜底）；别家来源直接用填的地址。
+    func base(for p: Provider) async -> (base: String?, place: NetPlace) {
+        if p.isHome {
+            let r = await resolve()
+            return (r.base, r.place)
+        }
+        var b = p.baseURL.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !b.isEmpty else { return (nil, .unknown) }
+        // 允许用户只填 example.com 或 example.com/v1，统一补成完整 base
+        if !b.lowercased().hasPrefix("http://"), !b.lowercased().hasPrefix("https://") {
+            b = "https://" + b
+        }
+        while b.hasSuffix("/") { b.removeLast() }
+        if b.hasSuffix("/v1") { b.removeLast(3) }
+        return (b, .away)
+    }
+
     // MARK: - 模型列表
 
-    func models(base: String) async throws -> [ModelInfo] {
+    func models(base: String, key: String) async throws -> [ModelInfo] {
         guard let url = URL(string: base + "/v1/models") else { throw RelayError.noEndpoint }
-        let key = await MainActor.run { settings.gatewayKey }
         var req = URLRequest(url: url)
-        req.timeoutInterval = 10
-        req.setValue("Bearer \(key)", forHTTPHeaderField: "Authorization")
+        req.timeoutInterval = 12
+        if !key.isEmpty {
+            req.setValue("Bearer \(key)", forHTTPHeaderField: "Authorization")
+        }
         let (data, resp) = try await session.data(for: req)
         let code = (resp as? HTTPURLResponse)?.statusCode ?? 0
         guard code == 200 else {
@@ -275,25 +286,32 @@ final class RelayClient {
 
     // MARK: - 流式对话（真流式：逐字出现）
 
-    /// 用 bytes 逐行读 SSE，边收边显示
-    func stream(base: String, model: String, messages: [ChatMessage],
+    /// 用 bytes 逐行读 SSE，边收边显示。
+    /// attachments 里的图片/视频会以多模态 content 发出。
+    func stream(base: String, key: String, model: String,
+                messages: [(role: String, text: String, attachments: [Attachment])],
                 onDelta: @escaping (String) -> Void) async throws {
 
         guard let url = URL(string: base + "/v1/chat/completions") else {
             throw RelayError.noEndpoint
         }
-        let key = await MainActor.run { settings.gatewayKey }
         var req = URLRequest(url: url)
         req.httpMethod = "POST"
         req.timeoutInterval = 180
         req.setValue("application/json", forHTTPHeaderField: "Content-Type")
-        req.setValue("Bearer \(key)", forHTTPHeaderField: "Authorization")
+        if !key.isEmpty {
+            req.setValue("Bearer \(key)", forHTTPHeaderField: "Authorization")
+        }
         req.setValue("text/event-stream", forHTTPHeaderField: "Accept")
 
+        let msgs: [[String: Any]] = messages.map { m in
+            ["role": m.role,
+             "content": PayloadBuilder.content(text: m.text, attachments: m.attachments)]
+        }
         let payload: [String: Any] = [
             "model": model,
             "stream": true,
-            "messages": messages.map { ["role": $0.role, "content": $0.text] }
+            "messages": msgs
         ]
         req.httpBody = try JSONSerialization.data(withJSONObject: payload)
 
@@ -310,8 +328,6 @@ final class RelayClient {
 
         var got = false
         var sawSSE = false
-
-        // 累积所有增量，交给调用方一次判空：避免每个字符都跨 actor 切换
         var collected = ""
 
         for try await line in bytes.lines {
@@ -338,7 +354,7 @@ final class RelayClient {
 
         // 上游忽略 stream、或流里没拿到内容时，用非流式补一次，保证不出现空白回答
         if !sawSSE || !got {
-            let text = try await nonStream(base: base, model: model, messages: messages)
+            let text = try await nonStream(base: base, key: key, model: model, messages: messages)
             if !text.isEmpty {
                 onDelta(text)
             } else if collected.isEmpty {
@@ -347,22 +363,26 @@ final class RelayClient {
         }
     }
 
-    /// 非流式兜底（上游不认 stream 时用）
-    private func nonStream(base: String, model: String, messages: [ChatMessage]) async throws -> String {
+    /// 非流式兜底（上游不认 stream、或流式失败时用）
+    func nonStream(base: String, key: String, model: String,
+                   messages: [(role: String, text: String, attachments: [Attachment])]) async throws -> String {
         guard let url = URL(string: base + "/v1/chat/completions") else {
             throw RelayError.noEndpoint
         }
-        let key = await MainActor.run { settings.gatewayKey }
         var req = URLRequest(url: url)
         req.httpMethod = "POST"
         req.timeoutInterval = 120
         req.setValue("application/json", forHTTPHeaderField: "Content-Type")
-        req.setValue("Bearer \(key)", forHTTPHeaderField: "Authorization")
-        let payload: [String: Any] = [
-            "model": model,
-            "messages": messages.map { ["role": $0.role, "content": $0.text] }
-        ]
+        if !key.isEmpty {
+            req.setValue("Bearer \(key)", forHTTPHeaderField: "Authorization")
+        }
+        let msgs: [[String: Any]] = messages.map { m in
+            ["role": m.role,
+             "content": PayloadBuilder.content(text: m.text, attachments: m.attachments)]
+        }
+        let payload: [String: Any] = ["model": model, "messages": msgs]
         req.httpBody = try JSONSerialization.data(withJSONObject: payload)
+
         let (data, resp) = try await session.data(for: req)
         let code = (resp as? HTTPURLResponse)?.statusCode ?? 0
         guard code == 200 else {
@@ -370,8 +390,13 @@ final class RelayClient {
         }
         guard let doc = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
               let choices = doc["choices"] as? [[String: Any]],
-              let msg = choices.first?["message"] as? [String: Any],
-              let c = msg["content"] as? String else { return "" }
-        return c
+              let msg = choices.first?["message"] as? [String: Any] else { return "" }
+
+        // content 可能是字符串，也可能是多模态数组
+        if let c = msg["content"] as? String { return c }
+        if let arr = msg["content"] as? [[String: Any]] {
+            return arr.compactMap { $0["text"] as? String }.joined()
+        }
+        return ""
     }
 }
