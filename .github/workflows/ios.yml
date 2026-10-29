@@ -1,0 +1,71 @@
+name: Build IPA
+
+# 推代码就自动出一个未签名的 .ipa：
+#   - 巨魔 / TrollStore：直接装
+#   - 有证书：用 Sideloadly / 爱思助手 重签后装
+on:
+  push:
+    branches: [ main, master ]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: macos-14
+    timeout-minutes: 30
+
+    steps:
+      - name: 拉取代码
+        uses: actions/checkout@v4
+
+      - name: 查看 Xcode 版本
+        run: xcodebuild -version
+
+      - name: 安装 XcodeGen
+        run: brew install xcodegen
+
+      - name: 生成 Xcode 工程
+        # 若仓库根目录本身就是工程目录（没有 AIRelayChat 子目录），这里自动适配
+        run: |
+          if [ -f AIRelayChat/project.yml ]; then
+            cd AIRelayChat
+          fi
+          xcodegen generate
+          ls -d *.xcodeproj
+
+      - name: 编译（不签名）
+        run: |
+          cd "$(dirname "$(find . -maxdepth 2 -name project.yml | head -1)")"
+          xcodebuild \
+            -project AIRelayChat.xcodeproj \
+            -scheme AIRelayChat \
+            -configuration Release \
+            -sdk iphoneos \
+            -derivedDataPath build \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_IDENTITY="" \
+            build
+
+      - name: 打包成 .ipa
+        run: |
+          cd "$(dirname "$(find . -maxdepth 2 -name project.yml | head -1)")"
+          APP="build/Build/Products/Release-iphoneos/AIRelayChat.app"
+          if [ ! -d "$APP" ]; then
+            echo "找不到 .app，实际产物如下："
+            find build/Build/Products -maxdepth 3 -name "*.app" || true
+            exit 1
+          fi
+          rm -rf Payload AIRelayChat.ipa
+          mkdir -p Payload
+          cp -R "$APP" Payload/
+          zip -qry AIRelayChat.ipa Payload
+          ls -lh AIRelayChat.ipa
+          echo "=== 包内结构 ==="
+          unzip -l AIRelayChat.ipa | head -15
+
+      - name: 上传 ipa
+        uses: actions/upload-artifact@v4
+        with:
+          name: AIRelayChat-ipa
+          path: '**/AIRelayChat.ipa'
+          retention-days: 90
