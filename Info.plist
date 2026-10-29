@@ -55,6 +55,10 @@
 	<string>$(GIST_ID)</string>
 	<key>AIRelayGistOwner</key>
 	<string>$(GIST_OWNER)</string>
+	<!-- 固定域名（Cloudflare 隧道）。在外面走 https，不依赖 IPv6 直连。
+	     和 Gist 一样从构建变量注入，源码与仓库里都不留真实值。 -->
+	<key>AIRelayPublicDomain</key>
+	<string>$(PUBLIC_DOMAIN)</string>
 
 	<key>UILaunchScreen</key>
 	<dict>
