@@ -45,7 +45,7 @@ struct SettingsView: View {
             HStack {
                 Text("家里路由器地址")
                 Spacer()
-                TextField("192.168.2.1", text: $settings.lanHost)
+                TextField("自动检测", text: $settings.lanHost)
                     .multilineTextAlignment(.trailing)
                     .keyboardType(.decimalPad)
                     .autocorrectionDisabled()
@@ -71,7 +71,7 @@ struct SettingsView: View {
         } header: {
             Text("连接")
         } footer: {
-            Text("地址填路由器在局域网里的 IP。密钥就是中转站后台的访问密钥，填一次就行。")
+            Text("地址留空会自动试常见网段，哪个通用哪个，并记住结果。密钥就是中转站后台的访问密钥，填一次就行。")
         }
     }
 
