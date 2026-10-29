@@ -4,7 +4,10 @@ options:
   deploymentTarget:
     iOS: "16.0"
   createIntermediateGroups: true
+  # 关键：XcodeGen 2.46 默认输出 project format 77，Xcode 15 打不开，
+  # 必须显式锁成 Xcode 15 能读的 objectVersion 56
   xcodeVersion: "15.0"
+  objectVersion: 56
 
 settings:
   base:
