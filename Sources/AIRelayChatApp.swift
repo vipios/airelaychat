@@ -1,5 +1,6 @@
 import SwiftUI
 import SafariServices
+import Network   // NWPathMonitor：网络一变化立刻重连
 
 // MARK: - App 入口
 
@@ -22,9 +23,57 @@ struct AIRelayChatApp: App {
                         Task { await store.refreshIfNeeded() }
                     }
                 }
+                .modifier(NetworkChangeWatcher {
+                    // 走到这里说明 WiFi 连上/断开、或者换了网 —— 立刻重新判定。
+                    // 用户要的就是"连 WiFi 自动在家、断 WiFi 自动在外面"，
+                    // 光靠切前台触发不够：手机在兜里走动时也可能切网。
+                    Task { await store.refreshIfNeeded() }
+                })
                 // 深色模式下顶部状态文字要看清
                 .preferredColorScheme(nil)
         }
+    }
+}
+
+// MARK: - 网络变化监听
+
+/// 监听默认路由的变化。WiFi 断开、连上、换网都会触发。
+/// 用它而不是"每 N 秒轮询"：不耗电，也不会在没变化时瞎重连。
+struct NetworkChangeWatcher: ViewModifier {
+    let onChange: () -> Void
+
+    @State private var monitor: NWPathMonitor?
+    @State private var lastSignature: String = ""
+
+    func body(content: Content) -> some View {
+        content
+            .onAppear {
+                guard monitor == nil else { return }
+                let m = NWPathMonitor()
+                m.pathUpdateHandler = { path in
+                    // 概括成一个字符串："wifi/有线/蜂窝 + 是否有 IPv6 等"
+                    // 只有真的变了才回调，避免 iOS 频繁刷新路径状态时重复重连。
+                    var sig = ""
+                    if path.usesInterfaceType(.wifi) { sig += "w" }
+                    if path.usesInterfaceType(.wiredEthernet) { sig += "e" }
+                    if path.usesInterfaceType(.cellular) { sig += "c" }
+                    sig += path.status == .satisfied ? "+" : "-"
+                    if path.supportsIPv6 { sig += "6" }
+                    DispatchQueue.main.async {
+                        guard sig != lastSignature else { return }
+                        let first = lastSignature.isEmpty
+                        lastSignature = sig
+                        // 首次只是记录基线，不必重连（.task 已经连过了）
+                        if !first { onChange() }
+                    }
+                }
+                m.start(queue: DispatchQueue(label: "airelay.netmon"))
+                monitor = m
+            }
+            .onDisappear {
+                monitor?.cancel()
+                monitor = nil
+            }
     }
 }
 
