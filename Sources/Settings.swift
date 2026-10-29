@@ -166,8 +166,10 @@ final class Settings: ObservableObject {
         homeModel = s?.homeModel ?? ""
         awayModel = s?.awayModel ?? ""
         port = s?.port ?? 8080
-        gistId = s?.gistId ?? "a96bdb5d96de46975334ca3276476901"
-        gistOwner = s?.gistOwner ?? "vipios"
+        // 默认值从 Info.plist 读，构建时注入。源码里不留真实 ID——
+        // 否则仓库公开就等于把「家里地址上报渠道」公开了。
+        gistId = s?.gistId ?? Bundle.main.infoDictionary?["AIRelayGistId"] as? String ?? ""
+        gistOwner = s?.gistOwner ?? Bundle.main.infoDictionary?["AIRelayGistOwner"] as? String ?? ""
 
         var ps = s?.providers ?? []
         if ps.isEmpty {
@@ -195,30 +197,34 @@ final class Settings: ObservableObject {
 
     /// 在家判定要试的内网地址，按优先级排列。
     ///
-    /// 为什么不止一个：路由器在内网是 192.168.2.1，同时挂了个 192.168.1.x 别名；
-    /// 手机连光猫 WiFi 和连路由器 WiFi 拿到的网段不一样，只写死一个会出现
-    /// "明明在家却判定成在外面"。
+    /// 顺序很重要（2026-10-29 修正）：
+    /// 用户手动填的排最前（他填了就是他知道），其次是手机当前网段推导出来的，
+    /// 最后才是历史已知地址。
     ///
-    /// 更进一步：手机当前 WiFi 是 192.168.31.x 这种从没见过的网段时，
-    /// 上面几个固定地址全都试不通。所以这里还会根据手机自己的 IP
-    /// 推导出同网段的 .1 / .88 / .250，覆盖绝大多数路由器默认地址。
+    /// 曾经把 192.168.2.1 排在第一位，结果它是路由器 LAN 侧地址，
+    /// 手机连光猫 WiFi 拿到的是 192.168.1.x，根本到不了 192.168.2.x，
+    /// 每次冷启动都要在这个死地址上空等两秒 —— 这就是"未连接"的直接原因。
     var lanCandidates: [String] {
         var list: [String] = []
+
+        // 1) 用户手动填的，最可信
         if !lanHost.isEmpty { list.append(lanHost) }
 
-        // 手机当前所在网段推导出来的候选（最能反映"现在这个 WiFi"）
+        // 2) 手机当前 WiFi 网段推导（最能反映"现在这个 WiFi 是哪一段"）
+        //    家用路由器管理地址绝大多数落在这几个尾巴上
         if let myIP = NetInfo.wifiIPv4() {
             let parts = myIP.split(separator: ".")
             if parts.count == 4 {
                 let seg = "\(parts[0]).\(parts[1]).\(parts[2])"
-                for tail in ["1", "88", "250"] {
+                for tail in ["88", "250", "1"] {
                     let h = "\(seg).\(tail)"
                     if !list.contains(h) { list.append(h) }
                 }
             }
         }
 
-        for h in ["192.168.2.1", "192.168.1.88", "192.168.1.250"] where !list.contains(h) {
+        // 3) 历史已知地址兜底（手机没拿到 WiFi IP 时才会用到）
+        for h in ["192.168.1.88", "192.168.1.250", "192.168.2.1"] where !list.contains(h) {
             list.append(h)
         }
         return list
