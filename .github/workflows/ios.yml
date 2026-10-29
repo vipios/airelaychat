@@ -24,17 +24,15 @@ jobs:
         run: brew install xcodegen
 
       - name: 生成 Xcode 工程
-        # 若仓库根目录本身就是工程目录（没有 AIRelayChat 子目录），这里自动适配
         run: |
-          if [ -f AIRelayChat/project.yml ]; then
-            cd AIRelayChat
-          fi
+          echo "当前目录: $(pwd)"
+          ls -la
           xcodegen generate
+          echo "--- 生成结果 ---"
           ls -d *.xcodeproj
 
       - name: 编译（不签名）
         run: |
-          cd "$(dirname "$(find . -maxdepth 2 -name project.yml | head -1)")"
           xcodebuild \
             -project AIRelayChat.xcodeproj \
             -scheme AIRelayChat \
@@ -48,7 +46,6 @@ jobs:
 
       - name: 打包成 .ipa
         run: |
-          cd "$(dirname "$(find . -maxdepth 2 -name project.yml | head -1)")"
           APP="build/Build/Products/Release-iphoneos/AIRelayChat.app"
           if [ ! -d "$APP" ]; then
             echo "找不到 .app，实际产物如下："
@@ -67,5 +64,5 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: AIRelayChat-ipa
-          path: '**/AIRelayChat.ipa'
+          path: AIRelayChat.ipa
           retention-days: 90
