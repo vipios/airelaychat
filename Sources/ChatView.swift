@@ -7,10 +7,12 @@ import UniformTypeIdentifiers
 struct ChatView: View {
     @ObservedObject var store: ChatStore
     @ObservedObject var settings = Settings.shared
+    @StateObject private var voice = VoiceInput()
 
     @State private var showModelPicker = false
     @State private var showProviderPicker = false
     @State private var showSettings = false
+    @State private var showDiag = false
     @State private var showAttachMenu = false
     @State private var showPhotoPicker = false
     @State private var showCamera = false
@@ -49,6 +51,9 @@ struct ChatView: View {
                 }
             }
             .sheet(isPresented: $showSettings) { SettingsView(store: store) }
+            .sheet(isPresented: $showDiag) {
+                NavigationStack { DiagView() }
+            }
             .confirmationDialog("选择来源", isPresented: $showProviderPicker, titleVisibility: .visible) {
                 ForEach(settings.providers.filter { $0.enabled }) { p in
                     Button(p.name + (p.id == settings.activeProvider ? "（当前）" : "")) {
@@ -347,7 +352,7 @@ struct ChatView: View {
         }
     }
 
-    // MARK: 错误提示（带一键换模型）
+    // MARK: 错误提示（带一键换模型 / 诊断入口）
 
     private func errorBanner(_ text: String) -> some View {
         VStack(alignment: .leading, spacing: 6) {
@@ -370,6 +375,14 @@ struct ChatView: View {
                     let name = store.models.first(where: { $0.id == store.capSuggestion })?.display
                         ?? store.capSuggestion ?? ""
                     Label("换成「\(name)」", systemImage: "arrow.triangle.2.circlepath")
+                        .font(.system(size: 12, weight: .semibold))
+                }
+                .buttonStyle(.plain)
+            }
+            // 连不上时给个直达诊断的入口，别让用户干瞪眼
+            if store.base == nil {
+                Button { showDiag = true } label: {
+                    Label("连接诊断", systemImage: "stethoscope")
                         .font(.system(size: 12, weight: .semibold))
                 }
                 .buttonStyle(.plain)
@@ -448,34 +461,87 @@ struct ChatView: View {
     // MARK: 输入栏
 
     private var inputBar: some View {
-        HStack(alignment: .bottom, spacing: 8) {
-            Button { showAttachMenu = true } label: {
-                Image(systemName: "plus.circle.fill")
-                    .font(.system(size: 27))
-                    .foregroundStyle(.secondary)
-            }
-            .buttonStyle(.plain)
-            .disabled(store.sending)
-
-            TextField("发消息…", text: $store.input, axis: .vertical)
-                .lineLimit(1...5)
-                .font(.system(size: 15))
-                .focused($inputFocused)
+        VStack(spacing: 0) {
+            // 按住说话时占据输入框位置，显示实时识别结果
+            if voice.recording {
+                HStack(spacing: 8) {
+                    Image(systemName: "waveform")
+                        .font(.system(size: 15))
+                        .foregroundStyle(.red)
+                    Text(voice.partial.isEmpty ? "正在听…" : voice.partial)
+                        .font(.system(size: 15))
+                        .foregroundStyle(voice.partial.isEmpty ? .secondary : .primary)
+                        .lineLimit(2)
+                    Spacer()
+                }
                 .padding(.horizontal, 12)
-                .padding(.vertical, 9)
+                .padding(.vertical, 10)
+                .frame(minHeight: 40)
                 .background(Color(.secondarySystemGroupedBackground))
                 .clipShape(RoundedRectangle(cornerRadius: 18, style: .continuous))
+                .padding(.horizontal, 12)
+                .padding(.vertical, 8)
+            } else {
+                HStack(alignment: .bottom, spacing: 8) {
+                    Button { showAttachMenu = true } label: {
+                        Image(systemName: "plus.circle.fill")
+                            .font(.system(size: 27))
+                            .foregroundStyle(.secondary)
+                    }
+                    .buttonStyle(.plain)
+                    .disabled(store.sending)
 
-            Button { sendIfPossible() } label: {
-                Image(systemName: store.sending ? "hourglass" : "arrow.up.circle.fill")
-                    .font(.system(size: 29))
-                    .foregroundStyle(store.canSend ? Color.accentColor : Color.secondary.opacity(0.5))
+                    TextField("发消息…", text: $store.input, axis: .vertical)
+                        .lineLimit(1...5)
+                        .font(.system(size: 15))
+                        .focused($inputFocused)
+                        .padding(.horizontal, 12)
+                        .padding(.vertical, 9)
+                        .background(Color(.secondarySystemGroupedBackground))
+                        .clipShape(RoundedRectangle(cornerRadius: 18, style: .continuous))
+
+                    // 按住说话：放在发送键左边
+                    HoldToTalkButton(voice: voice, disabled: store.sending) { text in
+                        // 识别结果拼到输入框（已有文字就接在后面），由用户确认后发送
+                        if store.input.isEmpty {
+                            store.input = text
+                        } else {
+                            store.input += text
+                        }
+                    }
+
+                    Button { sendIfPossible() } label: {
+                        Image(systemName: store.sending ? "hourglass" : "arrow.up.circle.fill")
+                            .font(.system(size: 29))
+                            .foregroundStyle(store.canSend ? Color.accentColor : Color.secondary.opacity(0.5))
+                    }
+                    .disabled(!store.canSend)
+                    .buttonStyle(.plain)
+                }
+                .padding(.horizontal, 12)
+                .padding(.vertical, 8)
             }
-            .disabled(!store.canSend)
-            .buttonStyle(.plain)
+
+            if let e = voice.error {
+                HStack(spacing: 6) {
+                    Image(systemName: "exclamationmark.circle.fill")
+                        .font(.system(size: 11))
+                    Text(e)
+                        .font(.system(size: 11))
+                        .fixedSize(horizontal: false, vertical: true)
+                    Spacer(minLength: 0)
+                    Button {
+                        voice.error = nil
+                    } label: {
+                        Image(systemName: "xmark").font(.system(size: 10, weight: .bold))
+                    }
+                    .buttonStyle(.plain)
+                }
+                .foregroundStyle(.orange)
+                .padding(.horizontal, 14)
+                .padding(.bottom, 6)
+            }
         }
-        .padding(.horizontal, 12)
-        .padding(.vertical, 8)
         .background(.regularMaterial)
         .overlay(alignment: .top) {
             if let t = store.toast {
