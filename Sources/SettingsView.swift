@@ -250,8 +250,15 @@ struct SettingsView: View {
             } label: {
                 Label("打开中转站后台", systemImage: "safari")
             }
+            NavigationLink {
+                DiagView()
+            } label: {
+                Label("连接诊断", systemImage: "stethoscope")
+            }
         } header: {
             Text("管理")
+        } footer: {
+            Text("连不上的时候点「连接诊断」，它会告诉你卡在哪一步。")
         }
     }
 
