@@ -54,6 +54,65 @@ enum RelayError: LocalizedError {
     }
 }
 
+// MARK: - 底层探测（写成文件级函数，并发任务里不用捕获 self）
+
+private func httpGet(_ urlString: String, timeout: TimeInterval,
+                     session: URLSession) async throws -> (Int, Data) {
+    guard let url = URL(string: urlString) else { throw RelayError.noEndpoint }
+    var req = URLRequest(url: url)
+    req.timeoutInterval = timeout
+    req.cachePolicy = .reloadIgnoringLocalCacheData
+    let (data, resp) = try await session.data(for: req)
+    let code = (resp as? HTTPURLResponse)?.statusCode ?? 0
+    return (code, data)
+}
+
+/// 服务活着吗？只认 status == "ok"，避免把别的网页当成中转站
+private func probeHealth(_ base: String, timeout: TimeInterval,
+                         session: URLSession) async -> HealthInfo? {
+    do {
+        let (code, data) = try await httpGet(base + "/health", timeout: timeout, session: session)
+        guard code == 200,
+              let h = try? JSONDecoder().decode(HealthInfo.self, from: data),
+              h.status == "ok" else { return nil }
+        return h
+    } catch {
+        return nil
+    }
+}
+
+/// 并发探一批地址，返回第一个通的。
+///
+/// 为什么要并发：串行时每个不通的地址都要等满自己的超时（内网 2 秒、公网 4 秒），
+/// 在外冷启动最坏要等 2+2+2+4+4 ≈ 14 秒才有结果，用户会以为卡死。
+/// 并发后总耗时约等于一个超时周期。
+private func firstAlive(_ bases: [String], timeout: TimeInterval,
+                        session: URLSession) async -> (index: Int, base: String, health: HealthInfo)? {
+    guard !bases.isEmpty else { return nil }
+    if bases.count == 1 {
+        if let h = await probeHealth(bases[0], timeout: timeout, session: session) {
+            return (0, bases[0], h)
+        }
+        return nil
+    }
+    return await withTaskGroup(of: (Int, String, HealthInfo)?.self) { group in
+        for (i, b) in bases.enumerated() {
+            group.addTask {
+                if let h = await probeHealth(b, timeout: timeout, session: session) {
+                    return (i, b, h)
+                }
+                return nil
+            }
+        }
+        var hit: (Int, String, HealthInfo)?
+        for await r in group {
+            if let r = r { hit = r; break }
+        }
+        group.cancelAll()
+        return hit
+    }
+}
+
 // MARK: - 中转站客户端
 
 final class RelayClient {
@@ -72,56 +131,43 @@ final class RelayClient {
     // MARK: - 基础请求
 
     private func get(_ urlString: String, timeout: TimeInterval = 3) async throws -> (Int, Data) {
-        guard let url = URL(string: urlString) else { throw RelayError.noEndpoint }
-        var req = URLRequest(url: url)
-        req.timeoutInterval = timeout
-        req.cachePolicy = .reloadIgnoringLocalCacheData
-        let (data, resp) = try await session.data(for: req)
-        let code = (resp as? HTTPURLResponse)?.statusCode ?? 0
-        return (code, data)
+        try await httpGet(urlString, timeout: timeout, session: session)
     }
 
-    /// 服务活着吗？只认 status == "ok"，避免把别的网页当成功
     private func alive(_ base: String, timeout: TimeInterval) async -> HealthInfo? {
-        do {
-            let (code, data) = try await get(base + "/health", timeout: timeout)
-            guard code == 200,
-                  let h = try? JSONDecoder().decode(HealthInfo.self, from: data),
-                  h.status == "ok" else { return nil }
-            return h
-        } catch {
-            return nil
-        }
+        await probeHealth(base, timeout: timeout, session: session)
     }
 
     // MARK: - 在家判定（探测内网，不需要任何权限）
 
     /// 内网通了 = 在家。比读 WiFi 名字可靠得多，也不需要定位权限。
+    /// 按多个候选地址并发试：不同 WiFi 下手机拿到的网段不同，只试一个会误判成"在外"。
     func probeLAN() async -> (base: String, health: HealthInfo)? {
-        let base = await MainActor.run { settings.lanBase }
-        // 内网响应极快，2 秒不回来基本就是不在家，不必等太久
-        if let h = await alive(base, timeout: 2.0) {
-            return (base, h)
+        let hosts = await MainActor.run { settings.lanCandidates }
+        let port = await MainActor.run { settings.port }
+        let bases = hosts.map { "http://\($0):\(port)" }
+        // 内网响应极快，2 秒不回来基本就是不在家
+        guard let hit = await firstAlive(bases, timeout: 2.0, session: session) else { return nil }
+        let host = hosts[hit.index]
+        // 记住这次能通的地址，下次优先试它（只有真的变了才写，避免反复落盘）
+        await MainActor.run {
+            if settings.lanHost != host { settings.lanHost = host }
         }
-        return nil
+        return (hit.base, hit.health)
     }
 
     // MARK: - 在外判定（先试缓存地址）
 
     func probePublic(addrs: [String]) async -> String? {
         let port = await MainActor.run { settings.port }
-        for ip in addrs {
-            let base = "http://[\(ip)]:\(port)"
-            if await alive(base, timeout: 4.0) != nil {
-                return base
-            }
-        }
-        return nil
+        let bases = addrs.map { "http://[\($0)]:\(port)" }
+        guard let hit = await firstAlive(bases, timeout: 4.0, session: session) else { return nil }
+        return hit.base
     }
 
     // MARK: - Gist 读地址（三路降级）
 
-    /// GitHub raw 直连不通时依次走公共加速站。每路 5 秒，全失败返回 nil。
+    /// GitHub raw 直连不通时用公共加速站兜底。
     private func gistURLs() async -> [String] {
         let owner = await MainActor.run { settings.gistOwner }
         let gid = await MainActor.run { settings.gistId }
@@ -136,19 +182,44 @@ final class RelayClient {
 
     /// 从 Gist 拿路由器最新公网地址。只在「缓存地址连不上」时才走，
     /// 所以平时不会给对话增加任何延迟。
+    ///
+    /// 三路也是并发：直连通常 0.6 秒就回来了，没必要等加速站；
+    /// 三路全挂才会耗满 5 秒。
     func fetchGistAddr() async -> GistAddr? {
-        for u in await gistURLs() {
+        let urls = await gistURLs()
+        guard !urls.isEmpty else { return nil }
+
+        func tryOne(_ u: String) async -> GistAddr? {
             do {
                 let (code, data) = try await get(u, timeout: 5)
                 guard code == 200,
                       let g = try? JSONDecoder().decode(GistAddr.self, from: data),
-                      let ips = g.ipv6, !ips.isEmpty else { continue }
+                      let ips = g.ipv6, !ips.isEmpty else { return nil }
                 return g
             } catch {
-                continue
+                return nil
             }
         }
-        return nil
+
+        if urls.count == 1 { return await tryOne(urls[0]) }
+
+        return await withTaskGroup(of: (Int, GistAddr)?.self) { group in
+            for (i, u) in urls.enumerated() {
+                group.addTask {
+                    if let g = await tryOne(u) { return (i, g) }
+                    return nil
+                }
+            }
+            var best: (Int, GistAddr)?
+            for await r in group {
+                if let r = r {
+                    if best == nil || r.0 < best!.0 { best = r }
+                    break
+                }
+            }
+            group.cancelAll()
+            return best?.1
+        }
     }
 
     // MARK: - 核心：判定场景并给出本次要用的地址
