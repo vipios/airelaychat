@@ -213,6 +213,19 @@ final class RelayClient {
         return hit.base
     }
 
+    // MARK: - 连接灯心跳
+
+    /// 单独探一次「现在这个地址还活着吗」。
+    ///
+    /// 和 bootstrap 的区别：这里只打一次 /health、超时很短、不改任何状态，
+    /// 纯粹给顶栏/输入栏那颗小灯用。返回 true = 通。
+    ///
+    /// 超时给 4 秒而不是 1 秒：走 Cloudflare 隧道时首包可能要 1~3 秒，
+    /// 用 1 秒会把「其实通着、只是慢」误判成红灯，灯一闪一闪的更烦人。
+    func ping(base: String) async -> Bool {
+        await probeHealth(base, timeout: 4.0, session: session) != nil
+    }
+
     // MARK: - 冷启动秒连（用上次成功的地址，不先探测）
 
     /// 用户原话：「打开能直接对话」。要做到这一点，打开 App 的第一秒就必须有一个
@@ -570,5 +583,105 @@ final class RelayClient {
             return arr.compactMap { $0["text"] as? String }.joined()
         }
         return ""
+    }
+
+    // MARK: - 设备状态 / 一键重启
+
+    /// 设备状态快照：开机多久、还剩多少内存、该不该重启。
+    ///
+    /// 为什么不在客户端自己算「该不该重启」：
+    /// 阈值（内存低于多少算紧张、load 超过多少算异常）属于运维策略，
+    /// 放在服务端改了立刻生效，不用重新发版。
+    func deviceStatus(base: String, key: String) async throws -> DeviceStatus {
+        guard let url = URL(string: base + "/admin/api/device") else { throw RelayError.noEndpoint }
+        var req = URLRequest(url: url)
+        req.timeoutInterval = 8
+        if !key.isEmpty { req.setValue(key, forHTTPHeaderField: "X-Access-Key") }
+        let (data, resp) = try await session.data(for: req)
+        let code = (resp as? HTTPURLResponse)?.statusCode ?? 0
+        guard code == 200 else {
+            throw RelayError.http(code, Self.humanError(code, data))
+        }
+        return try JSONDecoder().decode(DeviceStatus.self, from: data)
+    }
+
+    /// 一键重启路由器。
+    ///
+    /// 注意三点：
+    /// 1. 服务端先回 200 再真的重启，所以这里拿到响应 ≠ 已经重启完，
+    ///    只是「指令已受理」。界面要自己提示"约 40 秒后恢复"。
+    /// 2. 超时给 12 秒：要在隧道握手上再叠一层重启前的 2 秒延迟。
+    /// 3. confirm 字段是防手滑的二次确认，服务端缺了它会回 400。
+    func rebootDevice(base: String, key: String) async throws {
+        guard let url = URL(string: base + "/admin/api/device/reboot") else {
+            throw RelayError.noEndpoint
+        }
+        var req = URLRequest(url: url)
+        req.httpMethod = "POST"
+        req.timeoutInterval = 12
+        req.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        if !key.isEmpty { req.setValue(key, forHTTPHeaderField: "X-Access-Key") }
+        req.httpBody = try JSONSerialization.data(withJSONObject: ["confirm": "reboot"])
+        let (data, resp) = try await session.data(for: req)
+        let code = (resp as? HTTPURLResponse)?.statusCode ?? 0
+        guard code == 200 else {
+            throw RelayError.http(code, Self.humanError(code, data))
+        }
+    }
+
+    /// 把服务端返回的错误 JSON 翻成人话。
+    /// 直接抛 "HTTP 403" 用户看不懂，尤其是「后台只允许内网访问」这种。
+    private static func humanError(_ code: Int, _ data: Data) -> String {
+        if let doc = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+           let err = doc["error"] as? [String: Any],
+           let msg = err["message"] as? String, !msg.isEmpty {
+            return msg
+        }
+        switch code {
+        case 401: return "访问密钥不对，去设置里检查一下"
+        case 403: return "这个地址不允许远程访问"
+        case 429: return "操作太频繁，稍等一会再试"
+        default: return "HTTP \(code)"
+        }
+    }
+}
+
+// MARK: - 设备状态
+
+/// 服务端 /admin/api/device 的返回。
+/// 字段和 relay.py 里的 admin_device() 一一对应，改那边记得同步这里。
+struct DeviceStatus: Decodable {
+    var uptime: Int = 0
+    var uptimeText: String = ""
+    var load: [Double] = []
+    var memTotalKB: Int = 0
+    var memAvailKB: Int = 0
+    var swapTotalKB: Int = 0
+    var swapUsedPct: Int = 0
+    var relayRSSKB: Int = 0
+    var shouldReboot: Bool = false
+
+    enum CodingKeys: String, CodingKey {
+        case uptime
+        case uptimeText = "uptime_text"
+        case load
+        case memTotalKB = "mem_total_kb"
+        case memAvailKB = "mem_avail_kb"
+        case swapTotalKB = "swap_total_kb"
+        case swapUsedPct = "swap_used_pct"
+        case relayRSSKB = "relay_rss_kb"
+        case shouldReboot = "should_reboot"
+    }
+
+    /// 「8.1 / 116 MB」这种一眼能看的格式
+    var memText: String {
+        guard memTotalKB > 0 else { return "-" }
+        let avail = Double(memAvailKB) / 1024.0
+        let total = Double(memTotalKB) / 1024.0
+        return String(format: "%.1f / %.0f MB", avail, total)
+    }
+
+    var loadText: String {
+        load.isEmpty ? "-" : load.map { String(format: "%.2f", $0) }.joined(separator: " ")
     }
 }

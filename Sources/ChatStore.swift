@@ -26,11 +26,24 @@ final class ChatStore: ObservableObject {
 
     @Published var sessions: [Session] = []
     @Published var currentSessionId: String = ""
+    /// 用户自己建的分组（抽屉里「创建分组」）
+    @Published var groups: [TaskGroup] = []
 
-    /// 底部 Tab 当前选中项。原版有四个：任务 / 定时任务 / 发现 / 我的。
-    /// 咱们这边只让「任务」是真页面，另外三个做成"半成品说明页"——
-    /// 不假装有功能，点进去明说这个功能还没接，比给个假界面强。
+    /// 底部 Tab 当前选中项。
+    ///
+    /// 2026-10-30 按用户要求改成三个：任务 / 后台面板 / 我的。
+    /// 「后台面板」点一下直接进中转站网页后台；「我的」点进去直接是设置页。
     @Published var tab: MainTab = .tasks
+
+    /// 连接灯：true = 通，false = 不通，nil = 还没探过（灯显示灰色）
+    ///
+    /// 为什么单独一个状态而不是用 base != nil：
+    /// base 只代表「上次探测成功的地址」，那条隧道可能五分钟前就断了，
+    /// 而 base 还留着。灯要反映的是**此刻**通不通，必须真的去打一次。
+    @Published var online: Bool?
+    /// 连续失败次数。局域网抖动一次就翻红太吵，连续 2 次才算真断。
+    private var pingFails = 0
+    private var pinging = false
 
     private let client = RelayClient.shared
     private let settings = Settings.shared
@@ -48,6 +61,7 @@ final class ChatStore: ObservableObject {
             currentSessionId = top.id
             messages = top.messages.map { $0.toChatMessage() }
         }
+        groups = GroupStore.load()
 
         // 先用上次成功的地址把 base 填上，让界面第一帧就是"可用"。
         // 不这么做的话，打开 App 到探测完成之间有一段时间 base == nil，
@@ -56,6 +70,54 @@ final class ChatStore: ObservableObject {
         if let cached = settings.cachedBaseForLaunch {
             base = cached.base
             place = cached.place
+        }
+    }
+
+    // MARK: 连接灯
+
+    /// 用户主动重启设备期间，灯会短暂变灰。
+    ///
+    /// 为什么不干脆让它变红：红＝出故障，而这时候是我们自己把电拔了，
+    /// 报故障会让用户以为重启失败了。灰＝"我知道现在断了，一会儿就好"。
+    private var rebooting = false
+
+    /// 进入「我主动重启了」状态。设置页点完确认后立刻调。
+    func markRebooting() {
+        rebooting = true
+        online = nil
+        pingFails = 0
+    }
+
+    func clearRebooting() {
+        rebooting = false
+    }
+
+    /// 打一次心跳。给顶栏和输入栏的灯用。
+    ///
+    /// 调用方按固定节奏调（比如每 20 秒），这里自己做去重，
+    /// 避免几个视图同时调导致并发打一堆请求。
+    func pingNow() async {
+        // 重启等待期内不打心跳：必然是失败的，只会白攒 pingFails，
+        // 等设备回来了灯却因为攒够次数还红着。
+        if rebooting { return }
+        guard !pinging else { return }
+        guard let b = base else {
+            // 连地址都没有，必然是红的
+            pingFails = 2
+            online = false
+            return
+        }
+        pinging = true
+        defer { pinging = false }
+        let ok = await client.ping(base: b)
+        if ok {
+            pingFails = 0
+            online = true
+        } else {
+            pingFails += 1
+            // 连续 2 次不通才翻红：单次丢包/隧道抖动很常见，
+            // 一次就变红会让灯一直闪，反而看不出真实状态。
+            if pingFails >= 2 { online = false }
         }
     }
 
@@ -131,6 +193,72 @@ final class ChatStore: ObservableObject {
             messages = top.messages.map { $0.toChatMessage() }
         }
         SessionStore.save(sessions)
+    }
+
+    // MARK: 分组管理
+
+    /// 新建一个分组。名字空了就给个默认名，免得列表里出现一行空白。
+    @discardableResult
+    func createGroup(_ name: String) -> TaskGroup {
+        var n = name.trimmingCharacters(in: .whitespacesAndNewlines)
+        if n.isEmpty { n = "新分组 \(groups.count + 1)" }
+        let g = TaskGroup(name: n)
+        groups.append(g)
+        GroupStore.save(groups)
+        return g
+    }
+
+    func renameGroup(_ id: String, to name: String) {
+        let n = name.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !n.isEmpty, let i = groups.firstIndex(where: { $0.id == id }) else { return }
+        groups[i].name = n
+        GroupStore.save(groups)
+    }
+
+    /// 删除分组。**只删分组本身，里面的会话退回未分组**，
+    /// 不跟着一起删 —— 用户只是想取消归类的可能性远大于想清空。
+    func deleteGroup(_ id: String) {
+        groups.removeAll { $0.id == id }
+        var changed = false
+        for i in sessions.indices where sessions[i].groupId == id {
+            sessions[i].groupId = nil
+            changed = true
+        }
+        GroupStore.save(groups)
+        if changed { SessionStore.save(sessions) }
+    }
+
+    /// 把会话放进某个分组（groupId = nil 表示移出分组）
+    func setGroup(_ sessionId: String, to groupId: String?) {
+        guard let i = sessions.firstIndex(where: { $0.id == sessionId }) else { return }
+        guard sessions[i].groupId != groupId else { return }
+        sessions[i].groupId = groupId
+        SessionStore.save(sessions)
+    }
+
+    /// 某个分组里的会话（不按时间分，按更新时间倒序）
+    func sessions(inGroup id: String) -> [Session] {
+        sessions.filter { $0.groupId == id }.sorted { $0.updatedAt > $1.updatedAt }
+    }
+
+    /// 未归组、且有内容的会话，按时间分桶（原来的抽屉列表）
+    func ungroupedBuckets(query q: String) -> [SessionBucket] {
+        let key = q.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        var pool = sessions.filter { !$0.isEmpty && $0.groupId == nil }
+        if !key.isEmpty {
+            pool = pool.filter {
+                $0.displayTitle.lowercased().contains(key)
+                || $0.previewText.lowercased().contains(key)
+            }
+        }
+        pool.sort { $0.updatedAt > $1.updatedAt }
+
+        var buckets: [SessionGroup: [Session]] = [:]
+        for s in pool { buckets[SessionGroup.group(of: s.updatedAt), default: []].append(s) }
+        return SessionGroup.allCases.compactMap { g in
+            guard let items = buckets[g], !items.isEmpty else { return nil }
+            return SessionBucket(group: g, items: items)
+        }
     }
 
     /// 抽屉里要显示的分组

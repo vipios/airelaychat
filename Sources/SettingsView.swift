@@ -5,14 +5,25 @@ import SwiftUI
 struct SettingsView: View {
     @ObservedObject var settings = Settings.shared
     @ObservedObject var store: ChatStore
+    /// true = 作为「我的」页内嵌显示（没有导航栏、没有"完成"按钮）。
+    /// 为什么要这个开关：同一个界面有两个入口 —— 抽屉底部点"设置"是弹窗（需要关闭按钮），
+    /// 底部 Tab「我的」是整页（不需要关闭按钮，那一行会显得多余）。
+    var embedded: Bool = false
     @Environment(\.dismiss) private var dismiss
 
     @State private var loadingModels = false
     @State private var gistResult: String?
     @State private var gistLoading = false
-    @State private var showAdmin = false
-    @State private var adminURL: URL?
     @State private var editing: Provider?
+
+    // 重启路由器
+    @State private var devStatus: DeviceStatus?
+    @State private var devLoading = false
+    @State private var devMsg: String?
+    @State private var confirmReboot = false
+    @State private var rebooting = false
+    /// 重启后进入"等它回来"的倒计时状态
+    @State private var waitingBack = false
 
     var body: some View {
         NavigationStack {
@@ -21,26 +32,37 @@ struct SettingsView: View {
                 currentLinkSection
                 modelSection
                 connectionSection
+                deviceSection
                 publicSection
-                adminSection
                 aboutSection
             }
             .navigationTitle("设置")
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
-                ToolbarItem(placement: .navigationBarTrailing) {
-                    Button("完成") { dismiss() }
+                if !embedded {
+                    ToolbarItem(placement: .navigationBarTrailing) {
+                        Button("完成") { dismiss() }
+                    }
                 }
-            }
-            .sheet(isPresented: $showAdmin) {
-                if let u = adminURL { SafariView(url: u) }
             }
             .sheet(item: $editing) { p in
                 ProviderEditor(provider: p) { saved in
                     saveProvider(saved)
                 }
             }
+            // 点「重启路由器」先弹这个确认框，确认才真的重启。
+            // 用 alert 而不是 ActionSheet：这是不可撤销的破坏性操作，
+            // 居中的系统弹窗比底部弹出的菜单更容易让人看清文字、不容易误触。
+            .alert("重启路由器？", isPresented: $confirmReboot) {
+                Button("取消", role: .cancel) {}
+                Button("确认重启", role: .destructive) {
+                    Task { await doReboot() }
+                }
+            } message: {
+                Text("中转站会断开约 40 秒，正在进行的对话会中断。\n\n只在卡住不响应、后台几十秒才出来的时候才需要。")
+            }
             .task { await refreshModels() }
+            .task { await loadDevice() }
         }
     }
 
@@ -298,25 +320,86 @@ struct SettingsView: View {
         }
     }
 
-    // MARK: 后台管理
+    // MARK: 设备（重启路由器）
+    //
+    // 原来这一栏叫「管理」，里面是「打开中转站后台 + 连接诊断」。
+    // 2026-10-30 按用户要求删掉了：
+    //   - 后台面板已经在底部 Tab 里了，这里再放一个入口是重复的
+    //   - 现在改成一键重启，这才是手机端真正需要的运维操作
 
-    private var adminSection: some View {
+    private var deviceSection: some View {
         Section {
-            Button {
-                adminURL = URL(string: settings.lanBase)
-                showAdmin = true
-            } label: {
-                Label("打开中转站后台", systemImage: "safari")
+            if let d = devStatus {
+                HStack {
+                    Text("已运行")
+                    Spacer()
+                    Text(d.uptimeText)
+                        .font(.system(size: 13))
+                        .foregroundStyle(.secondary)
+                }
+                HStack {
+                    Text("可用内存")
+                    Spacer()
+                    Text(d.memText)
+                        .font(.system(size: 13))
+                        .foregroundStyle(d.memAvailKB < 3000 ? .red : .secondary)
+                }
+                HStack {
+                    Text("负载")
+                    Spacer()
+                    Text(d.loadText)
+                        .font(.system(size: 13, design: .monospaced))
+                        .foregroundStyle((d.load.first ?? 0) > 8 ? .red : .secondary)
+                }
+                if d.swapTotalKB > 0 {
+                    HStack {
+                        Text("交换区已用")
+                        Spacer()
+                        Text("\(d.swapUsedPct)%")
+                            .font(.system(size: 13))
+                            .foregroundStyle(d.swapUsedPct >= 95 ? .red : .secondary)
+                    }
+                }
+                // 只在该重启的时候才提示，平时不啰嗦
+                if d.shouldReboot {
+                    Label("内存紧张，建议重启一次", systemImage: "exclamationmark.triangle.fill")
+                        .font(.system(size: 13))
+                        .foregroundStyle(.orange)
+                }
+            } else if devLoading {
+                HStack(spacing: 8) {
+                    ProgressView().scaleEffect(0.8)
+                    Text("正在读取设备状态…")
+                        .font(.system(size: 12)).foregroundStyle(.secondary)
+                }
             }
-            NavigationLink {
-                DiagView()
+
+            Button(role: .destructive) {
+                confirmReboot = true
             } label: {
-                Label("连接诊断", systemImage: "stethoscope")
+                HStack {
+                    // 重启中/等待恢复时不显示图标，避免和转圈叠在一起
+                    if rebooting || waitingBack {
+                        ProgressView().scaleEffect(0.8)
+                    } else {
+                        Image(systemName: "power")
+                    }
+                    Text(rebooting ? "正在发送重启指令…"
+                         : (waitingBack ? "等待设备恢复…" : "重启路由器"))
+                    Spacer()
+                }
+            }
+            .disabled(rebooting || waitingBack)
+
+            if let m = devMsg {
+                Text(m)
+                    .font(.system(size: 12))
+                    .foregroundStyle(waitingBack ? .secondary : .red)
             }
         } header: {
-            Text("管理")
+            Text("设备")
         } footer: {
-            Text("连不上的时候点「连接诊断」，它会告诉你卡在哪一步。")
+            Text("卡住的时候点一下就能重启，不用进路由器后台。\n重启后约 40 秒自动恢复，App 会自己重新连上。")
         }
     }
 
@@ -332,9 +415,8 @@ struct SettingsView: View {
             }
         } header: {
             Text("关于")
-        } footer: {
-            Text("AIRelayChat · 家里的 AI 中转站客户端")
         }
+        // 原来的 footer「AIRelayChat · 家里的 AI 中转站客户端」已按用户要求删掉
     }
 
     // MARK: 动作
@@ -343,6 +425,71 @@ struct SettingsView: View {
         loadingModels = true
         defer { loadingModels = false }
         await store.refreshModels()
+    }
+
+    // MARK: 设备状态 / 重启
+
+    private func loadDevice() async {
+        // 拿当前能用的地址。store.base 是「上次探测成功的地址」，
+        // 探过就用它；没探过就先 bootstrap 一次，否则一定是空的。
+        if store.base == nil { await store.bootstrap(loadModels: false) }
+        guard let b = store.base else {
+            devMsg = "还没连上中转站，没法读取设备状态"
+            return
+        }
+        devLoading = true
+        defer { devLoading = false }
+        do {
+            devStatus = try await RelayClient.shared.deviceStatus(base: b, key: settings.accessKey)
+            devMsg = nil
+        } catch {
+            devMsg = "读取失败：\(friendly(error))"
+        }
+    }
+
+    private func doReboot() async {
+        guard let b = store.base else {
+            devMsg = "还没连上中转站，没法重启"
+            return
+        }
+        rebooting = true
+        devMsg = nil
+        defer { rebooting = false }
+        do {
+            try await RelayClient.shared.rebootDevice(base: b, key: settings.accessKey)
+            // 指令已受理，设备 2 秒后真的重启，接下来约 40 秒会连不上。
+            // 这里不干等，而是给个软提示 + 60 秒后自动刷一次状态，
+            // 用户体验上就是"点完切出去干别的，回来它已经好了"。
+            waitingBack = true
+            devMsg = "已发送重启指令，约 40 秒后恢复…"
+            // 立刻把连接灯翻成灰，表示"这会是我主动弄断的，不是故障"
+            store.markRebooting()
+            Task {
+                try? await Task.sleep(nanoseconds: 45_000_000_000)
+                waitingBack = false
+                // 45 秒后重新探一次，把 base 和灯恢复过来
+                store.clearRebooting()
+                await store.bootstrap()
+                await loadDevice()
+                if devStatus != nil {
+                    devMsg = "设备已恢复"
+                }
+            }
+        } catch {
+            devMsg = "重启失败：\(friendly(error))"
+        }
+    }
+
+    private func friendly(_ e: Error) -> String {
+        if let r = e as? RelayError {
+            // RelayError.http 的第二个参数已经是我们翻好的人话
+            // （服务端返回的 error.message，或 401/403/429 的中文说明）
+            if case .http(_, let msg) = r, !msg.isEmpty {
+                return msg
+            }
+            return r.errorDescription ?? "\(r)"
+        }
+        return e.localizedDescription
     }
 
     private func refreshFromGist() async {

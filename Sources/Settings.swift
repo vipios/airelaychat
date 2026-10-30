@@ -329,6 +329,21 @@ final class Settings: ObservableObject {
         return p.isHome ? gatewayKey : ""
     }
 
+    /// 调用**管理接口**（/admin/api/*）用的密钥。
+    ///
+    /// 注意这跟 `key(for:)` 不是一回事：
+    ///   - 模型接口 (/v1/*) 认 access_key 或任一网关 Key
+    ///   - 管理接口 (/admin/api/*) **只认 access_key**
+    /// 所以不能用网关 Key 去调重启，权限对不上会 401。
+    /// 这里和后台网页共用同一个钥匙串项，用户只需在首次进后台时输过一次。
+    var accessKey: String {
+        let k = AdminKey.load().trimmingCharacters(in: .whitespacesAndNewlines)
+        if !k.isEmpty { return k }
+        // 兜底：有些用户只在设置里填过「访问密钥」，从没开过后台。
+        // 中转站的 access_key 和这个字段是同一样东西，直接用。
+        return gatewayKey.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
     func cap(for model: String, in p: Provider) -> ModelCap {
         if let o = p.capOverrides[model] { return o }
         return CapInfer.infer(model)

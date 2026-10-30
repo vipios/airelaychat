@@ -2,13 +2,16 @@ import Foundation
 
 // MARK: - 底部导航
 
-/// 对齐 WorkBuddy 手机端底部的四个入口。
-/// 原版是「任务 / 定时任务 / 发现 / 我的」，图标依次是
-/// 对话气泡（选中态是实心深色）/ 秒表 / 指南针 / 人像。
+/// 对齐 WorkBuddy 手机端的底部入口。
+///
+/// 2026-10-30 按用户要求改成三个：
+///   「任务」聊天主界面
+///   「后台面板」点一下直接进中转站网页后台（App 内嵌，免登录）
+///   「我的」点进去直接就是设置页
+/// 原来的「发现」删掉了（官方内容广场，咱们没有内容源）。
 enum MainTab: String, CaseIterable, Identifiable {
     case tasks = "任务"
-    case scheduled = "定时任务"
-    case discover = "发现"
+    case admin = "后台面板"
     case mine = "我的"
 
     var id: String { rawValue }
@@ -16,8 +19,7 @@ enum MainTab: String, CaseIterable, Identifiable {
     var icon: String {
         switch self {
         case .tasks: return "bubble.left.and.bubble.right"
-        case .scheduled: return "stopwatch"
-        case .discover: return "safari"
+        case .admin: return "square.grid.2x2"
         case .mine: return "person"
         }
     }
@@ -25,8 +27,7 @@ enum MainTab: String, CaseIterable, Identifiable {
     var iconFilled: String {
         switch self {
         case .tasks: return "bubble.left.and.bubble.right.fill"
-        case .scheduled: return "stopwatch.fill"
-        case .discover: return "safari.fill"
+        case .admin: return "square.grid.2x2.fill"
         case .mine: return "person.fill"
         }
     }
@@ -75,6 +76,8 @@ struct Session: Codable, Identifiable, Hashable {
     var messages: [StoredMessage] = []
     var createdAt: Date = Date()
     var updatedAt: Date = Date()
+    /// 归属的自定义分组。nil = 未分组（按时间归档）
+    var groupId: String?
 
     var isEmpty: Bool { messages.isEmpty }
 
@@ -91,6 +94,18 @@ struct Session: Codable, Identifiable, Hashable {
         }
         return "还没有消息"
     }
+}
+
+// MARK: - 自定义分组
+
+/// 抽屉里用户自己建的分组。
+///
+/// 为什么要它：会话一多，按「今天/昨天」找太费劲。用户想把某几个对话
+/// 长期留在一个分组里（比如「工作」「折腾路由器」），所以单独存一份。
+struct TaskGroup: Codable, Identifiable, Hashable {
+    var id: String = UUID().uuidString
+    var name: String = ""
+    var createdAt: Date = Date()
 }
 
 // MARK: - 会话存储
@@ -124,6 +139,34 @@ enum SessionStore {
         let enc = JSONEncoder()
         enc.dateEncodingStrategy = .iso8601
         guard let data = try? enc.encode(trimmed) else { return }
+        try? data.write(to: url, options: .atomic)
+    }
+}
+
+/// 分组单独一个文件。和会话分开存的原因：分组数量少、改动频繁
+/// （改名/新建），混在会话大文件里每次都要重写几十 KB。
+enum GroupStore {
+    private static let fileName = "groups.json"
+
+    private static var fileURL: URL? {
+        guard let dir = FileManager.default.urls(for: .applicationSupportDirectory,
+                                                 in: .userDomainMask).first else { return nil }
+        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        return dir.appendingPathComponent(fileName)
+    }
+
+    static func load() -> [TaskGroup] {
+        guard let url = fileURL, let data = try? Data(contentsOf: url) else { return [] }
+        let dec = JSONDecoder()
+        dec.dateDecodingStrategy = .iso8601
+        return (try? dec.decode([TaskGroup].self, from: data)) ?? []
+    }
+
+    static func save(_ groups: [TaskGroup]) {
+        guard let url = fileURL else { return }
+        let enc = JSONEncoder()
+        enc.dateEncodingStrategy = .iso8601
+        guard let data = try? enc.encode(groups) else { return }
         try? data.write(to: url, options: .atomic)
     }
 }

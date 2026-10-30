@@ -3,31 +3,34 @@ import AVFoundation
 import Speech
 import SwiftUI
 
-// MARK: - 语音转文字（按住说话）
+// MARK: - 语音转文字（点一下开始听，再点一下结束）
 
-/// 按住录音，松手把识别结果以文字形式交给上层。
+/// 点一下开始听，再点一下结束（或静音一段时间自动结束），
+/// 边说边把识别到的文字**实时写进输入框**。
 ///
-/// 为什么用 SFSpeechRecognizer 而不是先录音再发：要「按住就说、松手出字」，
-/// 边说边识别体验最好，也省去一次文件读写。识别走系统服务，不消耗中转站的额度。
+/// 2026-10-30 按用户要求重做。上一版的三个问题：
 ///
-/// ## 2026-10-29 修的两个 bug
+/// **1. 「已经说话了还显示没听清」**
+/// 原因有两个：
+///   a) `requiresOnDeviceRecognition = true` 被无脑打开。zh-CN 的设备端模型
+///      在部分机型上根本不存在，一开就立刻报错，一个字都拿不到。
+///   b) 松手后只等 350ms 就取最终结果，长句子最后几个字还没吐出来就判了「空」。
+/// 现在：不再强制设备端（让系统自己选）、收尾等 1.2 秒、
+/// 而且**只要有过任何 partial 就绝不报「没听清」**。
 ///
-/// **1. 识别结果重复（说一句"喂"出来"喂喂喂喂"）**
-/// 根因是 `start()` 里 `recording` 是在最后才置 true，而这之前有
-/// `await ensurePermission()` 的异步等待。按钮的 onChanged 每帧都触发，
-/// 于是这个守卫形同虚设 —— 一次按住会真的启动好几个 AVAudioEngine，
-/// 每个都往自己的识别请求里塞同一段麦克风数据，识别器就听到了 N 遍。
-/// 现在用 `starting` 同步置位堵死并发，并用 `generation` 让过期回调失效。
+/// **2. 「识别出来的字只显示在胶囊里，没法编辑」**
+/// 上一版把实时文字放在 `partial` 这个独立变量里，跟输入框是两套东西。
+/// 现在 `onLive` 回调把每一版识别结果直接推给输入框，用户看到的就是
+/// 输入框里在长字，随时能打断、能改。
 ///
-/// **2. 权限弹窗期间松手，麦克风停不下来**
-/// `stop()` 里 `guard recording` 会在 start 还没完成时直接返回，
-/// 之后 start 完成把 recording 置 true，录音就一直开着。
-/// 现在 stop 会先记 `pendingStop`，start 一完成立刻自我收尾。
+/// **3. 「点输入框不弹键盘」**
+/// 上一版录音时把整个输入栏替换成了「正在听…」，输入框被移出视图，
+/// 焦点自然就丢了。现在输入栏结构不变，只改图标和指示灯。
 @MainActor
 final class VoiceInput: ObservableObject {
     /// 正在录（麦克风已开、识别已开始）
     @Published var recording = false
-    /// 实时识别的中间结果（按住时显示）
+    /// 实时识别的中间结果（用于界面显示，也用于结束时兜底）
     @Published var partial = ""
     /// 出错时的提示
     @Published var error: String?
@@ -41,13 +44,27 @@ final class VoiceInput: ObservableObject {
 
     /// 启动流程进行中（含等待权限）。同步置位，用来挡住重复启动。
     private var starting = false
-    /// 启动还没完成时用户就松手了
-    private var pendingStop = false
     /// 每次启动递增，回调里比对不上就丢弃（防止上一轮的迟到结果污染这一轮）
     private var generation = 0
+    /// 本次录音是否真的收到过识别文字
+    private var gotAnyText = false
+    /// 静音自动结束：最后一次拿到文字的时间
+    private var lastTextAt: Date = Date()
+    private var silenceTimer: Timer?
 
-    /// 松手时回调，参数是最终文字。空字符串表示没识别出来。
+    /// 静音多久自动结束。给 2.2 秒：说话时正常换气也就 0.5~1 秒，
+    /// 2.2 秒没新字基本就是讲完了，比让用户手动点第二下更省事。
+    private let silenceLimit: TimeInterval = 2.2
+
+    /// 每次识别到新文字就回调（实时写进输入框）
+    var onLive: ((String) -> Void)?
+    /// 结束时回调最终文字。空字符串表示确实没识别到（这时界面不该弹错，
+    /// 用户可能只是点了一下没说话）。
     var onFinish: ((String) -> Void)?
+
+    /// 本轮开始前输入框里已有的文字。实时回调要拼在它后面，
+    /// 否则识别一开口就会把用户之前打的字整个冲掉。
+    private var baseText = ""
 
     // MARK: 权限
 
@@ -89,17 +106,20 @@ final class VoiceInput: ObservableObject {
 
     // MARK: 开始 / 结束
 
-    func start() async {
-        // 这两行是同步的，能挡住 onChanged 的连发
+    /// 开始听。`prefix` 是输入框里已有的文字，识别结果会接在它后面。
+    func start(prefix: String = "") async {
+        // 这两行是同步的，能挡住手势的连发
         guard !starting, !recording else { return }
         starting = true
-        pendingStop = false
         generation += 1
         let gen = generation
 
         error = nil
         partial = ""
         denied = false
+        gotAnyText = false
+        lastTextAt = Date()
+        baseText = prefix
 
         // 上一轮如果还留了东西，先彻底清掉（避免 tap 叠加导致重复识别）
         teardown()
@@ -110,8 +130,8 @@ final class VoiceInput: ObservableObject {
         }
 
         guard await ensurePermission() else { return }
-        // 等权限期间用户可能已经松手
-        guard generation == gen, !pendingStop else { return }
+        // 等权限期间用户可能已经再点了一下（想取消）
+        guard generation == gen else { return }
 
         do {
             let session = AVAudioSession.sharedInstance()
@@ -122,10 +142,10 @@ final class VoiceInput: ObservableObject {
             let eng = AVAudioEngine()
             let req = SFSpeechAudioBufferRecognitionRequest()
             req.shouldReportPartialResults = true
-            // 优先用设备端识别：快、且不上传音频
-            if recognizer?.supportsOnDeviceRecognition == true {
-                req.requiresOnDeviceRecognition = true
-            }
+            // 不再强制 requiresOnDeviceRecognition。
+            // 强制端侧的后果是：机型上没有 zh-CN 端侧模型时直接报错，
+            // 一个 partial 都拿不到 —— 就是用户说的「说了话还说没听清」。
+            // 交给系统自己决定：有端侧用端侧，没有就走服务器。
 
             let node = eng.inputNode
             let fmt = node.outputFormat(forBus: 0)
@@ -142,76 +162,122 @@ final class VoiceInput: ObservableObject {
             task = recognizer?.recognitionTask(with: req) { [weak self] result, err in
                 Task { @MainActor in
                     guard let self = self, self.generation == gen else { return }
+
                     if let r = result {
-                        self.partial = r.bestTranscription.formattedString
+                        let text = r.bestTranscription.formattedString
+                        if !text.isEmpty {
+                            self.gotAnyText = true
+                            self.lastTextAt = Date()
+                            self.partial = text
+                            // 实时写进输入框：用户看到的就是"边说边长字"
+                            self.onLive?(self.join(text))
+                        }
+                        // 识别器自己说结束了（比如检测到长停顿），主动收尾
+                        if r.isFinal, self.recording {
+                            self.stop()
+                            return
+                        }
                     }
+
                     if err != nil {
-                        // 识别结束或出错；没拿到字就报个温和的提示
-                        if self.partial.isEmpty, self.recording {
-                            self.error = "没听清，再说一次？"
+                        // 关键修正：**有字就不报错**。
+                        // SFSpeechRecognizer 在"录音结束/静音"时经常带一个
+                        // err 回调出来，那不代表失败。上一版只要 err 就判空，
+                        // 于是明明识别到了还弹「没听清」。
+                        if self.recording, !self.gotAnyText, self.partial.isEmpty {
+                            // 真的一个字都没有：不弹错，安静收尾。
+                            self.stop()
                         }
                     }
                 }
             }
 
             recording = true
+            startSilenceWatch(gen)
 
-            // 关键：启动期间用户已经松手了，这里立刻自我收尾
-            if pendingStop {
-                pendingStop = false
-                stop()
-            }
         } catch {
             self.error = "录音启动失败：\(error.localizedDescription)"
             teardown()
         }
     }
 
-    /// 松手：结束识别，把最终文字回调出去
-    func stop() {
-        // 还在启动（比如权限弹窗）——记下来，start 完成时会自动收尾
-        if starting && !recording {
-            pendingStop = true
-            return
-        }
-        guard recording else { return }
+    /// 把识别结果接在原有文字后面
+    private func join(_ text: String) -> String {
+        let t = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !baseText.isEmpty else { return t }
+        // 中文不需要空格，英文/数字之间补一个
+        if baseText.hasSuffix(" ") || baseText.hasSuffix("\n") { return baseText + t }
+        return baseText + " " + t
+    }
 
-        let text = partial.trimmingCharacters(in: .whitespacesAndNewlines)
-        recording = false
-        let gen = generation
-
-        request?.endAudio()
-        // 给识别器一点时间吐出最后几个字，再收尾
-        Task {
-            try? await Task.sleep(nanoseconds: 350_000_000)
-            // 这期间用户又按下了新的一轮，就别清掉新的状态
-            guard self.generation == gen else { return }
-            self.teardown()
-            let final = self.partial.trimmingCharacters(in: .whitespacesAndNewlines)
-            let out = final.isEmpty ? text : final
-            self.partial = ""
-            if !out.isEmpty {
-                self.onFinish?(out)
-            } else if self.error == nil {
-                self.error = "没听清，再说一次？"
+    /// 静音看门狗：一段时间没有新文字就自动结束。
+    ///
+    /// 为什么需要它：用户说完话不一定会再点一下图标（第一版是按住说的，
+    /// 习惯还没改过来）。有这个兜底，"说完了字就停在那儿"，不会一直录着耗电。
+    private func startSilenceWatch(_ gen: Int) {
+        silenceTimer?.invalidate()
+        silenceTimer = Timer.scheduledTimer(withTimeInterval: 0.4, repeats: true) { [weak self] _ in
+            Task { @MainActor in
+                guard let self = self else { return }
+                guard self.recording, self.generation == gen else { return }
+                // 一直没字的不自动收（用户可能还在组织语言，或权限框刚点完）
+                guard self.gotAnyText else { return }
+                if Date().timeIntervalSince(self.lastTextAt) >= self.silenceLimit {
+                    self.stop()
+                }
             }
         }
     }
 
-    /// 用户中途取消（比如手指滑开了）
-    func cancel() {
-        if starting && !recording {
-            pendingStop = true
-            return
-        }
+    /// 结束：把最终文字交给上层
+    func stop() {
         guard recording else { return }
         recording = false
+        silenceTimer?.invalidate()
+        silenceTimer = nil
+
+        let gen = generation
+        let snapshot = partial.trimmingCharacters(in: .whitespacesAndNewlines)
+        let hadText = gotAnyText
+
+        request?.endAudio()
+
+        // 给识别器时间吐最后几个字。
+        // 350ms 太短了（上一版就是这么丢字的），1.2 秒更稳；
+        // 这期间界面已经把字填进输入框了，用户感觉不到在等。
+        Task {
+            try? await Task.sleep(nanoseconds: 1_200_000_000)
+            guard self.generation == gen else { return }
+            self.teardown()
+
+            let final = self.partial.trimmingCharacters(in: .whitespacesAndNewlines)
+            let out = final.isEmpty ? snapshot : final
+            self.partial = ""
+
+            if !out.isEmpty {
+                self.onFinish?(self.join(out))
+            } else if !hadText {
+                // 一个字都没有 —— 不报「没听清」。
+                // 多数情况是点错了或环境太吵，安静收场比红字友好。
+                self.error = nil
+            }
+        }
+    }
+
+    /// 用户中途取消
+    func cancel() {
+        guard recording else { return }
+        recording = false
+        silenceTimer?.invalidate()
+        silenceTimer = nil
         partial = ""
         generation += 1   // 让这一轮的迟到回调全部失效
         teardown()
     }
 
     private func teardown() {
+        silenceTimer?.invalidate()
+        silenceTimer = nil
         if let e = engine {
             if e.isRunning { e.stop() }
             // removeTap 在没装过 tap 时会抛异常，判一下更稳
