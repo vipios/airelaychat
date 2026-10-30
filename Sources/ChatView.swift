@@ -61,15 +61,15 @@ struct ChatView: View {
         }
         .sheet(isPresented: $showSettings) {
             SettingsView(store: store)
-                .presentationCornerRadius(28)
+                .roundSheet(28)
         }
         .sheet(isPresented: $showDiag) {
             NavigationStack { DiagView() }
-                .presentationCornerRadius(28)
+                .roundSheet(28)
         }
         .sheet(isPresented: $showFiles) {
             MyFilesView(store: store, embedded: true)
-                .presentationCornerRadius(28)
+                .roundSheet(28)
         }
         // 产物卡片的预览 / 分享
         .sheet(item: $previewFile) { f in
@@ -96,16 +96,16 @@ struct ChatView: View {
                         }
                     }
             }
-            .presentationCornerRadius(28)
+            .roundSheet(28)
         }
         .sheet(item: $shareFile) { f in
             ShareSheet(items: [f.url])
                 .presentationDetents([.medium, .large])
-                .presentationCornerRadius(28)
+                .roundSheet(28)
         }
         .sheet(isPresented: $showCamera) {
             CameraPicker { img in store.addImage(img) }
-                .presentationCornerRadius(28)
+                .roundSheet(28)
         }
         // 模型选择挂在整个页面最外层，不能挂在输入栏上 ——
         // 挂输入栏时 GeometryReader 只能拿到输入栏那几十 pt 高度，

@@ -66,4 +66,22 @@ extension View {
             .clipShape(RoundedRectangle(cornerRadius: corner, style: .continuous))
             .shadow(color: Color.black.opacity(shadow), radius: 7, y: 1)
     }
+
+    /// 弹层大圆角。
+    ///
+    /// 系统原生的 `.presentationCornerRadius` 要 iOS 16.4+，
+    /// 而本工程部署目标是 16.0 —— 直接写会编译报错：
+    ///   error: 'presentationCornerRadius' is only available in iOS 16.4 or newer
+    ///
+    /// 所以包一层做版本判断：16.4 及以上走原生（弹层真的变圆），
+    /// 更老的系统原样返回（弹层是系统默认圆角，观感略平但不会崩）。
+    /// 这样 16.0~16.3 的老机型也装得上，不会为了一个圆角砍掉兼容区间。
+    @ViewBuilder
+    func roundSheet(_ radius: CGFloat = 28) -> some View {
+        if #available(iOS 16.4, *) {
+            self.presentationCornerRadius(radius)
+        } else {
+            self
+        }
+    }
 }
