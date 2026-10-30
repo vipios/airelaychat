@@ -291,7 +291,7 @@ struct SettingsView: View {
                 Spacer()
                 Text(linkStateText)
                     .font(.system(size: 13))
-                    .foregroundStyle(store.base == nil ? .orange : .green)
+                    .foregroundStyle(store.base == nil ? Color.orange : Color.green)
             }
             if let b = store.base {
                 HStack(alignment: .top) {
@@ -342,14 +342,14 @@ struct SettingsView: View {
                     Spacer()
                     Text(d.memText)
                         .font(.system(size: 13))
-                        .foregroundStyle(d.memAvailKB < 3000 ? .red : .secondary)
+                        .foregroundStyle(d.memAvailKB < 3000 ? Color.red : Color.secondary)
                 }
                 HStack {
                     Text("负载")
                     Spacer()
                     Text(d.loadText)
                         .font(.system(size: 13, design: .monospaced))
-                        .foregroundStyle((d.load.first ?? 0) > 8 ? .red : .secondary)
+                        .foregroundStyle((d.load.first ?? 0) > 8 ? Color.red : Color.secondary)
                 }
                 if d.swapTotalKB > 0 {
                     HStack {
@@ -357,7 +357,7 @@ struct SettingsView: View {
                         Spacer()
                         Text("\(d.swapUsedPct)%")
                             .font(.system(size: 13))
-                            .foregroundStyle(d.swapUsedPct >= 95 ? .red : .secondary)
+                            .foregroundStyle(d.swapUsedPct >= 95 ? Color.red : Color.secondary)
                     }
                 }
                 // 只在该重启的时候才提示，平时不啰嗦
@@ -394,7 +394,10 @@ struct SettingsView: View {
             if let m = devMsg {
                 Text(m)
                     .font(.system(size: 12))
-                    .foregroundStyle(waitingBack ? .secondary : .red)
+                    // 三元的两个分支必须是同一具体类型。
+                    // .secondary 是 ShapeStyle 的静态成员、.red 是 Color，
+                    // 混着写编译器推不出来（会报 "type 'any ShapeStyle' cannot conform"）。
+                    .foregroundStyle(waitingBack ? Color.secondary : Color.red)
             }
         } header: {
             Text("设备")

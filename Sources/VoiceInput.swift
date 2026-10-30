@@ -214,12 +214,21 @@ final class VoiceInput: ObservableObject {
     ///
     /// 为什么需要它：用户说完话不一定会再点一下图标（第一版是按住说的，
     /// 习惯还没改过来）。有这个兜底，"说完了字就停在那儿"，不会一直录着耗电。
+    ///
+    /// 并发写法注意（2026-10-30 编译报错过）：
+    /// 不能在 Timer 闭包里先 `[weak self]` 再在 `Task { @MainActor in }`
+    /// 里用那个 self —— 捕获的 weak 变量跨进并发闭包会被判为
+    /// "reference to captured var 'self' in concurrently-executing code"。
+    /// 正解：把 weak 直接标在 Task 闭包上，让弱引用本身在 MainActor 里解包。
     private func startSilenceWatch(_ gen: Int) {
         silenceTimer?.invalidate()
-        silenceTimer = Timer.scheduledTimer(withTimeInterval: 0.4, repeats: true) { [weak self] _ in
-            Task { @MainActor in
+        // 先把参数拷成不可变局部量，避免闭包直接引用函数参数
+        // （在并发上下文里引用外层可变绑定会被编译器拦下）
+        let targetGen = gen
+        silenceTimer = Timer.scheduledTimer(withTimeInterval: 0.4, repeats: true) { _ in
+            Task { @MainActor [weak self] in
                 guard let self = self else { return }
-                guard self.recording, self.generation == gen else { return }
+                guard self.recording, self.generation == targetGen else { return }
                 // 一直没字的不自动收（用户可能还在组织语言，或权限框刚点完）
                 guard self.gotAnyText else { return }
                 if Date().timeIntervalSince(self.lastTextAt) >= self.silenceLimit {

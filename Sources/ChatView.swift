@@ -109,7 +109,7 @@ struct ChatView: View {
                 if !store.pending.isEmpty { pendingStrip }
                 inputBar
             case .admin:
-                AdminTabPage()
+                AdminTabPage(store: store)
             case .mine:
                 MineTabPage(store: store)
             }
