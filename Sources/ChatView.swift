@@ -218,12 +218,14 @@ struct ChatView: View {
     }
 
     private var statusLine: String {
-        if store.detecting { return "检测中…" }
+        // 已经有 base（含启动时用缓存先填上的）就直接说场景，
+        // 不要因为「后台还在校验」就把状态显示成"检测中"吓用户。
+        if store.detecting && store.base == nil { return "连接中…" }
         let p = store.providerName
         switch store.place {
         case .home: return "\(p) · 在家"
         case .away: return "\(p) · 在外"
-        case .unknown: return store.base == nil ? "未连接" : p
+        case .unknown: return store.base == nil ? "连接中…" : p
         }
     }
 
