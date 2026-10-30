@@ -110,6 +110,10 @@ final class Settings: ObservableObject {
     /// 不受运营商 CGNAT 影响，是「在外面」最稳的一条路，所以排在最前面试。
     @Published var publicDomain: String { didSet { store() } }
     @Published var publicAddrs: [String] { didSet { store() } }
+    /// 上次「在家」成功用过的内网地址（含端口），冷启动时直接拿来用，不等探测。
+    @Published var lastLanBase: String { didSet { store() } }
+    /// 上次「在外」成功用过的公网地址（域名或裸 IPv6），同样用于冷启动秒连。
+    @Published var lastPubBase: String { didSet { store() } }
     @Published var gatewayKey: String { didSet { store() } }
     @Published var homeModel: String { didSet { store() } }
     @Published var awayModel: String { didSet { store() } }
@@ -127,6 +131,8 @@ final class Settings: ObservableObject {
         var lanHost: String
         var publicDomain: String?
         var publicAddrs: [String]
+        var lastLanBase: String?
+        var lastPubBase: String?
         var gatewayKey: String
         var homeModel: String
         var awayModel: String
@@ -157,6 +163,7 @@ final class Settings: ObservableObject {
         if s == nil, let old = UserDefaults.standard.data(forKey: oldKey),
            let v1 = try? JSONDecoder().decode(StoredV1.self, from: old) {
             s = Stored(lanHost: v1.lanHost, publicDomain: nil, publicAddrs: v1.publicAddrs,
+                       lastLanBase: nil, lastPubBase: nil,
                        gatewayKey: v1.gatewayKey, homeModel: v1.homeModel,
                        awayModel: v1.awayModel, port: v1.port, gistId: v1.gistId,
                        gistOwner: v1.gistOwner, providers: nil, activeProvider: nil)
@@ -165,11 +172,15 @@ final class Settings: ObservableObject {
         // 默认值故意留空：第一次打开会按常见网段依次并发试，谁通用谁并记住。
         // 写死一个 IP 在不同 WiFi 下必然连不上。
         lanHost = s?.lanHost ?? ""
-        // 默认值从 Info.plist 读（构建时注入），和 Gist 一样不在源码里写死域名
-        publicDomain = s?.publicDomain
-            ?? Bundle.main.infoDictionary?["AIRelayPublicDomain"] as? String
-            ?? ""
+        // 默认值从 Info.plist 读（构建时注入），和 Gist 一样不在源码里写死域名。
+        // 注意：老版本会把 publicDomain 存成空串，空串要当成"没配"，
+        // 否则升级到带域名的新包之后，旧用户永远拿不到默认域名。
+        let bundledDomain = Bundle.main.infoDictionary?["AIRelayPublicDomain"] as? String ?? ""
+        let savedDomain = (s?.publicDomain ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+        publicDomain = savedDomain.isEmpty ? bundledDomain : savedDomain
         publicAddrs = s?.publicAddrs ?? []
+        lastLanBase = s?.lastLanBase ?? ""
+        lastPubBase = s?.lastPubBase ?? ""
         gatewayKey = s?.gatewayKey ?? ""
         homeModel = s?.homeModel ?? ""
         awayModel = s?.awayModel ?? ""
@@ -190,6 +201,7 @@ final class Settings: ObservableObject {
 
     private func store() {
         let s = Stored(lanHost: lanHost, publicDomain: publicDomain, publicAddrs: publicAddrs,
+                       lastLanBase: lastLanBase, lastPubBase: lastPubBase,
                        gatewayKey: gatewayKey,
                        homeModel: homeModel, awayModel: awayModel, port: port,
                        gistId: gistId, gistOwner: gistOwner,
@@ -240,6 +252,25 @@ final class Settings: ObservableObject {
     }
 
     // MARK: 来源
+
+    /// 启动瞬间能直接用的 base（上次成功的地址），没缓存就返回 nil。
+    ///
+    /// 只挑一个：连着 WiFi 优先内网（快），否则用公网。
+    /// 这里不做任何校验——校验交给 bootstrap，那个是异步的，
+    /// 校验期间界面已经能显示地址、能点发送了。
+    var cachedBaseForLaunch: (base: String, place: NetPlace)? {
+        // 不在主线程之外调 NetInfo：getifaddrs 是系统调用，放后台线程读没问题，
+        // 但 ChatStore.init 本身就是主线程，这里保持同步、不做 await 最稳。
+        let onWiFi = NetInfo.hasUsableWiFi()
+        if onWiFi, !lastLanBase.isEmpty {
+            return (lastLanBase, .home)
+        }
+        if !lastPubBase.isEmpty {
+            return (lastPubBase, .away)
+        }
+        // 没 WiFi 也没有公网缓存时，内网地址也只是个念想，交给 bootstrap 去探测更好
+        return nil
+    }
 
     /// 固定域名基地址（没有配置就返回 nil）。
     ///
