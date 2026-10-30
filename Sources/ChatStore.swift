@@ -27,6 +27,11 @@ final class ChatStore: ObservableObject {
     @Published var sessions: [Session] = []
     @Published var currentSessionId: String = ""
 
+    /// 底部 Tab 当前选中项。原版有四个：任务 / 定时任务 / 发现 / 我的。
+    /// 咱们这边只让「任务」是真页面，另外三个做成"半成品说明页"——
+    /// 不假装有功能，点进去明说这个功能还没接，比给个假界面强。
+    @Published var tab: MainTab = .tasks
+
     private let client = RelayClient.shared
     private let settings = Settings.shared
 
@@ -153,6 +158,19 @@ final class ChatStore: ObservableObject {
     var provider: Provider? { settings.currentProvider }
 
     var providerName: String { provider?.name ?? "未选择" }
+
+    /// 顶栏大标题：对齐 WorkBuddy 的「任务名」。
+    /// 原版顶栏第二行是「电脑名 | 任务」，第一行就是当前任务名。
+    var currentSessionTitle: String {
+        guard let s = sessions.first(where: { $0.id == currentSessionId }) else { return "新任务" }
+        let t = s.displayTitle
+        return t.isEmpty ? "新任务" : t
+    }
+
+    /// 顶栏第二行显示「设备名 | 场景」里的设备名部分。
+    /// 原版显示的是登录的那台电脑名（DESKTOP-xxx），咱们这边对应「家里那台路由器」。
+    /// 用 UIDevice 的真实名字反而误导（那是"我的 iPhone"），所以写路由器型号更实在。
+    var deviceLabel: String { "Redmi AC2100" }
 
     // MARK: 当前模型能力
 

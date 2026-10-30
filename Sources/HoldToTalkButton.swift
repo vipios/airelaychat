@@ -18,10 +18,13 @@ struct HoldToTalkButton: View {
     private let cancelDistance: CGFloat = 60
 
     var body: some View {
-        Image(systemName: voice.recording ? "mic.circle.fill" : "mic.circle")
-            .font(.system(size: 27))
+        // 参考图上这个位置是一枚声波图标（一个点 + 两道弧），不是麦克风：
+        // `·))`。别用 mic —— 形状差得远，一眼就看出来不是原版。
+        Image(systemName: voice.recording ? "waveform" : "dot.radiowaves.left.and.right")
+            .font(.system(size: 18, weight: .regular))
             .foregroundStyle(color)
-            .scaleEffect(voice.recording ? 1.12 : 1.0)
+            .frame(width: 30, height: 30)
+            .scaleEffect(voice.recording ? 1.1 : 1.0)
             .animation(.easeOut(duration: 0.12), value: voice.recording)
             .contentShape(Rectangle())
             .opacity(disabled ? 0.4 : 1)
@@ -78,6 +81,7 @@ struct HoldToTalkButton: View {
     private var color: Color {
         if cancelled { return .red }
         if voice.recording { return .red }
-        return disabled ? .secondary : .accentColor
+        // 平时用近黑（参考图里这枚图标是深色，不是灰的），禁用才退成灰
+        return disabled ? Theme.sub : Theme.inkSoft
     }
 }

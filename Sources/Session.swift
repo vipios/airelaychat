@@ -1,5 +1,37 @@
 import Foundation
 
+// MARK: - 底部导航
+
+/// 对齐 WorkBuddy 手机端底部的四个入口。
+/// 原版是「任务 / 定时任务 / 发现 / 我的」，图标依次是
+/// 对话气泡（选中态是实心深色）/ 秒表 / 指南针 / 人像。
+enum MainTab: String, CaseIterable, Identifiable {
+    case tasks = "任务"
+    case scheduled = "定时任务"
+    case discover = "发现"
+    case mine = "我的"
+
+    var id: String { rawValue }
+
+    var icon: String {
+        switch self {
+        case .tasks: return "bubble.left.and.bubble.right"
+        case .scheduled: return "stopwatch"
+        case .discover: return "safari"
+        case .mine: return "person"
+        }
+    }
+
+    var iconFilled: String {
+        switch self {
+        case .tasks: return "bubble.left.and.bubble.right.fill"
+        case .scheduled: return "stopwatch.fill"
+        case .discover: return "safari.fill"
+        case .mine: return "person.fill"
+        }
+    }
+}
+
 // MARK: - 会话（抽屉里的「任务」）
 
 /// 落盘用的消息结构。

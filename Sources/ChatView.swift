@@ -32,7 +32,9 @@ struct ChatView: View {
             mainColumn
 
             if drawerOpen {
-                Color.black.opacity(0.26)
+                // 遮罩按参考图采到的 #ADADAD 反推 ≈ 30% 黑，
+                // 比我原来用的 26% 略重一点，抽屉的"压过去"感更明显
+                Color.black.opacity(0.30)
                     .ignoresSafeArea()
                     .transition(.opacity)
                     .onTapGesture { closeDrawer() }
@@ -94,13 +96,19 @@ struct ChatView: View {
 
     private var mainColumn: some View {
         VStack(spacing: 0) {
-            topBar
-            messagesArea
-            if let err = store.errorText { errorBanner(err) }
-            if !store.pending.isEmpty { pendingStrip }
-            inputBar
+            switch store.tab {
+            case .tasks:
+                topBar
+                messagesArea
+                if let err = store.errorText { errorBanner(err) }
+                if !store.pending.isEmpty { pendingStrip }
+                inputBar
+            default:
+                otherTabPage(store.tab)
+            }
+            bottomTabBar
         }
-        .background(Color(.systemBackground))
+        .background(Theme.page)
         .contentShape(Rectangle())
         // 从屏幕左缘往右滑打开抽屉。只在起点靠左、主要横向移动时触发，
         // 不会抢走消息列表的纵向滚动。
@@ -117,47 +125,201 @@ struct ChatView: View {
         )
     }
 
+    // MARK: - 底部导航
+
+    /// 结构照 WorkBuddy：四个图标 + 下方小字，选中态是深色实心图标 + 深色文字。
+    /// 原版选中时图标底色是个小圆角方块，这里用同样的处理。
+    private var bottomTabBar: some View {
+        // 参考图的 Tab 栏上方没有分隔线，颜色和消息区完全一样。
+        // 所以这里只有一条透明的背景，靠"图标离得远"来分区。
+        VStack(spacing: 0) {
+            HStack(spacing: 0) {
+                ForEach(MainTab.allCases) { t in
+                    Button {
+                        if store.tab == t { return }
+                        inputFocused = false
+                        store.tab = t
+                    } label: {
+                        VStack(spacing: 3) {
+                            ZStack {
+                                if store.tab == t {
+                                    RoundedRectangle(cornerRadius: 7, style: .continuous)
+                                        .fill(Color.primary)
+                                        .frame(width: 27, height: 23)
+                                }
+                                Image(systemName: store.tab == t ? t.iconFilled : t.icon)
+                                    .font(.system(size: 15, weight: .regular))
+                                    .foregroundStyle(store.tab == t ? Theme.card : Theme.sub)
+                            }
+                            .frame(height: 23)
+
+                            Text(t.rawValue)
+                                .font(.system(size: 10, weight: store.tab == t ? .medium : .regular))
+                                .foregroundStyle(store.tab == t ? Color.primary : Theme.sub)
+                        }
+                        .frame(maxWidth: .infinity)
+                        .contentShape(Rectangle())
+                    }
+                    .buttonStyle(.plain)
+                }
+            }
+            .padding(.top, 7)
+            .padding(.bottom, 1)
+        }
+        .background(Theme.page)
+    }
+
+    // MARK: - 其它 Tab 页
+
+    /// 原版另外三个 Tab 在咱们这边没有对应功能：
+    /// 「定时任务」= WorkBuddy 的定时执行；「发现」= 官方内容广场；「我的」= 账号与会员。
+    /// 不假装做出来，明说还没接，并给出能做的替代入口。
+    @ViewBuilder
+    private func otherTabPage(_ t: MainTab) -> some View {
+        VStack(spacing: 0) {
+            HStack {
+                Text(t.rawValue)
+                    .font(.system(size: 17, weight: .semibold))
+                Spacer()
+            }
+            .padding(.horizontal, 16)
+            .padding(.top, 8)
+            .padding(.bottom, 10)
+
+            ScrollView {
+                VStack(alignment: .leading, spacing: 14) {
+                    Image(systemName: t.icon)
+                        .font(.system(size: 34, weight: .light))
+                        .foregroundStyle(.tertiary)
+                        .frame(maxWidth: .infinity, alignment: .center)
+                        .padding(.top, 40)
+
+                    Text(explain(t))
+                        .font(.system(size: 14))
+                        .foregroundStyle(.secondary)
+                        .multilineTextAlignment(.center)
+                        .fixedSize(horizontal: false, vertical: true)
+                        .frame(maxWidth: .infinity)
+                        .padding(.horizontal, 28)
+
+                    VStack(spacing: 10) {
+                        switch t {
+                        case .scheduled:
+                            // 中转站本身就有「自动签到 / 自动升级」这类定时任务，
+                            // 只是它们在网页后台里，这里给个直达入口。
+                            Button {
+                                adminJump()
+                            } label: {
+                                Label("打开中转站后台看定时任务", systemImage: "safari")
+                                    .frame(maxWidth: .infinity)
+                            }
+                            .buttonStyle(.borderedProminent)
+                        case .discover:
+                            EmptyView()
+                        case .mine:
+                            Button { showSettings = true } label: {
+                                Label("打开设置", systemImage: "gearshape")
+                                    .frame(maxWidth: .infinity)
+                            }
+                            .buttonStyle(.borderedProminent)
+                            Button { showDiag = true } label: {
+                                Label("连接诊断", systemImage: "stethoscope")
+                                    .frame(maxWidth: .infinity)
+                            }
+                            .buttonStyle(.bordered)
+                        default:
+                            EmptyView()
+                        }
+                    }
+                    .padding(.horizontal, 28)
+                    .padding(.top, 6)
+                }
+            }
+            .frame(maxHeight: .infinity)
+        }
+    }
+
+    private func explain(_ t: MainTab) -> String {
+        switch t {
+        case .scheduled:
+            return "WorkBuddy 这边的「定时任务」是让电脑按时间自动跑任务。\n\n咱们的中转站没有这个概念，但路由器上确实有定时活（自动签到、自动升级、地址上报），这些在网页后台里能看到，点下面直接过去。"
+        case .discover:
+            return "这一栏在 WorkBuddy 里是官方内容广场（模板、案例、插件推荐）。\n\n咱们是自建中转站，没有这套内容源，所以这里空着。想找能用的模型，去「任务」页点顶部标题就能切换。"
+        case .mine:
+            return "WorkBuddy 的「我的」是账号、会员、积分这些。\n\n咱们这边对应的是中转站设置：密钥、模型来源、连接状态都在里面。"
+        default:
+            return ""
+        }
+    }
+
+    private func adminJump() {
+        // 优先用当前实际在用的地址，在家就是内网、在外就是域名
+        let raw = store.base ?? settings.lanBase
+        if let u = URL(string: raw) {
+            UIApplication.shared.open(u)
+        }
+    }
+
     // MARK: - 顶栏
 
+    /// 结构照 WorkBuddy：
+    ///   [≡]  任务标题（左对齐，粗体 17）      [+]  [⋯]
+    ///        🖥 设备名 | 任务 ▸
+    /// 原版标题是左对齐的，不是居中——居中会让长标题两侧留白很怪。
     private var topBar: some View {
-        HStack(spacing: 10) {
+        HStack(alignment: .top, spacing: 10) {
             circleButton("line.3.horizontal") { openDrawer() }
-
-            Spacer(minLength: 2)
+                .padding(.top, 2)
 
             Button { showModelPicker = true } label: {
-                VStack(spacing: 1) {
-                    HStack(spacing: 3) {
-                        Text(currentModelTitle)
-                            .font(.system(size: 15, weight: .semibold))
-                            .foregroundStyle(.primary)
-                            .lineLimit(1)
-                        Image(systemName: "chevron.down")
-                            .font(.system(size: 9, weight: .semibold))
-                            .foregroundStyle(.secondary)
-                    }
+                VStack(alignment: .leading, spacing: 3) {
+                    Text(store.currentSessionTitle)
+                        .font(.system(size: 17, weight: .semibold))
+                        .foregroundStyle(.primary)
+                        .lineLimit(1)
+                        .truncationMode(.tail)
+
                     HStack(spacing: 4) {
-                        Circle().fill(statusColor).frame(width: 5, height: 5)
-                        Text(statusLine)
+                        Image(systemName: "desktopcomputer")
+                            .font(.system(size: 10))
+                            .foregroundStyle(.secondary)
+                        Text(store.deviceLabel)
+                            .font(.system(size: 11, weight: .medium))
+                            .foregroundStyle(.secondary)
+                            .lineLimit(1)
+                        Text("|")
+                            .font(.system(size: 11))
+                            .foregroundStyle(.quaternary)
+                        Text(placeShort)
                             .font(.system(size: 11))
                             .foregroundStyle(.secondary)
-                            .lineLimit(1)
+                        Image(systemName: "chevron.right")
+                            .font(.system(size: 8, weight: .semibold))
+                            .foregroundStyle(.quaternary)
                     }
                 }
-                .frame(maxWidth: 230)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .contentShape(Rectangle())
             }
             .buttonStyle(.plain)
 
-            Spacer(minLength: 2)
-
-            circleButton("square.and.pencil") {
-                store.newSession()
-                inputFocused = false
+            // 原版右侧是两个：一个「+」、一个「⋯」，都是纯图标、无底色
+            Button { store.newSession() } label: {
+                Image(systemName: "plus")
+                    .font(.system(size: 17, weight: .medium))
+                    .foregroundStyle(.primary)
+                    .frame(width: 34, height: 34)
+                    .contentShape(Rectangle())
             }
+            .buttonStyle(.plain)
+            .padding(.top, 1)
 
             Menu {
                 Button { store.syncCurrentSession() } label: {
                     Label("保存当前对话", systemImage: "tray.and.arrow.down")
+                }
+                Button { showModelPicker = true } label: {
+                    Label("切换模型", systemImage: "cpu")
                 }
                 Button { showDiag = true } label: {
                     Label("连接诊断", systemImage: "stethoscope")
@@ -171,62 +333,49 @@ struct ChatView: View {
                 }
             } label: {
                 Image(systemName: "ellipsis")
-                    .font(.system(size: 15, weight: .semibold))
+                    .font(.system(size: 17, weight: .medium))
                     .foregroundStyle(.primary)
-                    .frame(width: 32, height: 32)
-                    .background(Color(.secondarySystemBackground))
-                    .clipShape(Circle())
+                    .frame(width: 34, height: 34)
+                    .contentShape(Rectangle())
             }
+            .padding(.top, 1)
         }
-        .padding(.horizontal, 14)
+        .padding(.horizontal, 10)
         .padding(.top, 6)
         .padding(.bottom, 8)
-        .background(Color(.systemBackground))
-        .overlay(alignment: .bottom) {
-            Rectangle()
-                .fill(Color(.separator).opacity(0.5))
-                .frame(height: 0.5)
+        // 顶栏不单独上色，直接透出页面底色 —— 参考图整页是同一块 #F8F8F8，
+        // 中间没有任何分隔线，加了分隔线就会碎成"上中下三块"。
+        .background(Theme.page)
+    }
+
+    /// 顶栏副行里的场景短标签（对齐原版「任务 ▸」那个位置的语气）
+    private var placeShort: String {
+        if store.detecting && store.base == nil { return "连接中" }
+        switch store.place {
+        case .home: return "在家"
+        case .away: return "在外"
+        case .unknown: return store.base == nil ? "连接中" : "已连接"
         }
     }
 
+    /// 顶栏和抽屉里的圆形按钮。
+    ///
+    /// 参考图上这些按钮**没有底色**（按钮中心的像素和页面背景一模一样），
+    /// 就是一枚纯图标。所以这里不要加 background，加了就会多出一圈灰饼。
     private func circleButton(_ icon: String, action: @escaping () -> Void) -> some View {
         Button(action: action) {
             Image(systemName: icon)
-                .font(.system(size: 15, weight: .semibold))
+                .font(.system(size: 16, weight: .medium))
                 .foregroundStyle(.primary)
-                .frame(width: 32, height: 32)
-                .background(Color(.secondarySystemBackground))
-                .clipShape(Circle())
+                .frame(width: 34, height: 34)
+                .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
-    }
-
-    private var currentModelTitle: String {
-        if store.currentModel.isEmpty { return "选择模型" }
-        return store.models.first(where: { $0.id == store.currentModel })?.display
-            ?? shortName(store.currentModel)
     }
 
     private func shortName(_ m: String) -> String {
         if let i = m.firstIndex(of: "|") { return String(m[m.index(after: i)...]) }
         return m
-    }
-
-    private var statusColor: Color {
-        if store.detecting { return .orange }
-        return store.base != nil ? Color.green : Color.orange
-    }
-
-    private var statusLine: String {
-        // 已经有 base（含启动时用缓存先填上的）就直接说场景，
-        // 不要因为「后台还在校验」就把状态显示成"检测中"吓用户。
-        if store.detecting && store.base == nil { return "连接中…" }
-        let p = store.providerName
-        switch store.place {
-        case .home: return "\(p) · 在家"
-        case .away: return "\(p) · 在外"
-        case .unknown: return store.base == nil ? "连接中…" : p
-        }
     }
 
     // MARK: - 消息区
@@ -294,33 +443,32 @@ struct ChatView: View {
     @ViewBuilder
     private func bubble(_ msg: ChatMessage) -> some View {
         if msg.role == "user" {
+            // 原版用户消息是右侧**白色**圆角块 + 黑字，靠一层极淡阴影从
+            // #F8F8F8 底色上浮起来。不是蓝色气泡（微信那一套），
+            // 也不是灰气泡 —— 灰度差太小会糊在一起，白色反而更清楚。
             HStack(alignment: .top) {
                 Spacer(minLength: 48)
                 VStack(alignment: .trailing, spacing: 6) {
                     attachmentsView(msg)
                     if !msg.text.isEmpty || msg.attachments.isEmpty {
                         Text(msg.text.isEmpty ? " " : msg.text)
-                            .font(.system(size: 15))
-                            .foregroundStyle(.white)
+                            .font(.system(size: 15.5))
+                            .foregroundStyle(.primary)
                             .multilineTextAlignment(.leading)
                             .textSelection(.enabled)
-                            .padding(.horizontal, 13)
-                            .padding(.vertical, 9)
-                            .background(Color.accentColor)
-                            .clipShape(RoundedRectangle(cornerRadius: 16, style: .continuous))
+                            .padding(.horizontal, 14)
+                            .padding(.vertical, 10)
+                            .background(Theme.card)
+                            .clipShape(RoundedRectangle(cornerRadius: 18, style: .continuous))
+                            .shadow(color: Color.black.opacity(0.045), radius: 5, y: 1)
                     }
                 }
             }
         } else {
+            // AI 回复：无气泡、左对齐、正文黑字。原版就是这样，
+            // 也不显示模型名小标（模型在顶栏标题里）。这里保留一个小标，
+            // 因为咱们一个任务里可能中途切换模型，标出来更有用。
             VStack(alignment: .leading, spacing: 6) {
-                HStack(spacing: 5) {
-                    Image(systemName: "sparkles").font(.system(size: 10))
-                    Text(shortName(msg.model.isEmpty ? store.currentModel : msg.model))
-                        .font(.system(size: 10, weight: .medium))
-                        .lineLimit(1)
-                }
-                .foregroundStyle(.tertiary)
-
                 attachmentsView(msg)
 
                 if !msg.text.isEmpty || msg.attachments.isEmpty {
@@ -330,6 +478,13 @@ struct ChatView: View {
                         .fixedSize(horizontal: false, vertical: true)
                         .textSelection(.enabled)
                         .frame(maxWidth: .infinity, alignment: .leading)
+                }
+
+                if !msg.model.isEmpty {
+                    Text(shortName(msg.model))
+                        .font(.system(size: 10))
+                        .foregroundStyle(.quaternary)
+                        .padding(.top, 1)
                 }
 
                 if msg.failed {
@@ -487,51 +642,27 @@ struct ChatView: View {
                 .padding(.vertical, 8)
             }
         }
-        .background(Color(.systemBackground))
+        .background(Theme.page)
     }
 
     // MARK: - 输入栏（悬浮胶囊）
 
     private var inputBar: some View {
         VStack(spacing: 0) {
-            if voice.recording {
-                // 录音时占位显示实时识别结果
-                HStack(spacing: 8) {
-                    Image(systemName: "waveform").font(.system(size: 15)).foregroundStyle(.red)
+            HStack(alignment: .center, spacing: 8) {
+                if voice.recording {
+                    // 录音态：波形 + 实时识别，占住整条胶囊
+                    Image(systemName: "waveform")
+                        .font(.system(size: 17))
+                        .foregroundStyle(.red)
                     Text(voice.partial.isEmpty ? "正在听…" : voice.partial)
-                        .font(.system(size: 15))
-                        .foregroundStyle(voice.partial.isEmpty ? .secondary : .primary)
+                        .font(.system(size: 16))
+                        .foregroundStyle(voice.partial.isEmpty ? Theme.sub : Color.primary)
                         .lineLimit(2)
                     Spacer(minLength: 0)
-                }
-                .padding(.horizontal, 14)
-                .padding(.vertical, 12)
-                .background(Color(.secondarySystemBackground))
-                .clipShape(RoundedRectangle(cornerRadius: 22, style: .continuous))
-                .padding(.horizontal, 14)
-                .padding(.bottom, 8)
-            } else {
-                HStack(alignment: .bottom, spacing: 6) {
-                    Button { showAttachMenu = true } label: {
-                        Image(systemName: "plus")
-                            .font(.system(size: 16, weight: .semibold))
-                            .foregroundStyle(.primary)
-                            .frame(width: 32, height: 32)
-                            .background(Color(.tertiarySystemFill))
-                            .clipShape(Circle())
-                    }
-                    .buttonStyle(.plain)
-                    .disabled(store.sending)
-                    .padding(.bottom, 2)
-
-                    TextField("发消息或按住说话…", text: $store.input, axis: .vertical)
-                        .lineLimit(1...5)
-                        .font(.system(size: 15))
-                        .focused($inputFocused)
-                        .padding(.vertical, 8)
-                        .padding(.horizontal, 2)
-
-                    // 按住说话放在发送键左边
+                } else {
+                    // 左边声波 = 按住说话。参考图上它就是一枚纯图标，
+                    // 没有圆底、没有"语音"两个字。
                     HoldToTalkButton(voice: voice, disabled: store.sending) { text in
                         // 识别结果填进输入栏，光标落到末尾、键盘弹出，
                         // 由你自己确认后再点发送 —— 不自动发出去。
@@ -544,25 +675,49 @@ struct ChatView: View {
                         }
                         inputFocused = true
                     }
-                    .padding(.bottom, 2)
 
-                    Button { sendIfPossible() } label: {
-                        Image(systemName: sendIcon)
-                            .font(.system(size: 30))
-                            .foregroundStyle(store.canSend ? Color.accentColor
-                                             : Color.secondary.opacity(0.45))
+                    TextField("发消息或按住说话...", text: $store.input, axis: .vertical)
+                        .lineLimit(1...5)
+                        .font(.system(size: 16))
+                        .focused($inputFocused)
+                        .padding(.vertical, 4)
+
+                    // 右边：空的时候是「+」（加附件），写了字就换成「↑」发出去。
+                    // 用 hasDraft 而不是 store.canSend 判断 —— canSend 在发送中会变 false，
+                    // 拿它做判断会让按钮在发送瞬间跳回加号，看着像卡了一下。
+                    if hasDraft {
+                        Button { sendIfPossible() } label: {
+                            Image(systemName: "arrow.up")
+                                .font(.system(size: 15, weight: .semibold))
+                                .foregroundStyle(Theme.card)
+                                .frame(width: 30, height: 30)
+                                .background(Color.primary)
+                                .clipShape(Circle())
+                        }
+                        .buttonStyle(.plain)
+                        .disabled(!store.canSend)
+                        .opacity(store.canSend ? 1 : 0.4)
+                    } else {
+                        Button { showAttachMenu = true } label: {
+                            Image(systemName: "plus")
+                                .font(.system(size: 20, weight: .regular))
+                                .foregroundStyle(Theme.inkSoft)
+                                .frame(width: 30, height: 30)
+                                .contentShape(Rectangle())
+                        }
+                        .buttonStyle(.plain)
+                        .disabled(store.sending)
                     }
-                    .disabled(!store.canSend)
-                    .buttonStyle(.plain)
-                    .padding(.bottom, 1)
                 }
-                .padding(.horizontal, 8)
-                .padding(.vertical, 7)
-                .background(Color(.secondarySystemBackground))
-                .clipShape(RoundedRectangle(cornerRadius: 24, style: .continuous))
-                .padding(.horizontal, 12)
-                .padding(.bottom, 8)
             }
+            .padding(.leading, 14)
+            .padding(.trailing, 10)
+            .padding(.vertical, 9)
+            .frame(minHeight: 54)
+            .floatingCard(corner: 27)
+            .padding(.horizontal, 12)
+            .padding(.top, 4)
+            .padding(.bottom, 8)
 
             if let e = voice.error {
                 HStack(spacing: 6) {
@@ -581,7 +736,7 @@ struct ChatView: View {
                 .padding(.bottom, 6)
             }
         }
-        .background(Color(.systemBackground))
+        .background(Theme.page)
         .overlay(alignment: .top) {
             if let t = store.toast {
                 Text(t)
@@ -597,9 +752,14 @@ struct ChatView: View {
         }
     }
 
-    private var sendIcon: String {
-        if store.sending { return "hourglass.circle.fill" }
-        return store.canSend ? "arrow.up.circle.fill" : "arrow.up.circle"
+    /// 输入框里有没有"待发出去的东西"（文字或附件）。
+    ///
+    /// 单独拎出来是因为不能直接用 store.canSend 判断显示「+」还是「↑」：
+    /// canSend 在"正在发送"时会变成 false，拿它当判断会让按钮在点击瞬间
+    /// 跳回加号，看起来像点了没反应。
+    private var hasDraft: Bool {
+        !store.input.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            || !store.pending.isEmpty
     }
 
     private func sendIfPossible() {
