@@ -175,6 +175,7 @@ final class RelayClient {
         // 记住这次能通的地址，下次优先试它（只有真的变了才写，避免反复落盘）
         await MainActor.run {
             if settings.lanHost != host { settings.lanHost = host }
+            if settings.lastLanBase != hit.base { settings.lastLanBase = hit.base }
         }
         return (hit.base, hit.health)
     }
@@ -194,6 +195,9 @@ final class RelayClient {
         let base = await MainActor.run { settings.domainBase }
         guard let base = base else { return nil }
         if let h = await probeHealth(base, timeout: 8.0, session: session) {
+            await MainActor.run {
+                if settings.lastPubBase != base { settings.lastPubBase = base }
+            }
             return (base, h)
         }
         return nil
@@ -203,7 +207,50 @@ final class RelayClient {
         let port = await MainActor.run { settings.port }
         let bases = addrs.map { "http://[\($0)]:\(port)" }
         guard let hit = await firstAlive(bases, timeout: 4.0, session: session) else { return nil }
+        await MainActor.run {
+            if settings.lastPubBase != hit.base { settings.lastPubBase = hit.base }
+        }
         return hit.base
+    }
+
+    // MARK: - 冷启动秒连（用上次成功的地址，不先探测）
+
+    /// 用户原话：「打开能直接对话」。要做到这一点，打开 App 的第一秒就必须有一个
+    /// 能用的 base，而探测（内网候选 × 0.9 秒、域名 × 8 秒）本身就要时间。
+    ///
+    /// 做法：把上次成功的 base 直接拿来用，同时后台悄悄校验一次。
+    /// 校验失败就把缓存丢掉、退回正常探测流程，用户最多看到一次"重试"，不会有长时间空白。
+    ///
+    /// 为什么两条缓存分开存：在家用 `http://192.168.1.88:8080`，
+    /// 在外用 `https://域名`，二者不能互相替代。合并成一个的话，
+    /// 出门第一次打开会先拿内网地址去撞墙，反而更慢。
+    private func cachedCandidate() async -> (place: NetPlace, base: String)? {
+        let lan = await MainActor.run { settings.lastLanBase }
+        let pub = await MainActor.run { settings.lastPubBase }
+
+        // 内网缓存只在手机确实连着 WiFi 时才试：没连 WiFi 还拿内网地址去连，
+        // 必定超时，纯粹浪费用户时间。
+        let onWiFi = NetInfo.hasUsableWiFi()
+
+        if onWiFi, !lan.isEmpty,
+           await probeHealth(lan, timeout: 0.8, session: lanSession) != nil {
+            // 顺手把内网 host 同步回设置，设置页显示的就是"现在真正在用的地址"
+            if let h = URL(string: lan)?.host, !h.isEmpty {
+                await MainActor.run {
+                    if settings.lanHost != h { settings.lanHost = h }
+                }
+            }
+            return (.home, lan)
+        }
+        if !pub.isEmpty, await probeHealth(pub, timeout: 2.5, session: session) != nil {
+            return (.away, pub)
+        }
+        // 缓存都不通：清掉，避免下次继续拿死地址试
+        await MainActor.run {
+            if !lan.isEmpty { settings.lastLanBase = "" }
+            if !pub.isEmpty { settings.lastPubBase = "" }
+        }
+        return nil
     }
 
     // MARK: - Gist 读地址（三路降级）
@@ -269,6 +316,12 @@ final class RelayClient {
     /// 谁先回来用谁。这样「连了别的 WiFi（比如公司）」也能自动落到公网地址，
     /// 不会傻等内网超时。
     func resolve() async -> (place: NetPlace, base: String?, health: HealthInfo?) {
+        // 第一步：上次成功的地址（在家内网 / 在外域名）直接验证一下。
+        // 通畅就立刻返回，跳过下面所有探测 —— 这是「打开就能直接对话」的关键。
+        if let c = await cachedCandidate() {
+            return (c.place, c.base, nil)
+        }
+
         let onWiFi = NetInfo.hasUsableWiFi()
 
         if onWiFi {
@@ -320,13 +373,11 @@ final class RelayClient {
 
     /// 公网地址候选：域名和裸 IPv6 同时并发试，谁先回来用谁。
     ///
-    /// 为什么要并发而不是先域名后 IPv6：IPv6 直连现在基本走不通
-    /// （家宽入站被光猫丢弃，这一点已用防火墙计数器证实），
-    /// 串行的话每次都要先等它超时，在外面冷启动会白等好几秒。
-    /// 并发后总耗时约等于最快那条路的时间。
-    ///
-    /// 域名这条路更可靠，所以它先命中就用它；IPv6 命中说明用户网络
-    /// 恰好可达，也不拦着。
+    /// 2026-10-31 变更：家用公网的 IPv6 入站已被按用户要求全部封堵
+    /// （实测 `[2409:...]:8080` → ConnectionRefused），裸 IPv6 这条路
+    /// 只作为「万一将来重新放开」的兜底，不再当成主路径。
+    /// 所以顺序改成：域名优先、并发打 IPv6 只当备份，且**不再因为 IPv6
+    /// 失败就去拉 Gist**——那会白白多花几秒。
     private func publicCandidate() async -> String? {
         let cached = await MainActor.run { settings.publicAddrs }
         let hasDomain = await MainActor.run { !settings.publicDomain.isEmpty }
@@ -355,7 +406,10 @@ final class RelayClient {
         }
         if let hit = hit { return hit }
 
-        // 缓存全失效（运营商换了 IPv6 前缀）：问 Gist 要最新的
+        // 只有「完全没配域名」时才去问 Gist 兜底。
+        // 配了域名还去拉 Gist，等于每次外网失败都多等一次网络请求。
+        guard !hasDomain else { return nil }
+
         if let g = await fetchGistAddr(), let ips = g.ipv6, !ips.isEmpty {
             let newPort = (g.port ?? 0) > 0 ? g.port! : 0
             await MainActor.run {
