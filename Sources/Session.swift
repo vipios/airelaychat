@@ -80,7 +80,8 @@ enum SessionStore {
     static func load() -> [Session] {
         guard let url = fileURL, let data = try? Data(contentsOf: url) else { return [] }
         let dec = JSONDecoder()
-        dec.dateEncodingStrategy = .iso8601
+        // 读的是解码策略（编码策略是 JSONEncoder 的属性，写到 JSONDecoder 上编译不过）
+        dec.dateDecodingStrategy = .iso8601
         return (try? dec.decode([Session].self, from: data)) ?? []
     }
 
