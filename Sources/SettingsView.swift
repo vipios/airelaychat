@@ -18,6 +18,7 @@ struct SettingsView: View {
         NavigationStack {
             Form {
                 providerSection
+                currentLinkSection
                 modelSection
                 connectionSection
                 publicSection
@@ -246,6 +247,54 @@ struct SettingsView: View {
             Text("公网地址")
         } footer: {
             Text("路由器的 IPv6 前缀可能被运营商换掉。它每 5 分钟把最新地址写进 Gist，连不上时软件会自动去拉。")
+        }
+    }
+
+    // MARK: 当前连接
+
+    private var linkStateText: String {
+        if store.detecting && store.base == nil { return "连接中…" }
+        if store.base == nil { return "没连上" }
+        switch store.place {
+        case .home: return "在家（内网直连）"
+        case .away: return "在外（域名）"
+        case .unknown: return "已连接"
+        }
+    }
+
+    private var currentLinkSection: some View {
+        Section {
+            HStack {
+                Text("状态")
+                Spacer()
+                Text(linkStateText)
+                    .font(.system(size: 13))
+                    .foregroundStyle(store.base == nil ? .orange : .green)
+            }
+            if let b = store.base {
+                HStack(alignment: .top) {
+                    Text("正在用")
+                    Spacer()
+                    Text(b)
+                        .font(.system(size: 12, design: .monospaced))
+                        .foregroundStyle(.secondary)
+                        .multilineTextAlignment(.trailing)
+                        .textSelection(.enabled)
+                }
+            }
+            Button {
+                // 清掉"上次成功地址"缓存，逼它重新探一遍。
+                // 换了 WiFi、光猫改了网段、或者出门很久再回来时会用得上。
+                settings.lastLanBase = ""
+                settings.lastPubBase = ""
+                Task { await store.bootstrap() }
+            } label: {
+                Label("重新判定在家/在外", systemImage: "arrow.triangle.2.circlepath")
+            }
+        } header: {
+            Text("当前连接")
+        } footer: {
+            Text("打开软件时会自动判断：连家里 WiFi 走内网直连，否则走固定域名。切网络时会自动重新判断，一般不用管这里。")
         }
     }
 
