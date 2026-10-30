@@ -197,10 +197,13 @@ final class Diagnostics: ObservableObject {
                 rows.append(DiagRow(target: "—", label: "公网", ok: false,
                                     detail: "没有缓存的公网地址"))
             } else {
+                // 说明：IPv6 直连的 8080 已经按用户要求封堵了，
+                // 这一行预期就是红的，看到红不代表出问题。
                 for ip in addrs {
                     let base = "http://[\(ip)]:\(settings.port)"
                     let r = await probe(base + "/health")
-                    rows.append(DiagRow(target: base, label: "公网", ok: r.ok, detail: r.detail))
+                    rows.append(DiagRow(target: base, label: "公网直连(已封)", ok: r.ok,
+                                        detail: r.ok ? r.detail : "已封堵，属于正常"))
                     if r.ok { pubHit = true }
                 }
             }
@@ -216,24 +219,25 @@ final class Diagnostics: ObservableObject {
             summary = "固定域名通了。在外面也能正常用。"
             suggestion = "这条走 Cloudflare 隧道，不依赖手机 IPv6，最稳妥。"
         } else if pubHit {
-            summary = "内网不通但公网通。说明你现在不在家里 WiFi 上，或者手机连的是别的 WiFi。"
-            suggestion = "想在家走内网的话：连上家里 WiFi 再点一次诊断。"
+            summary = "内网不通但公网直连通。"
+            suggestion = "公网直连本来是封着的，既然通了你也可以直接用。"
         } else if wifiIP == nil {
-            summary = "手机没有连任何 WiFi，内网地址当然访问不到。"
+            summary = "手机没有连任何 WiFi。"
             suggestion = cellular.isEmpty
                 ? "打开 WiFi 连上家里的路由器，或者确认手机有移动网络。"
-                : "你现在在走流量。在家请连家里 WiFi；在外面需要手机支持 IPv6 才能连公网。"
+                : "你现在在走流量。这种情况应该走固定域名那条路——如果域名也红了，说明隧道没起来，去路由器上看 cloudflared 进程。"
         } else {
             // 连了 WiFi 但内网不通：要么连错 WiFi，要么权限被拦
             let anySameSeg = settings.lanCandidates.contains {
                 NetInfo.sameSubnet24(wifiIP!, $0)
             }
             if !anySameSeg {
-                summary = "手机连的 WiFi（\(wifiIP!)）和家里路由器不在同一网段。"
+                summary = "手机连的 WiFi（\(wifiIP!)）不是家里那个。"
                 suggestion = """
-                说明你连的不是家里路由器的 WiFi，可能是邻居的、公司的、或者光猫另一个 SSID。
-                解决：连上家里路由器发出的那个 WiFi 再试。
-                或者：把下面「手动配置」里的地址改成这个 WiFi 的网关 IP 再诊断一次。
+                这不一定是问题：不在家里的时候本来就该走固定域名。
+                如果你确实在家、连的也是家里 WiFi，那要检查：
+                1. 家里路由器的 LAN 网段是不是 192.168.x.x（改了网段的话 App 猜不到）
+                2. 在「设置 → 家里中转站 → 路由器地址」里手动填一下路由器的 IP
                 """
             } else {
                 summary = "同一网段却连不上，基本可以确定是 iOS 的「本地网络」权限被拦。"
