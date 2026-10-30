@@ -43,6 +43,15 @@ final class ChatStore: ObservableObject {
             currentSessionId = top.id
             messages = top.messages.map { $0.toChatMessage() }
         }
+
+        // 先用上次成功的地址把 base 填上，让界面第一帧就是"可用"。
+        // 不这么做的话，打开 App 到探测完成之间有一段时间 base == nil，
+        // 发送按钮是灰的，用户会以为卡住了。
+        // 这个值是"乐观"的：bootstrap 会立刻校验并纠正，连不上会自动换。
+        if let cached = settings.cachedBaseForLaunch {
+            base = cached.base
+            place = cached.place
+        }
     }
 
     // MARK: 会话操作
@@ -201,6 +210,9 @@ final class ChatStore: ObservableObject {
     // MARK: - 启动 / 重新检测
 
     /// 进前台、切网络、点重试都走这里。已有对话不会被清掉。
+    ///
+    /// 2026-10-31 改：(1) 已有可用 base 时**不阻塞界面**，把校验丢后台；
+    /// (2) 拿到新 base 立刻记住，下次打开秒连。
     func bootstrap(loadModels: Bool = true) async {
         guard !detecting else { return }
         detecting = true
@@ -212,6 +224,7 @@ final class ChatStore: ObservableObject {
             return
         }
 
+        let hadBase = (base != nil)
         let (b, pl) = await client.base(for: p)
         place = pl
         base = b
@@ -222,11 +235,15 @@ final class ChatStore: ObservableObject {
                 : RelayError.notConfigured.errorDescription
             return
         }
+        errorText = nil
+        // 刚才已经有 base（启动时用的是缓存）：说明用户已经能发消息了，
+        // 这时候再去拉模型列表只是补充信息，失败了也不该弹错吓人。
         guard loadModels, let bb = b else { return }
-        await loadModelsFrom(base: bb, provider: p)
+        await loadModelsFrom(base: bb, provider: p, quiet: hadBase)
     }
 
-    private func loadModelsFrom(base bb: String, provider p: Provider) async {
+    private func loadModelsFrom(base bb: String, provider p: Provider,
+                                quiet: Bool = false) async {
         let key = settings.key(for: p)
         do {
             let list = try await client.models(base: bb, key: key)
@@ -251,8 +268,9 @@ final class ChatStore: ObservableObject {
                 currentModel = list.first?.id ?? ""
             }
         } catch {
-            // 模型拉不到不影响聊天（还能用上次选的），只提示不打断
-            if models.isEmpty {
+            // 模型拉不到不影响聊天（还能用上次选的），只提示不打断。
+            // quiet=true 表示这一轮是后台补充，连提示都不必给。
+            if models.isEmpty && !quiet {
                 errorText = error.localizedDescription
             }
         }
@@ -382,16 +400,50 @@ final class ChatStore: ObservableObject {
                 }
             }
         } catch {
-            if idx < messages.count, messages[idx].text.isEmpty {
-                messages[idx].text = "（没发出去）"
-                messages[idx].failed = true
+            // 这里是「打开就能用」体验的最后一环：
+            // 启动时用的是缓存地址，如果恰好出门/回家导致缓存失效，
+            // 第一条消息会失败。这时候不该直接把错误甩给用户，
+            // 先重新判定一次场景、换成对的地址、自动重发一遍。
+            // 只有在「一个字都没收到」时才重试——已经流出内容说明链路是通的，
+            // 中途断掉重发会让用户看到重复的内容。
+            let gotNothing = (idx < messages.count) && messages[idx].text.isEmpty
+            var recovered = false
+            if gotNothing {
+                await bootstrap(loadModels: false)
+                if let nb = base, nb != b {
+                    recovered = await retryStream(base: nb, key: key, model: model,
+                                                  history: history, idx: idx)
+                }
             }
-            errorText = error.localizedDescription
-            // 网络中途断了，重新判定场景，下次发送更靠谱
-            await bootstrap(loadModels: false)
+            if !recovered {
+                if idx < messages.count, messages[idx].text.isEmpty {
+                    messages[idx].text = "（没发出去）"
+                    messages[idx].failed = true
+                }
+                errorText = error.localizedDescription
+                // 网络中途断了，重新判定场景，下次发送更靠谱
+                await bootstrap(loadModels: false)
+            }
         }
         sending = false
         syncCurrentSession()
+    }
+
+    /// 换地址后重发一次。成功返回 true（已有内容流进来）。
+    private func retryStream(base nb: String, key: String, model: String,
+                             history: [(role: String, text: String, attachments: [Attachment])],
+                             idx: Int) async -> Bool {
+        do {
+            try await client.stream(base: nb, key: key, model: model, messages: history) { delta in
+                Task { @MainActor in
+                    guard idx < self.messages.count else { return }
+                    self.messages[idx].text += delta
+                }
+            }
+            return !((idx < messages.count) && messages[idx].text.isEmpty)
+        } catch {
+            return false
+        }
     }
 
     /// 重发最后一条用户消息
