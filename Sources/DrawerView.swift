@@ -1,33 +1,36 @@
 import SwiftUI
 
-// MARK: - 左侧抽屉（1:1 对齐 WorkBuddy 侧边栏）
+// MARK: - 左侧抽屉
 
-/// 原版结构（照截图逐项对齐）：
-///   顶部：🖥 电脑名 ⌄            [≡]   ← 右上角那个菜单钮其实是关闭
-///   「⊕ 新建任务」白底大按钮，圆角、描边
-///   「任务 (3) ⌄」 可折叠分组 → 纯文字任务项，选中项浅灰底 + 右侧转圈
-///   「空间 (1) ⌄」 可折叠分组 → 带图标的条目
-///   每项都没有副标题、没有聊天气泡图标，就是一行文字
+/// 2026-10-31 定稿版，按用户逐条要求改：
 ///
-/// 咱们的差异（保留，因为是真功能）：
-///   1. 加了「创建分组」：会话多了按时间找太累，用户要能自己归类长期保留
-///   2. 长按会话 → 「保存到分组」：这是用户点名要的操作方式（按住会话塞进分组）
-///   3. 分组标题和会话名都能改名（分组走长按菜单）
-///
-/// 2026-10-30 修正：原来 `.ignoresSafeArea(.vertical)` 让 header 顶到屏幕最上面，
-/// 和状态栏的时间/信号叠在一起（用户原话「弹出来的文字太高了，已经和状态栏时间重叠了」）。
-/// 现在把整个抽屉放回安全区内，只让**背景**铺满屏幕 ——
-/// 内容不再钻到刘海底下，视觉上又还是通栏的一张纸。
+///   1. **右上角 ☰ 删掉**（用户原话「这个图标删除」）。
+///      它本来只是「关闭抽屉」，但点外面遮罩、左滑、选会话都会关，
+///      留一个 34pt 的圆钮专门干这事纯属占地方。
+///   2. **搜索框常驻**在第一位，不再是点放大镜才出来
+///      —— 藏起来的入口等于没有，找东西的人不会先去点一个放大镜。
+///   3. **「我的文件」放在「新建任务」上方**，同样是白底描边大按钮，
+///      右侧带文件数量。
+///   4. **时间分组可折叠**：点「今天 (3) ▾」收起该组会话，
+///      再点展开。收起状态只在本页生命周期内有效，不写磁盘
+///      —— 这是"临时看一眼"的操作，不是配置。
+///   5. **底部「本机 / 听诊器 / 齿轮」整块删掉**：
+///      设置进「我的」Tab，诊断在设置里，抽屉底部不该再重复一遍。
+///   6. 顶部不再显示设备名（`REDMI AC2100`）—— 改不了的名字不值得占一行。
 struct DrawerView: View {
     @ObservedObject var store: ChatStore
     @ObservedObject var settings = Settings.shared
+    @ObservedObject private var lib = FileLibrary.shared
+
     /// 关闭动作交给外层统一管动画，避免两处状态各动一套
     let onClose: () -> Void
-    /// 设置/诊断也交给外层弹，抽屉自己不挂 sheet。
+    /// 设置/诊断交给外层弹，抽屉自己不挂 sheet。
     /// 原因：同一个 ZStack 上再挂一层 sheet，会和 ChatView 的 sheet 抢，
     /// iOS 会警告 "Attempt to present ... which is already presenting"。
     var onOpenSettings: () -> Void = {}
     var onOpenDiag: () -> Void = {}
+    /// 打开「我的文件」。外面统一管弹层，抽屉不自己挂。
+    var onOpenFiles: () -> Void = {}
 
     static let width: CGFloat = 300
 
@@ -36,7 +39,7 @@ struct DrawerView: View {
     @State private var renameText = ""
     @State private var confirmDelete: Session?
 
-    /// 新建分组
+    /// 创建分组
     @State private var showNewGroup = false
     @State private var newGroupName = ""
     /// 分组改名
@@ -45,17 +48,14 @@ struct DrawerView: View {
     /// 分组删除确认
     @State private var confirmDeleteGroup: TaskGroup?
 
-    /// 折叠状态，对齐原版「任务 (3) ⌄」那个箭头。
-    /// key：自定义分组用 group.id，时间分组用 rawValue，共用一个集合不会冲突。
+    /// 折叠状态。key：自定义分组用 group.id，时间分组用 rawValue。
     @State private var collapsed: Set<String> = []
-    /// 原版抽屉里没有搜索框。但咱们任务多了之后总得能找，
-    /// 所以做成"点放大镜才出现"——不点就跟原版一模一样。
-    @State private var showSearch = false
 
     private var ungrouped: [SessionBucket] {
         store.ungroupedBuckets(query: query)
     }
 
+    /// 自建分组（「工作」「折腾路由器」这些）
     private var filteredGroups: [TaskGroup] {
         let key = query.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
         guard !key.isEmpty else { return store.groups }
@@ -66,18 +66,21 @@ struct DrawerView: View {
         ungrouped.isEmpty && filteredGroups.allSatisfy { store.sessions(inGroup: $0.id).isEmpty }
     }
 
+    /// 搜索框下面那行「文件命中 N 个」用
+    private var hitFiles: [AIFile] {
+        lib.search(query)
+    }
+
     var body: some View {
         VStack(spacing: 0) {
-            header
+            searchBox
+            filesButton
             newTaskButton
             newGroupButton
-            if showSearch { searchBox }
             list
-            footer
         }
         .frame(width: Self.width)
         // 背景单独铺满整屏（含刘海区、底部小白条区），内容留在安全区内。
-        // 这一行 + 外层去掉 ignoresSafeArea 就是「不再压状态栏」的全部秘密。
         .background(Theme.sheet.ignoresSafeArea(edges: .vertical))
         .overlay(alignment: .trailing) {
             Rectangle()
@@ -133,7 +136,7 @@ struct DrawerView: View {
             }
             Button("取消", role: .cancel) { confirmDelete = nil }
         } message: {
-            Text("删除后无法恢复。")
+            Text("删除后无法恢复，这个任务的产物也会一起删掉。")
         }
         // 删分组
         .confirmationDialog("删除这个分组？", isPresented: Binding(
@@ -150,75 +153,78 @@ struct DrawerView: View {
         }
     }
 
-    // MARK: 顶部：设备名 + 折叠箭头
-
-    private var header: some View {
-        HStack(spacing: 8) {
-            Image(systemName: "desktopcomputer")
-                .font(.system(size: 15, weight: .medium))
-                .foregroundStyle(.primary)
-
-            Text(store.deviceLabel.uppercased())
-                .font(.system(size: 15, weight: .bold))
-                .foregroundStyle(.primary)
-                .lineLimit(1)
-
-            Image(systemName: "chevron.down")
-                .font(.system(size: 10, weight: .bold))
-                .foregroundStyle(.primary)
-
-            Spacer(minLength: 4)
-
-            // 搜索：原版没有，收起来不占位
-            Button {
-                withAnimation(.easeInOut(duration: 0.18)) {
-                    showSearch.toggle()
-                    if !showSearch { query = "" }
-                }
-            } label: {
-                Image(systemName: "magnifyingglass")
-                    .font(.system(size: 14, weight: .semibold))
-                    .foregroundStyle(.secondary)
-                    .frame(width: 34, height: 34)
-            }
-            .buttonStyle(.plain)
-
-            Button { close() } label: {
-                Image(systemName: "line.3.horizontal")
-                    .font(.system(size: 14, weight: .semibold))
-                    .foregroundStyle(.primary)
-                    .frame(width: 34, height: 34)
-                    .background(Color(.secondarySystemBackground))
-                    .clipShape(Circle())
-            }
-            .buttonStyle(.plain)
-        }
-        .padding(.horizontal, 18)
-        .padding(.top, 10)
-        .padding(.bottom, 14)
-    }
-
-    // MARK: 搜索（原版没有，只在输入时才浮现，不占常驻空间）
+    // MARK: 搜索（常驻第一位）
 
     private var searchBox: some View {
         HStack(spacing: 6) {
             Image(systemName: "magnifyingglass")
                 .font(.system(size: 12))
                 .foregroundStyle(.secondary)
-            TextField("搜索任务", text: $query)
+            TextField("搜索分组 / 会话 / 文件", text: $query)
                 .font(.system(size: 13))
                 .textInputAutocapitalization(.never)
                 .autocorrectionDisabled()
+            if !query.isEmpty {
+                Button {
+                    query = ""
+                } label: {
+                    Image(systemName: "xmark.circle.fill")
+                        .font(.system(size: 12))
+                        .foregroundStyle(.tertiary)
+                }
+                .buttonStyle(.plain)
+            }
         }
         .padding(.horizontal, 10)
         .padding(.vertical, 8)
         .background(Color(.secondarySystemBackground))
-        .clipShape(RoundedRectangle(cornerRadius: 9, style: .continuous))
+        .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
         .padding(.horizontal, 14)
-        .padding(.bottom, 10)
+        // 顶部 8 → 16：删掉 ☰ 之后搜索框直接贴着安全区边缘，
+        // 用户反馈「整体有点往上」，多留一点和聊天页顶栏对齐
+        .padding(.top, 16)
+        .padding(.bottom, 8)
     }
 
-    // MARK: 新建任务（原版是白底、灰描边的大圆角按钮）
+    // MARK: 我的文件（放在新建任务上方，同款白底描边按钮）
+
+    private var filesButton: some View {
+        Button {
+            close()
+            onOpenFiles()
+        } label: {
+            HStack(spacing: 6) {
+                Image(systemName: "folder")
+                    .font(.system(size: 15, weight: .medium))
+                Text("我的文件")
+                    .font(.system(size: 15, weight: .medium))
+                // 数量角标：没文件就不显示，别挂个「0」让人以为坏了
+                if !lib.files.isEmpty {
+                    Text("\(lib.files.count)")
+                        .font(.system(size: 11, weight: .medium))
+                        .foregroundStyle(.secondary)
+                        .padding(.horizontal, 5)
+                        .padding(.vertical, 1)
+                        .background(Color(.tertiarySystemFill))
+                        .clipShape(Capsule())
+                }
+            }
+            .foregroundStyle(.primary)
+            .frame(maxWidth: .infinity)
+            .padding(.vertical, 11)
+            .background(Theme.card)
+            .overlay(
+                RoundedRectangle(cornerRadius: 14, style: .continuous)
+                    .stroke(Color(.separator).opacity(0.7), lineWidth: 0.8)
+            )
+            .clipShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
+        }
+        .buttonStyle(.plain)
+        .padding(.horizontal, 14)
+        .padding(.bottom, 8)
+    }
+
+    // MARK: 新建任务
 
     private var newTaskButton: some View {
         Button {
@@ -236,7 +242,6 @@ struct DrawerView: View {
             .frame(maxWidth: .infinity)
             .padding(.vertical, 11)
             // 白底 + 细描边，浮在 #FAFAFA 的抽屉上。
-            // 参考图里这个按钮就是靠那圈描边认出来的，填充色和抽屉底几乎同色。
             .background(Theme.card)
             .overlay(
                 RoundedRectangle(cornerRadius: 14, style: .continuous)
@@ -249,7 +254,7 @@ struct DrawerView: View {
         .padding(.bottom, 8)
     }
 
-    // MARK: 创建分组（原版没有，用户点名要的功能）
+    // MARK: 创建分组
 
     private var newGroupButton: some View {
         Button {
@@ -270,7 +275,7 @@ struct DrawerView: View {
         }
         .buttonStyle(.plain)
         .padding(.horizontal, 14)
-        .padding(.bottom, 4)
+        .padding(.bottom, 2)
     }
 
     // MARK: 任务列表
@@ -295,7 +300,7 @@ struct DrawerView: View {
                                 count: items.count,
                                 open: open,
                                 icon: "folder.fill") {
-                        if open { collapsed.insert(g.id) } else { collapsed.remove(g.id) }
+                        toggleGroup(g.id)
                     }
                     .contextMenu {
                         Button {
@@ -326,7 +331,7 @@ struct DrawerView: View {
                     }
                 }
 
-                // ---------- 未分组的会话，仍按时间归档 ----------
+                // ---------- 未分组的会话，按时间归档 ----------
                 if !ungrouped.isEmpty, !store.groups.isEmpty {
                     HStack(spacing: 4) {
                         Text("未分组")
@@ -347,7 +352,7 @@ struct DrawerView: View {
                                 count: bucket.items.count,
                                 open: open,
                                 icon: nil) {
-                        if open { collapsed.insert(key) } else { collapsed.remove(key) }
+                        toggleGroup(key)
                     }
 
                     if open {
@@ -356,13 +361,49 @@ struct DrawerView: View {
                         }
                     }
                 }
+
+                // 搜索时顺带提示命中了几个文件 —— 搜索框写的是
+                // 「搜索分组 / 会话 / 文件」，只搜会话会显得骗人。
+                if !query.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+                   !hitFiles.isEmpty {
+                    Button {
+                        close()
+                        onOpenFiles()
+                    } label: {
+                        HStack(spacing: 6) {
+                            Image(systemName: "doc.text")
+                                .font(.system(size: 11))
+                            Text("「\(query)」命中 \(hitFiles.count) 个文件")
+                                .font(.system(size: 12))
+                                .lineLimit(1)
+                            Spacer(minLength: 0)
+                            Image(systemName: "chevron.right")
+                                .font(.system(size: 9, weight: .semibold))
+                        }
+                        .foregroundStyle(.secondary)
+                        .padding(.horizontal, 18)
+                        .padding(.vertical, 10)
+                        .contentShape(Rectangle())
+                    }
+                    .buttonStyle(.plain)
+                }
             }
             .padding(.bottom, 10)
+            .animation(.easeInOut(duration: 0.16), value: collapsed)
         }
         .frame(maxHeight: .infinity)
     }
 
-    /// 分组标题：「今天 (3) ⌄」/「工作 (2) ⌄」
+    /// 点标题折叠 / 展开这个分组
+    private func toggleGroup(_ key: String) {
+        if collapsed.contains(key) {
+            collapsed.remove(key)
+        } else {
+            collapsed.insert(key)
+        }
+    }
+
+    /// 分组标题：「今天 (3) ▾」/「工作 (2) ▸」
     private func groupHeader(title: String,
                              count: Int,
                              open: Bool,
@@ -395,8 +436,7 @@ struct DrawerView: View {
         .buttonStyle(.plain)
     }
 
-    /// 原版任务项就是一行文字，选中项浅灰底。这里照着做，
-    /// 只在选中项右侧加一个小转圈表示"这条正在用"。
+    /// 任务项就是一行文字，选中项浅灰底 + 右侧小转圈。
     private func sessionRow(_ s: Session) -> some View {
         let active = s.id == store.currentSessionId
         return Button {
@@ -470,78 +510,6 @@ struct DrawerView: View {
             } label: {
                 Label("删除", systemImage: "trash")
             }
-        }
-        // 长按出菜单是 iOS 默认行为，但原版长按没反应；
-        // 这里保留长按（归组/改名/删除得有入口），只是不额外加视觉提示。
-    }
-
-    // MARK: 底部
-
-    private var footer: some View {
-        VStack(spacing: 0) {
-            Rectangle()
-                .fill(Color(.separator).opacity(0.4))
-                .frame(height: 0.5)
-
-            HStack(spacing: 10) {
-                Button { close(); onOpenSettings() } label: {
-                    HStack(spacing: 8) {
-                        Image(systemName: "person.crop.circle.fill")
-                            .font(.system(size: 24))
-                            .foregroundStyle(Color(.tertiaryLabel))
-                        VStack(alignment: .leading, spacing: 1) {
-                            Text("本机")
-                                .font(.system(size: 14, weight: .medium))
-                                .foregroundStyle(.primary)
-                            HStack(spacing: 4) {
-                                Circle()
-                                    .fill(statusColor)
-                                    .frame(width: 5, height: 5)
-                                Text(placeText)
-                                    .font(.system(size: 10))
-                                    .foregroundStyle(.secondary)
-                            }
-                        }
-                    }
-                    .contentShape(Rectangle())
-                }
-                .buttonStyle(.plain)
-
-                Spacer()
-
-                Button { close(); onOpenDiag() } label: {
-                    Image(systemName: "stethoscope")
-                        .font(.system(size: 16))
-                        .foregroundStyle(.secondary)
-                        .frame(width: 34, height: 34)
-                }
-                .buttonStyle(.plain)
-
-                Button { close(); onOpenSettings() } label: {
-                    Image(systemName: "gearshape")
-                        .font(.system(size: 17))
-                        .foregroundStyle(.secondary)
-                        .frame(width: 34, height: 34)
-                }
-                .buttonStyle(.plain)
-            }
-            .padding(.horizontal, 16)
-            .padding(.vertical, 10)
-        }
-        .background(Theme.sheet)
-    }
-
-    private var statusColor: Color {
-        if store.detecting && store.base == nil { return .orange }
-        return store.base == nil ? .orange : .green
-    }
-
-    private var placeText: String {
-        if store.detecting && store.base == nil { return "连接中…" }
-        switch store.place {
-        case .home: return "在家 · 内网直连"
-        case .away: return "在外 · 域名"
-        case .unknown: return store.base == nil ? "连接中…" : "已连接"
         }
     }
 

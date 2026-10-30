@@ -24,19 +24,50 @@ struct SettingsView: View {
     @State private var rebooting = false
     /// 重启后进入"等它回来"的倒计时状态
     @State private var waitingBack = false
+    /// 后台密钥（access_key）的输入草稿。落盘走钥匙串，见 body 里的 onChange。
+    @State private var adminKeyDraft = AdminKey.load()
+
+    /// 长按某个来源 → 改名。用 alert 是因为 iOS 的 contextMenu 里
+    /// 不能内嵌输入框，改名只能另开一层。
+    @State private var renameTarget: Provider?
+    @State private var nameDraft = ""
 
     var body: some View {
         NavigationStack {
-            Form {
-                providerSection
-                currentLinkSection
-                modelSection
-                connectionSection
-                deviceSection
-                publicSection
-                aboutSection
+            VStack(spacing: 0) {
+                // 内嵌到「我的」Tab 时，自己画一个和聊天页同款的大标题。
+                // 为什么不用 navigationTitle：inline 模式会把「我的」压成
+                // 17pt 居中细字 + 一条导航栏底色，和演示图里左对齐的
+                // 粗体标题完全不是一个观感；large 模式又会在滚动时变形。
+                if embedded {
+                    HStack {
+                        Text("我的")
+                            .font(.system(size: 26, weight: .bold))
+                            .foregroundStyle(.primary)
+                        Spacer()
+                    }
+                    .padding(.horizontal, 20)
+                    // 顶部 14：和后台面板页保持同一个视觉基线
+                    .padding(.top, 14)
+                    .padding(.bottom, 2)
+                }
+
+                Form {
+                    providerSection
+                    currentLinkSection
+                    modelSection
+                    connectionSection
+                    deviceSection
+                    publicSection
+                    aboutSection
+                }
+                // Form 自带一层不透明底色，会把 Theme.page 盖掉，
+                // 表现为"上半截灰、下半截白"的断层。
+                .scrollContentBackground(.hidden)
+                .background(Theme.page)
             }
-            .navigationTitle("设置")
+            .background(Theme.page)
+            .navigationTitle(embedded ? "" : "设置")
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
                 if !embedded {
@@ -45,6 +76,7 @@ struct SettingsView: View {
                     }
                 }
             }
+            .toolbar(embedded ? .hidden : .visible, for: .navigationBar)
             .sheet(item: $editing) { p in
                 ProviderEditor(provider: p) { saved in
                     saveProvider(saved)
@@ -61,6 +93,17 @@ struct SettingsView: View {
             } message: {
                 Text("中转站会断开约 40 秒，正在进行的对话会中断。\n\n只在卡住不响应、后台几十秒才出来的时候才需要。")
             }
+            // 长按来源 → 改名
+            .alert("给来源改名", isPresented: Binding(
+                get: { renameTarget != nil },
+                set: { if !$0 { renameTarget = nil } }
+            )) {
+                TextField("名称", text: $nameDraft)
+                Button("取消", role: .cancel) { renameTarget = nil }
+                Button("保存") { commitRename() }
+            } message: {
+                Text("只改显示名，地址和密钥不变。")
+            }
             .task { await refreshModels() }
             .task { await loadDevice() }
         }
@@ -71,6 +114,8 @@ struct SettingsView: View {
     private var providerSection: some View {
         Section {
             ForEach(settings.providers) { p in
+                // 点按 = 切到这家；长按 = 弹菜单（改名 / 执行 / 编辑 / 删除）。
+                // 用户原话「点击和长按都有各自的功能」，两者都要有。
                 Button {
                     Task { await store.switchProvider(p.id) }
                 } label: {
@@ -92,6 +137,33 @@ struct SettingsView: View {
                         if p.id == settings.activeProvider {
                             Image(systemName: "checkmark.circle.fill")
                                 .foregroundStyle(.tint)
+                        }
+                    }
+                    .contentShape(Rectangle())
+                }
+                .contextMenu {
+                    Button {
+                        renameTarget = p
+                        nameDraft = p.name
+                    } label: {
+                        Label("改名", systemImage: "pencil")
+                    }
+                    Button {
+                        Task { await store.switchProvider(p.id) }
+                    } label: {
+                        Label("执行（切到这家）", systemImage: "arrow.right.circle")
+                    }
+                    Button {
+                        editing = p
+                    } label: {
+                        Label("编辑地址和密钥", systemImage: "gearshape")
+                    }
+                    if !p.isHome {
+                        Divider()
+                        Button(role: .destructive) {
+                            deleteProvider(p)
+                        } label: {
+                            Label("删除", systemImage: "trash")
                         }
                     }
                 }
@@ -152,6 +224,15 @@ struct SettingsView: View {
         }
     }
 
+    private func commitRename() {
+        guard var p = renameTarget else { return }
+        let n = nameDraft.trimmingCharacters(in: .whitespacesAndNewlines)
+        renameTarget = nil
+        guard !n.isEmpty, n != p.name else { return }
+        p.name = n
+        settings.updateProvider(p)
+    }
+
     // MARK: 模型
 
     private var modelSection: some View {
@@ -199,7 +280,11 @@ struct SettingsView: View {
             HStack {
                 Text("端口")
                 Spacer()
-                TextField("8080", value: $settings.port, format: .number)
+                // 用 .number.grouping(.never) 而不是 .number：
+                // 默认格式化会按本地化加千位分隔符，8080 会显示成「8,080」——
+                // 端口号是个标识符，不是数量，加逗号既难看也容易让人误以为能改。
+                TextField("8080", value: $settings.port,
+                          format: .number.grouping(.never))
                     .multilineTextAlignment(.trailing)
                     .keyboardType(.numberPad)
                     .frame(width: 80)
@@ -222,10 +307,30 @@ struct SettingsView: View {
                     .autocorrectionDisabled()
                     .textInputAutocapitalization(.never)
             }
+            // 中转站有**两把不同的钥匙**，这里必须分开填：
+            //   访问密钥（上面那个）= 网关 Key，形如 sk-relay-…，只能调 /v1 模型
+            //   后台密钥（这一行）  = access_key，就是打开网页后台时输的密码，
+            //                         /admin/api/* 只认这把
+            // 之前只有一把输入框，重启必然 401 —— 用户看到的就是
+            // 「读取失败：需要访问密钥 (access_key)」，但他明明填了密钥。
+            HStack {
+                Text("后台密钥")
+                Spacer()
+                SecureField(adminKeyDraft.isEmpty ? "网页后台的登录密码" : "已保存（可改）",
+                            text: $adminKeyDraft)
+                    .multilineTextAlignment(.trailing)
+                    .autocorrectionDisabled()
+                    .textInputAutocapitalization(.never)
+                    .onChange(of: adminKeyDraft) { v in
+                        // 存钥匙串，和「后台面板」共用同一条记录 ——
+                        // 在哪边填过，另一边就自动能用，不用填两次。
+                        AdminKey.save(v)
+                    }
+            }
         } header: {
             Text("家里中转站")
         } footer: {
-            Text("地址留空会自动试常见网段，哪个通用哪个并记住。密钥就是中转站后台的访问密钥。\n\n固定域名填中转站的公网域名（如 your.domain.com）。填了之后在外面优先走它，不依赖手机有没有 IPv6。")
+            Text("地址留空会自动试常见网段，哪个通用哪个并记住。\n\n固定域名填中转站的公网域名（如 your.domain.com）。填了之后在外面优先走它，不依赖手机有没有 IPv6。\n\n「访问密钥」是给聊天用的网关 Key（sk-…）；「后台密钥」是打开网页后台时输的密码，重启路由器要用它，两个不一样。")
         }
     }
 
@@ -433,6 +538,12 @@ struct SettingsView: View {
     // MARK: 设备状态 / 重启
 
     private func loadDevice() async {
+        // 先看有没有后台密钥。没有就别发请求了 ——
+        // 发了必定 401，用户看到「需要访问密钥 (access_key)」也不知道填在哪。
+        guard !settings.accessKey.isEmpty else {
+            devMsg = "还差后台密钥：在上面「家里中转站」里填后台密钥（就是打开网页后台时输的密码）"
+            return
+        }
         // 拿当前能用的地址。store.base 是「上次探测成功的地址」，
         // 探过就用它；没探过就先 bootstrap 一次，否则一定是空的。
         if store.base == nil { await store.bootstrap(loadModels: false) }
@@ -446,11 +557,15 @@ struct SettingsView: View {
             devStatus = try await RelayClient.shared.deviceStatus(base: b, key: settings.accessKey)
             devMsg = nil
         } catch {
-            devMsg = "读取失败：\(friendly(error))"
+            devMsg = authHint(error)
         }
     }
 
     private func doReboot() async {
+        guard !settings.accessKey.isEmpty else {
+            devMsg = "还差后台密钥，填了才能重启"
+            return
+        }
         guard let b = store.base else {
             devMsg = "还没连上中转站，没法重启"
             return
@@ -479,8 +594,21 @@ struct SettingsView: View {
                 }
             }
         } catch {
-            devMsg = "重启失败：\(friendly(error))"
+            devMsg = authHint(error)
         }
+    }
+
+    /// 把错误翻成「该去改哪里」。
+    ///
+    /// 401 是最容易让人迷惑的一种：用户明明填了「访问密钥」，
+    /// 却被告知需要 access_key —— 因为那本来是**两把不同的钥匙**。
+    /// 所以这里必须点名让他去填「后台密钥」，否则他会一直重试同一个框。
+    private func authHint(_ e: Error) -> String {
+        let raw = friendly(e)
+        if raw.contains("access_key") || raw.contains("访问密钥") || raw.contains("401") {
+            return "后台密钥不对或没填：在上面「家里中转站 → 后台密钥」里填网页后台的登录密码（不是 sk- 开头的网关 Key）"
+        }
+        return "操作失败：\(raw)"
     }
 
     private func friendly(_ e: Error) -> String {

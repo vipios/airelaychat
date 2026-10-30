@@ -12,6 +12,8 @@ import UniformTypeIdentifiers
 struct ChatView: View {
     @ObservedObject var store: ChatStore
     @ObservedObject var settings = Settings.shared
+    /// 产物库。聊天页要看「这条回复的产物」和「全部产物 (N)」。
+    @ObservedObject private var lib = FileLibrary.shared
     @StateObject private var voice = VoiceInput()
 
     @State private var showModelPicker = false
@@ -25,6 +27,11 @@ struct ChatView: View {
     @State private var healthTimer: Timer?
 
     @State private var drawerOpen = false
+    /// 抽屉里的「我的文件」。和抽屉共用外层弹层，抽屉自己不挂 sheet。
+    @State private var showFiles = false
+    /// 点产物卡片 → 预览；预览里点分享 → 换成分享面板
+    @State private var previewFile: AIFile?
+    @State private var shareFile: AIFile?
 
     @FocusState private var inputFocused: Bool
 
@@ -45,15 +52,70 @@ struct ChatView: View {
                 DrawerView(store: store,
                            onClose: { closeDrawer() },
                            onOpenSettings: { showSettings = true },
-                           onOpenDiag: { showDiag = true })
+                           onOpenDiag: { showDiag = true },
+                           onOpenFiles: { showFiles = true })
                     .frame(width: DrawerView.width)
                     .frame(maxHeight: .infinity)
                     .transition(.move(edge: .leading))
             }
         }
-        .sheet(isPresented: $showSettings) { SettingsView(store: store) }
-        .sheet(isPresented: $showDiag) { NavigationStack { DiagView() } }
-        .sheet(isPresented: $showCamera) { CameraPicker { img in store.addImage(img) } }
+        .sheet(isPresented: $showSettings) {
+            SettingsView(store: store)
+                .presentationCornerRadius(28)
+        }
+        .sheet(isPresented: $showDiag) {
+            NavigationStack { DiagView() }
+                .presentationCornerRadius(28)
+        }
+        .sheet(isPresented: $showFiles) {
+            MyFilesView(store: store, embedded: true)
+                .presentationCornerRadius(28)
+        }
+        // 产物卡片的预览 / 分享
+        .sheet(item: $previewFile) { f in
+            NavigationStack {
+                QuickLookView(url: f.url)
+                    .ignoresSafeArea()
+                    .navigationTitle(f.title)
+                    .navigationBarTitleDisplayMode(.inline)
+                    .toolbar {
+                        ToolbarItem(placement: .navigationBarTrailing) {
+                            Button {
+                                let tmp = f
+                                previewFile = nil
+                                // 等预览关掉再弹分享，两个 sheet 同时开会互相吞
+                                DispatchQueue.main.asyncAfter(deadline: .now() + 0.35) {
+                                    shareFile = tmp
+                                }
+                            } label: {
+                                Image(systemName: "square.and.arrow.up")
+                            }
+                        }
+                        ToolbarItem(placement: .cancellationAction) {
+                            Button("关闭") { previewFile = nil }
+                        }
+                    }
+            }
+            .presentationCornerRadius(28)
+        }
+        .sheet(item: $shareFile) { f in
+            ShareSheet(items: [f.url])
+                .presentationDetents([.medium, .large])
+                .presentationCornerRadius(28)
+        }
+        .sheet(isPresented: $showCamera) {
+            CameraPicker { img in store.addImage(img) }
+                .presentationCornerRadius(28)
+        }
+        // 模型选择挂在整个页面最外层，不能挂在输入栏上 ——
+        // 挂输入栏时 GeometryReader 只能拿到输入栏那几十 pt 高度，
+        // 半屏算出来就变成一条窄带。挂根层才能拿到整屏高度。
+        .overlay {
+            if showModelPicker {
+                ModelPickerSheet(store: store,
+                                 onClose: { showModelPicker = false })
+            }
+        }
         .photosPicker(isPresented: $showPhotoPicker, selection: $photoItems,
                       maxSelectionCount: 6, matching: .any(of: [.images, .videos]))
         .fileImporter(isPresented: $showFilePicker,
@@ -117,16 +179,27 @@ struct ChatView: View {
         }
         .background(Theme.page)
         .contentShape(Rectangle())
-        // 从屏幕左缘往右滑打开抽屉。只在起点靠左、主要横向移动时触发，
-        // 不会抢走消息列表的纵向滚动。
+        // 从屏幕左缘往右滑打开抽屉。
+        // **只在「任务」页生效** —— 用户明确要求「侧抽只能聊天界面才能生效」。
+        // 后台面板是网页、我的页是设置列表，在那里侧滑出抽屉既意外又容易误触。
         .simultaneousGesture(
             DragGesture(minimumDistance: 20)
                 .onEnded { g in
                     guard !drawerOpen else { return }
-                    if g.startLocation.x < 30,
-                       g.translation.width > 70,
-                       abs(g.translation.height) < 70 {
-                        openDrawer()
+                    let horizontal = abs(g.translation.height) < 70
+                    if store.tab == .tasks {
+                        // 聊天页：左缘右滑 → 出抽屉
+                        if g.startLocation.x < 30, horizontal,
+                           g.translation.width > 70 {
+                            openDrawer()
+                        }
+                    } else if horizontal, g.translation.width < -70 {
+                        // 后台面板 / 我的：左滑返回聊天页。
+                        // 用户要求「不管到哪个界面都应该左滑返回上个界面」。
+                        inputFocused = false
+                        withAnimation(.easeInOut(duration: 0.2)) {
+                            store.tab = .tasks
+                        }
                     }
                 }
         )
@@ -176,13 +249,14 @@ struct ChatView: View {
 
     // MARK: - 顶栏
 
-    /// 结构照 WorkBuddy 截图：
-    ///   (≡)            💻• 模型名（粗体 17）
-    ///                  会话名 | 在家 ›
-    ///                          [💬+  ⋯] 一个白胶囊
+    /// 结构照用户 2026-10-31 的截图定稿：
+    ///   (≡)            任务名（17 粗体，第一行）
+    ///                  💻• 模型名 | 在家（11 灰，第二行）
+    ///                                          [💬+  ⋯]
     ///
-    /// 模型名放在第一行（用户 2026-10-30 明确要求），会话名让到第二行。
-    /// 灯贴在 💻 图标的右上角，绿=通、红=不通、灰=还没探到。
+    /// 上一版是「模型第一行、会话第二行」，用户新截图明确要求
+    /// **第一行任务名、第二行模型** —— 手机上看的是"我在聊什么"，
+    /// 模型是次要信息，放第二行。
     private var topBar: some View {
         HStack(alignment: .center, spacing: 8) {
             // 左侧：白色圆钮。参考图里这是一个白底圆形，不是纯图标。
@@ -197,47 +271,42 @@ struct ChatView: View {
             }
             .buttonStyle(.plain)
 
-            // 中间：第一行模型名（带电脑图标和连接灯），第二行会话名
+            // 中间：第一行任务名，第二行模型（点它开模型选择）
+            //
+            // 2026-10-31 改居中：之前是左对齐，模型名那一行会紧贴左边的 ☰ 按钮，
+            // 而演示图里两行都是**居中**的 —— 左右两个圆钮夹着中间一列文字，
+            // 这种对称感才是原版的样子。
             Button { showModelPicker = true } label: {
-                VStack(alignment: .leading, spacing: 2) {
-                    HStack(spacing: 5) {
+                VStack(alignment: .center, spacing: 2) {
+                    Text(store.currentSessionTitle)
+                        .font(.system(size: 17, weight: .semibold))
+                        .foregroundStyle(.primary)
+                        .lineLimit(1)
+                        .truncationMode(.tail)
+                        .frame(maxWidth: .infinity)
+
+                    HStack(spacing: 4) {
                         // 电脑图标 + 右上角小灯
                         ZStack(alignment: .topTrailing) {
                             Image(systemName: "desktopcomputer")
-                                .font(.system(size: 13))
-                                .foregroundStyle(.primary)
+                                .font(.system(size: 10))
+                                .foregroundStyle(.secondary)
                             Circle()
                                 .fill(linkColor)
-                                .frame(width: 6, height: 6)
-                                .overlay(Circle().stroke(Theme.page, lineWidth: 1.2))
-                                .offset(x: 3.5, y: -2)
+                                .frame(width: 5, height: 5)
+                                .overlay(Circle().stroke(Theme.page, lineWidth: 1))
+                                .offset(x: 2.5, y: -1.5)
                         }
-                        .frame(width: 19, height: 16)
+                        .frame(width: 14, height: 12)
 
                         Text(modelTitle)
-                            .font(.system(size: 17, weight: .semibold))
-                            .foregroundStyle(.primary)
-                            .lineLimit(1)
-                            .truncationMode(.tail)
-                    }
-
-                    HStack(spacing: 4) {
-                        Text(store.currentSessionTitle)
                             .font(.system(size: 11))
                             .foregroundStyle(.secondary)
                             .lineLimit(1)
-                        Text("|")
-                            .font(.system(size: 11))
-                            .foregroundStyle(.quaternary)
-                        Text(placeShort)
-                            .font(.system(size: 11))
-                            .foregroundStyle(.secondary)
-                        Image(systemName: "chevron.right")
-                            .font(.system(size: 8, weight: .semibold))
-                            .foregroundStyle(.quaternary)
                     }
+                    .frame(maxWidth: .infinity)
                 }
-                .frame(maxWidth: .infinity, alignment: .leading)
+                .frame(maxWidth: .infinity, alignment: .center)
                 .contentShape(Rectangle())
             }
             .buttonStyle(.plain)
@@ -411,6 +480,31 @@ struct ChatView: View {
                         .frame(maxWidth: .infinity, alignment: .leading)
                 }
 
+                // 这条回复落盘的那份产物（ChatStore.archiveReply 写的）
+                if let f = artifact(for: msg) {
+                    artifactCard(f)
+                }
+
+                // 整个会话的产物入口。只有真的存到了东西才显示，
+                // 免得每条回复下面都挂一个「全部产物 (0)」。
+                let all = lib.files(sessionId: store.currentSessionId)
+                if !all.isEmpty {
+                    Button {
+                        inputFocused = false
+                        showFiles = true
+                    } label: {
+                        HStack(spacing: 4) {
+                            Image(systemName: "folder")
+                                .font(.system(size: 11, weight: .medium))
+                            Text("全部产物 (\(all.count))")
+                                .font(.system(size: 12))
+                        }
+                        .foregroundStyle(Color.accentColor)
+                        .contentShape(Rectangle())
+                    }
+                    .buttonStyle(.plain)
+                }
+
                 if !msg.model.isEmpty {
                     Text(shortName(msg.model))
                         .font(.system(size: 10))
@@ -474,6 +568,61 @@ struct ChatView: View {
         case .document: return "doc.richtext"
         case .binary: return "doc"
         }
+    }
+
+    // MARK: - 产物卡片
+
+    /// 这条回复对应的那个文件。
+    ///
+    /// archiveReply 存的时候用「messages 里的下标」当 messageIndex，
+    /// 所以这里按 id 反查下标，再在文件库里按 (会话, 下标) 找。
+    /// 不按文本匹配：文本会被流式改动，下标在归档那一刻就固定了。
+    private func artifact(for msg: ChatMessage) -> AIFile? {
+        guard let idx = store.messages.firstIndex(where: { $0.id == msg.id }) else { return nil }
+        return lib.files.first {
+            $0.sessionId == store.currentSessionId && $0.messageIndex == idx
+        }
+    }
+
+    private func artifactCard(_ f: AIFile) -> some View {
+        Button {
+            inputFocused = false
+            previewFile = f
+        } label: {
+            HStack(spacing: 9) {
+                ZStack {
+                    RoundedRectangle(cornerRadius: 8, style: .continuous)
+                        .fill(Color.accentColor.opacity(0.12))
+                        .frame(width: 30, height: 30)
+                    Image(systemName: f.kind.icon)
+                        .font(.system(size: 13))
+                        .foregroundStyle(Color.accentColor)
+                }
+                VStack(alignment: .leading, spacing: 1) {
+                    Text(f.fileName)
+                        .font(.system(size: 12.5))
+                        .foregroundStyle(.primary)
+                        .lineLimit(1)
+                    Text("\(f.kind.label) · \(f.sizeText)")
+                        .font(.system(size: 10))
+                        .foregroundStyle(.secondary)
+                }
+                Image(systemName: "chevron.right")
+                    .font(.system(size: 10, weight: .semibold))
+                    .foregroundStyle(.quaternary)
+            }
+            .padding(.horizontal, 11)
+            .padding(.vertical, 8)
+            .background(Theme.card)
+            .overlay(
+                RoundedRectangle(cornerRadius: 14, style: .continuous)
+                    .stroke(Color(.separator).opacity(0.5), lineWidth: 0.7)
+            )
+            .clipShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .padding(.top, 2)
     }
 
     // MARK: - 错误提示
@@ -704,12 +853,6 @@ struct ChatView: View {
                 )
             }
         }
-        .overlay {
-            if showModelPicker {
-                ModelPickerOverlay(store: store, linkColor: linkColor,
-                                   onClose: { showModelPicker = false })
-            }
-        }
     }
 
     /// 发送键能不能点。录音中允许点（用来「停止」），有内容才允许发。
@@ -840,100 +983,6 @@ private struct AttachSheet: View {
     }
 }
 
-// MARK: - 模型选择弹层（贴在输入栏上方）
-
-/// 点输入栏里的模型名，在**输入栏正上方**浮出这张卡片。
-///
-/// 为什么不用 sheet：sheet 会从屏幕底部推上来，把输入栏盖住、键盘弹走，
-/// 选完再关掉，视觉上跳两次。这个直接贴在输入栏上方，选完即刻消失。
-private struct ModelPickerOverlay: View {
-    @ObservedObject var store: ChatStore
-    var linkColor: Color
-    let onClose: () -> Void
-
-    @State private var query = ""
-
-    private var list: [ModelItem] {
-        let q = query.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-        guard !q.isEmpty else { return store.models }
-        return store.models.filter {
-            $0.display.lowercased().contains(q) || $0.id.lowercased().contains(q)
-        }
-    }
-
-    var body: some View {
-        ZStack(alignment: .bottom) {
-            Color.black.opacity(0.18)
-                .ignoresSafeArea()
-                .onTapGesture { onClose() }
-
-            VStack(spacing: 0) {
-                HStack(spacing: 8) {
-                    Image(systemName: "magnifyingglass")
-                        .font(.system(size: 13))
-                        .foregroundStyle(.secondary)
-                    TextField("搜索模型", text: $query)
-                        .font(.system(size: 14))
-                        .autocorrectionDisabled()
-                        .textInputAutocapitalization(.never)
-                    Button { onClose() } label: {
-                        Image(systemName: "xmark.circle.fill")
-                            .font(.system(size: 16))
-                            .foregroundStyle(.tertiary)
-                    }
-                    .buttonStyle(.plain)
-                }
-                .padding(.horizontal, 14)
-                .padding(.vertical, 11)
-
-                Divider()
-
-                ScrollView {
-                    LazyVStack(spacing: 0) {
-                        if store.models.isEmpty {
-                            Text(store.detecting ? "正在读取模型列表…" : "还没有模型，去设置里刷新一下")
-                                .font(.system(size: 13))
-                                .foregroundStyle(.secondary)
-                                .padding(.vertical, 24)
-                        }
-                        ForEach(list) { m in
-                            Button {
-                                store.currentModel = m.id
-                                onClose()
-                            } label: {
-                                HStack(spacing: 8) {
-                                    Text(m.display)
-                                        .font(.system(size: 14))
-                                        .foregroundStyle(.primary)
-                                        .lineLimit(1)
-                                    Spacer(minLength: 6)
-                                    if m.id == store.currentModel {
-                                        Image(systemName: "checkmark")
-                                            .font(.system(size: 12, weight: .semibold))
-                                            .foregroundStyle(.tint)
-                                    }
-                                }
-                                .padding(.horizontal, 16)
-                                .padding(.vertical, 11)
-                                .contentShape(Rectangle())
-                            }
-                            .buttonStyle(.plain)
-                            Divider().padding(.leading, 16)
-                        }
-                    }
-                }
-                .frame(maxHeight: 300)
-            }
-            .background(Theme.card)
-            .clipShape(RoundedRectangle(cornerRadius: 18, style: .continuous))
-            .shadow(color: .black.opacity(0.12), radius: 16, y: 4)
-            .padding(.horizontal, 12)
-            .padding(.bottom, 12)
-        }
-        .transition(.opacity)
-    }
-}
-
 // MARK: - 后台面板页
 
 /// 「后台面板」Tab：App 内嵌网页后台，首次输一次密钥就自动登录。
@@ -989,7 +1038,8 @@ private struct AdminTabPage: View {
                 .buttonStyle(.plain)
             }
             .padding(.horizontal, 14)
-            .padding(.top, 8)
+            // 顶部 8 → 16：标题原来贴着状态栏时间，用户反馈「整体往下」
+            .padding(.top, 16)
             .padding(.bottom, 10)
             .background(Theme.page)
 

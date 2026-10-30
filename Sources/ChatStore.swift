@@ -178,9 +178,33 @@ final class ChatStore: ObservableObject {
         guard !t.isEmpty, let i = sessions.firstIndex(where: { $0.id == id }) else { return }
         sessions[i].title = t
         SessionStore.save(sessions)
+        // 会话改名 → 磁盘上的产物文件夹跟着改名。
+        // 用户原话：「会话的名字我要改了文件夹名字也同步改」。
+        // 这里做的是真的移动文件 + 改目录名，不是只改记录，
+        // 否则去「文件」App 里看到的还是老名字。
+        renameArtifactFolder(sessionId: id, newTitle: t)
+    }
+
+    /// 把某个会话的产物文件夹改成新名字，并把记录里的 folder 字段一起更新。
+    private func renameArtifactFolder(sessionId: String, newTitle: String) {
+        let lib = FileLibrary.shared
+        let updated = FileStore.renameFolder(oldFiles: lib.files,
+                                            newTitle: newTitle,
+                                            sessionId: sessionId)
+        // 只有真的变了才落盘，避免每次改名都重写 index.json
+        if updated.map({ $0.folder }) != lib.files.map({ $0.folder }) {
+            lib.replaceAll(updated)
+        }
     }
 
     func deleteSession(_ id: String) {
+        // 删会话时把它那一堆产物也删掉。
+        // 为什么不保留：用户删的是一个"任务"，留着一堆孤立文件
+        // 只会在「我的文件」里堆成找不回来的垃圾。
+        let lib = FileLibrary.shared
+        let doomed = Set(lib.files.filter { $0.sessionId == id }.map { $0.id })
+        if !doomed.isEmpty { lib.remove(ids: doomed) }
+
         sessions.removeAll { $0.id == id }
         if sessions.isEmpty {
             let s = Session()
@@ -573,6 +597,63 @@ final class ChatStore: ObservableObject {
         }
         sending = false
         syncCurrentSession()
+        // 回复完成，把它存成文件进「我的文件」。
+        // 放在 syncCurrentSession 之后：那时标题已经从首条用户消息补齐，
+        // 文件名才能是「中转站搭建」而不是「新对话」。
+        archiveReply(at: idx)
+    }
+
+    /// 把一条 AI 回复存成 .md 放进「我的文件」。
+    ///
+    /// 为什么要自动存而不是让用户手动点「保存」：
+    /// 用户要的是「AI 给我的东西都在我的文件里」，多一步点选就等于没存
+    /// （想起来点的时候已经找不到了）。自动存 + 能删，比手动存更符合直觉。
+    ///
+    /// 失败/空回复不存：那种内容存了只是垃圾。
+    private func archiveReply(at idx: Int) {
+        guard idx >= 0, idx < messages.count else { return }
+        let m = messages[idx]
+        guard m.role == "assistant", !m.failed else { return }
+        let body = m.text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard body.count >= 10 else { return }   // 太短的多半是「好的」这类，不值得存
+
+        // 找这条回复对应的那个问题，做成 md 的标题
+        var question = ""
+        var i = idx - 1
+        while i >= 0 {
+            if messages[i].role == "user" { question = messages[i].text; break }
+            i -= 1
+        }
+
+        var doc = ""
+        if !question.isEmpty {
+            doc += "# \(question.replacingOccurrences(of: "\n", with: " "))\n\n"
+        }
+        doc += "> 模型：\(m.model.isEmpty ? currentModel : m.model)\n"
+        doc += "> 时间：\(Self.stampText())\n\n---\n\n"
+        doc += body
+        doc += "\n"
+
+        let title = question.isEmpty
+            ? (currentSessionTitle.isEmpty ? "对话" : currentSessionTitle)
+            : String(question.replacingOccurrences(of: "\n", with: " ").prefix(30))
+
+        // sessionTitle 决定文件落在哪个文件夹：每个会话一个独立目录，
+        // 目录名就是会话名（带一小段 id 防同名覆盖）。
+        if let rec = FileStore.writeText(title: title,
+                                        body: doc,
+                                        ext: "md",
+                                        sessionId: currentSessionId,
+                                        sessionTitle: currentSessionTitle,
+                                        messageIndex: idx) {
+            FileLibrary.shared.add(rec)
+        }
+    }
+
+    private static func stampText() -> String {
+        let f = DateFormatter()
+        f.dateFormat = "yyyy-MM-dd HH:mm:ss"
+        return f.string(from: Date())
     }
 
     /// 换地址后重发一次。成功返回 true（已有内容流进来）。
