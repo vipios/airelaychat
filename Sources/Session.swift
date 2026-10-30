@@ -9,10 +9,15 @@ import Foundation
 ///   「后台面板」点一下直接进中转站网页后台（App 内嵌，免登录）
 ///   「我的」点进去直接就是设置页
 /// 原来的「发现」删掉了（官方内容广场，咱们没有内容源）。
+///
+/// 2026-10-31 用户要求「后台面板和我的位置换一下」：
+/// 底部顺序从「任务 / 后台面板 / 我的」改成「任务 / 我的 / 后台面板」。
+/// 注意 **case 的声明顺序就是 Tab 的显示顺序**（靠 CaseIterable 遍历），
+/// 所以这里必须真的把两个 case 调换位置，不是改个显示名就行。
 enum MainTab: String, CaseIterable, Identifiable {
     case tasks = "任务"
-    case admin = "后台面板"
     case mine = "我的"
+    case admin = "后台面板"
 
     var id: String { rawValue }
 

@@ -56,7 +56,7 @@ enum RelayError: LocalizedError {
         case .empty:
             return "上游没有返回内容，请重试。"
         case .notConfigured:
-            return "这个来源还没配置好，去「设置 → 模型来源」里填服务器地址和密钥。"
+            return "这个供应商还没配置好，去「我的 → 模型来源」里填服务器地址和密钥。"
         }
     }
 }

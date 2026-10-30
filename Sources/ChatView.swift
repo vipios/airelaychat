@@ -110,10 +110,24 @@ struct ChatView: View {
         // 模型选择挂在整个页面最外层，不能挂在输入栏上 ——
         // 挂输入栏时 GeometryReader 只能拿到输入栏那几十 pt 高度，
         // 半屏算出来就变成一条窄带。挂根层才能拿到整屏高度。
+        //
+        // 附件弹层（加号）原先挂在输入栏的 .overlay 上，同样有问题：
+        // overlay 的尺寸被限制在输入栏那一条里，里面的黑色半透明遮罩
+        // 只能盖住输入栏本身，点"弹窗上面的空白"根本点不到遮罩 →
+        // 用户反馈「不选择就收不回去」。现在两个都挂到根层，
+        // 遮罩铺满整屏，点任何空白处都能关。
         .overlay {
             if showModelPicker {
                 ModelPickerSheet(store: store,
                                  onClose: { showModelPicker = false })
+            }
+            if showAttach {
+                AttachSheet(
+                    onPhoto: { showAttach = false; showPhotoPicker = true },
+                    onCamera: { showAttach = false; showCamera = true },
+                    onFile: { showAttach = false; showFilePicker = true },
+                    onCancel: { showAttach = false }
+                )
             }
         }
         .photosPicker(isPresented: $showPhotoPicker, selection: $photoItems,
@@ -175,7 +189,11 @@ struct ChatView: View {
             case .mine:
                 MineTabPage(store: store)
             }
-            if store.tab != .admin { bottomTabBar }
+            // 底部导航常驻。
+            // 之前后台面板页把它藏起来（想让网页全屏），代价是进去以后
+            // 想切到「我的」只能先左滑回聊天页 —— 三个 Tab 里少一个，
+            // 用户会以为后台是个单向页面。现在和演示图统一，三页都有。
+            bottomTabBar
         }
         .background(Theme.page)
         .contentShape(Rectangle())
@@ -840,19 +858,8 @@ struct ChatView: View {
                     .transition(.opacity)
             }
         }
-        // 附件菜单改成自绘弹层（放在顶部对齐的 overlay 里），
-        // 不再用 confirmationDialog —— 之前它和几个 sheet 挂同一层会互相吞掉，
-        // 点了加号没反应就是这个原因。
-        .overlay {
-            if showAttach {
-                AttachSheet(
-                    onPhoto: { showAttach = false; showPhotoPicker = true },
-                    onCamera: { showAttach = false; showCamera = true },
-                    onFile: { showAttach = false; showFilePicker = true },
-                    onCancel: { showAttach = false }
-                )
-            }
-        }
+        // 附件弹层已上移到根视图的 overlay（见 body 里那段注释）：
+        // 挂在这里时 overlay 只有输入栏那么大，遮罩盖不满屏幕，点空白关不掉。
     }
 
     /// 发送键能不能点。录音中允许点（用来「停止」），有内容才允许发。
@@ -927,38 +934,51 @@ private struct AttachSheet: View {
     let onCancel: () -> Void
 
     var body: some View {
-        ZStack {
-            Color.black.opacity(0.24)
-                .ignoresSafeArea()
-                .onTapGesture { onCancel() }
+        // 用 GeometryReader 而不是 ZStack + Spacer 撑开：
+        // Spacer 本身不参与命中测试，看起来没问题，但它把面板推到底部的同时
+        // 也让整个 VStack 覆盖了上方区域。改成「遮罩铺满 + 面板贴底」两层，
+        // 上层只有面板那块有可点内容，空白处一律落到遮罩上，
+        // 这样「点空白收回」才是确定的，不依赖 Spacer 的命中行为。
+        GeometryReader { geo in
+            ZStack(alignment: .bottom) {
+                // 遮罩必须显式 contentShape：
+                // 纯 Color 在某些情况下命中测试会穿透到下面几层，
+                // 表现为"点了没反应"。加一行 contentShape 就不用赌系统行为。
+                Color.black.opacity(0.24)
+                    .frame(width: geo.size.width, height: geo.size.height)
+                    .contentShape(Rectangle())
+                    .onTapGesture { onCancel() }
 
-            VStack(spacing: 0) {
-                Spacer()
                 VStack(spacing: 0) {
-                    row("照片或视频", "photo.on.rectangle", onPhoto)
-                    Divider().padding(.leading, 52)
-                    row("拍照", "camera", onCamera)
-                    Divider().padding(.leading, 52)
-                    row("文件", "folder", onFile)
-                }
-                .background(Theme.card)
-                .clipShape(RoundedRectangle(cornerRadius: 16, style: .continuous))
-                .padding(.horizontal, 16)
+                    VStack(spacing: 0) {
+                        row("照片或视频", "photo.on.rectangle", onPhoto)
+                        Divider().padding(.leading, 52)
+                        row("拍照", "camera", onCamera)
+                        Divider().padding(.leading, 52)
+                        row("文件", "folder", onFile)
+                    }
+                    .background(Theme.card)
+                    .clipShape(RoundedRectangle(cornerRadius: 16, style: .continuous))
+                    .padding(.horizontal, 16)
 
-                Button { onCancel() } label: {
-                    Text("取消")
-                        .font(.system(size: 16, weight: .medium))
-                        .foregroundStyle(.primary)
-                        .frame(maxWidth: .infinity)
-                        .padding(.vertical, 15)
-                        .background(Theme.card)
-                        .clipShape(RoundedRectangle(cornerRadius: 16, style: .continuous))
+                    Button { onCancel() } label: {
+                        Text("取消")
+                            .font(.system(size: 16, weight: .medium))
+                            .foregroundStyle(.primary)
+                            .frame(maxWidth: .infinity)
+                            .padding(.vertical, 15)
+                            .background(Theme.card)
+                            .clipShape(RoundedRectangle(cornerRadius: 16, style: .continuous))
+                    }
+                    .buttonStyle(.plain)
+                    .padding(.horizontal, 16)
+                    .padding(.top, 8)
+                    .padding(.bottom, 22)
                 }
-                .buttonStyle(.plain)
-                .padding(.horizontal, 16)
-                .padding(.top, 8)
-                .padding(.bottom, 22)
             }
+            // 让遮罩一直延伸到刘海和底部 Home 条外面，
+            // 否则状态栏那一条点下去会落到下面的聊天页上
+            .ignoresSafeArea()
         }
         .transition(.opacity)
     }
@@ -1043,8 +1063,13 @@ private struct AdminTabPage: View {
             .padding(.bottom, 10)
             .background(Theme.page)
 
+            // 底部 Tab 已经常驻，网页不能再 ignoresSafeArea(.bottom)：
+            // 那样网页最后一行会钻到 Tab 栏底下点不到。
+            // 这里让它只铺到 Tab 之上，四周留 12 的圆角卡片感，和演示图一致。
             AdminWebView(base: base, key: key, reloadTick: tick)
-                .ignoresSafeArea(edges: .bottom)
+                .clipShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
+                .padding(.horizontal, 10)
+                .padding(.bottom, 8)
         }
         .background(Theme.page)
         .alert("后台管理密钥", isPresented: $editingKey) {

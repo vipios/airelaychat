@@ -188,7 +188,7 @@ struct SettingsView: View {
             Button {
                 editing = Provider(name: "", isHome: false, baseURL: "", apiKey: "")
             } label: {
-                Label("添加别家模型来源", systemImage: "plus.circle")
+                Label("添加供应商", systemImage: "plus.circle")
             }
         } header: {
             Text("模型来源")
@@ -732,7 +732,7 @@ struct ProviderEditor: View {
                     }
                 }
             }
-            .navigationTitle(provider.isHome ? "家里中转站" : "模型来源")
+            .navigationTitle(provider.isHome ? "家里中转站" : (provider.name.isEmpty ? "添加供应商" : provider.name))
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
                 ToolbarItem(placement: .cancellationAction) {
@@ -742,7 +742,7 @@ struct ProviderEditor: View {
                     Button("保存") {
                         var p = provider
                         if p.name.trimmingCharacters(in: .whitespaces).isEmpty {
-                            p.name = p.isHome ? "家里中转站" : "未命名来源"
+                            p.name = p.isHome ? "家里中转站" : "新供应商"
                         }
                         onSave(p)
                         dismiss()

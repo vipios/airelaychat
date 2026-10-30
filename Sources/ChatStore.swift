@@ -390,7 +390,7 @@ final class ChatStore: ObservableObject {
         defer { detecting = false }
 
         guard let p = provider else {
-            errorText = "还没有可用的模型来源，去「设置 → 模型来源」添加一个。"
+            errorText = "还没有可用的供应商，去「我的 → 模型来源」添加一个。"
             return
         }
 
