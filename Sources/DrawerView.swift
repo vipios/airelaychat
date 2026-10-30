@@ -292,11 +292,11 @@ struct DrawerView: View {
     }
 
     private var placeText: String {
-        if store.detecting { return "检测中…" }
+        if store.detecting && store.base == nil { return "连接中…" }
         switch store.place {
         case .home: return "在家 · 内网"
         case .away: return "在外 · 公网"
-        case .unknown: return "未连接"
+        case .unknown: return store.base == nil ? "连接中…" : "已连接"
         }
     }
 
