@@ -207,20 +207,38 @@ struct PressableStyle: ButtonStyle {
     var darken: Double = 0.20
     /// 按下时震一下。默认开 —— 用户要求「所有的按键都加一个震动反馈」。
     var haptic: Bool = true
+    /// 这个按钮**自己有实心底**（白卡片、灰块、胶囊）。
+    ///
+    /// 2026-11-01 用户：「现在只有后台面板的返回和密钥、还有底栏那三个有
+    /// 由白变黑的点击效果，你把所有的都改成和他们一样」。
+    ///
+    /// 做法不是手写"按下变白字" —— 内层 `.foregroundStyle(.primary)` 写死了，
+    /// 外层改不动。改用**环境色板反色**：Theme 里的颜色全是动态色（UIColor 的
+    /// light/dark 两套），把 colorScheme 切成 .dark 之后，白底自己变成 #2C2C2E、
+    /// `.primary` 文字自己变白、`.secondary` 变亮灰 —— 一步到位，不用逐处改颜色。
+    ///
+    /// 只在有实心底的按钮上用。没有底的（纯图标、透明行）切了色板会白字白底看不见。
+    var fills: Bool = false
 
     func makeBody(configuration: Configuration) -> some View {
         let pressed = configuration.isPressed
+        // 系统当前是不是深色模式。反色对它无效（本来就是 dark），
+        // 所以深色模式下改用"提亮一点"当反馈。
+        let isDark = UITraitCollection.current.userInterfaceStyle == .dark
+        let flipping = pressed && fills
+
+        var boost: Double = 0
+        if pressed {
+            boost = fills ? (isDark ? 0.12 : 0) : -darken
+        }
+
         return configuration.label
-            // 2026-11-01 用户：「怎么只有返回按键有反馈效果啊」。
-            //
-            // 上一版按下是"缩 5% + 变淡到 0.52"，问题是：变淡 = 变透明
-            // = 浅色按钮往回退到页面底色里，本来就同色系的两种白，一淡就没了。
-            // 变暗才是肉眼能立刻抓住的方向 —— 并且 brightness 是像素级滤镜，
-            // 只作用于不透明像素，形状（圆角/胶囊/圆）自动跟随，不用另画底。
-            .brightness(pressed ? -darken : 0)
+            // 2026-11-01：有底的按钮按下 = 整块换成深色版，
+            // 和后台面板那三个胶囊（白底→深灰字反白）完全一致。
+            .environment(\.colorScheme, flipping ? .dark : (isDark ? .dark : .light))
+            // 没有底的元素（纯图标、纯文字）变暗不可见，靠下面这层淡灰补。
+            .brightness(boost)
             .scaleEffect(pressed ? scale : 1)
-            // 没有底色的元素（纯图标、纯文字）变暗不可见，靠这层补。
-            // tint 默认 0，等于完全不画，不会影响已有底色的按钮。
             .background(
                 RoundedRectangle(cornerRadius: tintRadius, style: .continuous)
                     .fill(Color.primary.opacity(pressed ? tint : 0))

@@ -267,7 +267,7 @@ struct MyFilesView: View {
             .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
             .contentShape(Rectangle())
         }
-        .buttonStyle(PressableStyle(scale: 0.97))
+        .buttonStyle(PressableStyle(scale: 0.97, fills: true))
         .padding(.bottom, 2)
     }
 
@@ -335,7 +335,7 @@ struct MyFilesView: View {
                 .padding(.vertical, 12)
                 .contentShape(Rectangle())
             }
-            .buttonStyle(PressableStyle(scale: 0.97))
+            .buttonStyle(PressableStyle(scale: 0.97, tint: 0.16, tintRadius: 14))
             // ScrollView 里没有 swipeActions，长按菜单顶替。
             //
             // 2026-10-31 用户点名要的四项：打开 / 共享 / 保存 / 添加到对话。
@@ -489,7 +489,7 @@ struct MyFilesView: View {
                     .background(Theme.card)
                     .clipShape(RoundedRectangle(cornerRadius: 13, style: .continuous))
             }
-            .buttonStyle(PressableStyle(scale: 0.97))
+            .buttonStyle(PressableStyle(scale: 0.97, fills: true))
             .foregroundStyle(picked.isEmpty ? Color.secondary : Color.primary)
             .disabled(picked.isEmpty)
 
@@ -503,7 +503,7 @@ struct MyFilesView: View {
                     .background(Theme.card)
                     .clipShape(RoundedRectangle(cornerRadius: 13, style: .continuous))
             }
-            .buttonStyle(PressableStyle(scale: 0.97))
+            .buttonStyle(PressableStyle(scale: 0.97, fills: true))
             .foregroundStyle(picked.isEmpty ? Color.secondary : Color.red)
             .disabled(picked.isEmpty)
         }
@@ -598,7 +598,7 @@ struct SessionPickerSheet: View {
                         } label: {
                             row(s)
                         }
-                        .buttonStyle(PressableStyle(scale: 0.97))
+                        .buttonStyle(PressableStyle(scale: 0.97, fills: true))
                     }
                 }
                 .padding(.horizontal, 16)

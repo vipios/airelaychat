@@ -176,7 +176,7 @@ struct ModelPickerSheet: View {
                         .background(Color(.secondarySystemBackground))
                         .clipShape(Circle())
                 }
-                .buttonStyle(PressableStyle(scale: 0.90))
+                .buttonStyle(PressableStyle(scale: 0.90, fills: true))
             }
             .padding(.horizontal, 18)
             .padding(.top, 4)
@@ -289,7 +289,7 @@ struct ModelPickerSheet: View {
             .clipShape(RoundedRectangle(cornerRadius: 16, style: .continuous))
             .contentShape(Rectangle())
         }
-        .buttonStyle(PressableStyle(scale: 0.97))
+        .buttonStyle(PressableStyle(scale: 0.97, fills: true))
         .contextMenu {
             Button {
                 newName = p.name
@@ -358,7 +358,7 @@ struct ModelPickerSheet: View {
             .clipShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
             .contentShape(Rectangle())
         }
-        .buttonStyle(PressableStyle(scale: 0.97))
+        .buttonStyle(PressableStyle(scale: 0.97, fills: true))
     }
 
     @ViewBuilder

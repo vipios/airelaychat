@@ -487,7 +487,7 @@ struct ChatView: View {
                     .clipShape(Circle())
                     .shadow(color: .black.opacity(0.05), radius: 3, x: 0, y: 1)
             }
-            .buttonStyle(PressableStyle(scale: 0.95))
+            .buttonStyle(PressableStyle(scale: 0.95, fills: true))
 
             // 中间：第一行任务名，第二行模型（点它开模型选择）
             //
@@ -527,7 +527,7 @@ struct ChatView: View {
                 .frame(maxWidth: .infinity, alignment: .center)
                 .contentShape(Rectangle())
             }
-            .buttonStyle(PressableStyle(scale: 0.95))
+            .buttonStyle(PressableStyle(scale: 0.96, tint: 0.06, tintRadius: 14))
 
             // 右侧：一个白胶囊里并排两个图标（新建 / 更多），照截图
             HStack(spacing: 0) {
@@ -870,7 +870,7 @@ struct ChatView: View {
             .clipShape(Capsule())
             .contentShape(Capsule())
         }
-        .buttonStyle(PressableStyle())
+        .buttonStyle(PressableStyle(fills: true))
     }
 
     @ViewBuilder
@@ -984,7 +984,7 @@ struct ChatView: View {
             .clipShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
             .contentShape(Rectangle())
         }
-        .buttonStyle(PressableStyle(scale: 0.95))
+        .buttonStyle(PressableStyle(scale: 0.95, fills: true))
         // 2026-11-01 用户：「这个产物我按住以后也要弹窗全部产物中的那种弹窗」。
         // 所以聊天里这张卡和「全部产物」列表里的那行长按菜单保持一致：
         // 打开 / 共享 / 保存 / 添加到对话。
@@ -1348,7 +1348,7 @@ private struct AttachSheet: View {
                             .background(Theme.card)
                             .clipShape(RoundedRectangle(cornerRadius: 16, style: .continuous))
                     }
-                    .buttonStyle(PressableStyle(scale: 0.95))
+                    .buttonStyle(PressableStyle(scale: 0.95, fills: true))
                     .padding(.horizontal, 16)
                     .padding(.top, 8)
                     .padding(.bottom, 22)
