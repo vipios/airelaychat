@@ -218,6 +218,14 @@ struct SelectableText: UIViewRepresentable {
         /// 点气泡空白处时别把键盘弹出来 —— 这里只需要"选"，不需要"编"。
         func textViewShouldBeginEditing(_ textView: UITextView) -> Bool { false }
 
+        /// 选区一变就登记"当前是谁在选"。
+        /// 2026-11-01：点空白处取消选区要靠它知道该清哪一个控件。
+        func textViewDidChangeSelection(_ textView: UITextView) {
+            if textView.selectedRange.length > 0 {
+                SelectionKiller.shared.active = textView
+            }
+        }
+
         /// 接管长按弹出的那个菜单（iOS 16.0+）。
         ///
         /// 系统在简体中文里把这项叫「拷贝」，改不了本地化，只能整块换掉菜单。
@@ -248,25 +256,36 @@ struct SelectableText: UIViewRepresentable {
                 Haptic.press()
             })
 
-            // 「全选」：选满之后**自己把菜单再弹一次**。
+            // 「全选」：只在**还没全选**时才给这一项。
             //
-            // 2026-11-01 用户两次反馈：「全选完以后他不弹出来复制，还要我点击一次
-            // 被选的位置才能出来复制」。上一版试过"先清零再设满选区"，指望系统
-            // 因为选区变化自动重弹 —— 实测不行：菜单是被长按手势带出来的，
-            // 选区变化不会触发它。所以这里改成显式调用 `presentEditMenu`。
-            // 中间的 0.08s 是等系统把旧菜单收干净，太快会两个菜单打架。
-            actions.append(UIAction(title: "全选",
-                                    image: UIImage(systemName: "textformat.size")) { [weak self, weak textView] _ in
-                guard let tv = textView else { return }
-                let full = NSRange(location: 0, length: (tv.text as NSString).length)
-                guard full.length > 0 else { return }
-                tv.becomeFirstResponder()
-                tv.selectedRange = full
-                Haptic.tap()
-                DispatchQueue.main.asyncAfter(deadline: .now() + 0.08) {
-                    self?.presentMenu(on: tv)
-                }
-            })
+            // 2026-11-01 用户：「前面已经全选了，然后自动弹出来复制就可以了，
+            // 已经全选了还要弹出来全选为了什么」。对 —— 全选之后再点一次全选
+            // 什么都不会变，纯占位子还挡着视线。所以按当前选区判断：
+            // 选满了就把这一项拿掉，菜单只剩「复制」。
+            let full = NSRange(location: 0, length: (textView.text as NSString).length)
+            let allSelected = full.length > 0 && textView.selectedRange == full
+
+            if !allSelected {
+                // 选满之后**自己把菜单再弹一次**。
+                // 2026-11-01 用户两次反馈：「全选完以后他不弹出来复制，还要我点击
+                // 一次被选的位置才能出来复制」。上一版试过"先清零再设满选区"，
+                // 指望系统因为选区变化自动重弹 —— 不行：菜单是被长按手势带出来的。
+                // 所以改成显式 `presentEditMenu`。0.08s 是等系统把旧菜单收干净。
+                actions.append(UIAction(title: "全选",
+                                        image: UIImage(systemName: "textformat.size")) { [weak self, weak textView] _ in
+                    guard let tv = textView else { return }
+                    let range = NSRange(location: 0, length: (tv.text as NSString).length)
+                    guard range.length > 0 else { return }
+                    tv.becomeFirstResponder()
+                    tv.selectedRange = range
+                    // 选满了就要登记为"当前活动选区"，点空白才有东西可以取消
+                    SelectionKiller.shared.active = tv
+                    Haptic.tap()
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.08) {
+                        self?.presentMenu(on: tv)
+                    }
+                })
+            }
 
             if parent.allowRecall {
                 actions.append(UIAction(title: "撤回",
@@ -375,5 +394,114 @@ final class PasteTextView: UITextView {
         DispatchQueue.main.async { [weak self] in
             self?.onRecallAndEdit?()
         }
+    }
+}
+
+// MARK: - 点空白处取消选区
+
+/// 选了一段以后，点没选中的地方应该"取消这一次选择"。
+///
+/// 2026-11-01 用户：「全选或者选择复制的时候，不想复制了，点击没选择的地方
+/// 应该对此次的复制进行取消，你现在都取消不了」，并附了截图 ——
+/// 菜单已经收了，绿色高亮还整段留在那儿。
+///
+/// 为什么不用 SwiftUI 的 `onTapGesture`：它和 ScrollView 的拖动、
+/// 和 UITextView 自己的长按/拖动手柄会抢手势，表现很不稳
+/// （有时点一下滚不动、有时点了没反应，还得靠真机反复试）。
+///
+/// 这里改成在 **window 最外层**挂一个 tap 识别器：
+///   · `cancelsTouchesInView = false` —— 不吞事件，输入框、按钮照常工作；
+///   · 点在当前选区那块文本自己身上 → 不管，交给 UITextView 调光标；
+///   · 点在别处 → 收菜单 + 清选区 + 交还第一响应者。
+final class SelectionKiller: NSObject, UIGestureRecognizerDelegate {
+    static let shared = SelectionKiller()
+
+    /// 当前有选区的那个控件。弱引用：消息滑出屏幕被回收后自动变 nil，
+    /// 不会拖着一堆已经不在树上的 textView。
+    weak var active: UITextView?
+
+    private var installed = false
+    private var retry = 0
+
+    /// App 启动时调一次。必须在 window 已经存在之后 ——
+    /// 拿不到就等 0.3 秒再来，最多 6 次（约 2 秒）。
+    func install() {
+        guard !installed else { return }
+        guard let w = Self.keyWindow() else {
+            guard retry < 6 else { return }
+            retry += 1
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) { [weak self] in
+                self?.install()
+            }
+            return
+        }
+        installed = true
+        let tap = UITapGestureRecognizer(target: self, action: #selector(onTap(_:)))
+        tap.cancelsTouchesInView = false
+        tap.delegate = self
+        w.addGestureRecognizer(tap)
+    }
+
+    @objc private func onTap(_ g: UITapGestureRecognizer) {
+        guard let tv = active else { return }
+        // 点在自己身上：可能是想改选词/挪光标，交给 UITextView 自己处理
+        if tv.bounds.contains(g.location(in: tv)) { return }
+        // 立刻解绑，再去清。不能等 0.05 秒后才解绑 ——
+        // 这中间用户可能已经点了另一条消息、把 active 换成了新的控件，
+        // 延迟里再置空就会把"新的那个"的登记抹掉，之后点空白又清不掉它。
+        active = nil
+        clear(tv)
+    }
+
+    /// 收菜单 → 清选区 → 交还第一响应者。
+    ///
+    /// ⚠️ 故意晚 0.05 秒再清，这不是凑数：
+    /// 点菜单上「复制」那一下，window 的 tap 和菜单的 UIAction 在同一个 runloop
+    /// 里都会被触发。要是我们抢在前头把选区清了，`copy(nil)` 拿到的就是空内容 ——
+    /// 表现成"点了复制什么都没进剪贴板"。延后一帧让 action 先跑完，清不清都无所谓。
+    func clear(_ tv: UITextView) {
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) {
+            for i in tv.interactions {
+                (i as? UIEditMenuInteraction)?.dismissMenu()
+            }
+            tv.selectedRange = NSRange(location: 0, length: 0)
+            tv.resignFirstResponder()
+        }
+    }
+
+    // MARK: UIGestureRecognizerDelegate
+
+    /// 点在"编辑菜单"本身上时直接不接管。
+    ///
+    /// 菜单是系统私有类的视图（`_UIEditMenuView` / `…PlatterView` 之类），
+    /// 没有公开类型可以比对，只能沿 superview 链看类名。这一步是上面那个
+    /// 0.05 秒延迟之外的第二道保险 —— 只要识别器收不到这一下，就绝不会
+    /// 在用户点「全选」时把刚弹出来的菜单又收掉。
+    func gestureRecognizer(_ g: UIGestureRecognizer,
+                           shouldReceive touch: UITouch) -> Bool {
+        var node = touch.view
+        while let cur = node {
+            let name = String(describing: type(of: cur))
+            if name.contains("EditMenu") || name.contains("ContextMenu") || name.contains("Platter") {
+                return false
+            }
+            node = cur.superview
+        }
+        return true
+    }
+
+    /// 和滚动、和文本自己的手势同时识别，互不阻塞。
+    /// 返回 false 的话，滚动过程中只要手指一开始碰到按钮就会判定失败。
+    func gestureRecognizer(_ g: UIGestureRecognizer,
+                           shouldRecognizeSimultaneouslyWith other: UIGestureRecognizer) -> Bool {
+        true
+    }
+
+    static func keyWindow() -> UIWindow? {
+        UIApplication.shared.connectedScenes
+            .compactMap { $0 as? UIWindowScene }
+            .filter { $0.activationState == .foregroundActive }
+            .flatMap { $0.windows }
+            .first { $0.isKeyWindow }
     }
 }

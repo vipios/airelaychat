@@ -17,6 +17,8 @@ struct AIRelayChatApp: App {
                     // 经常不震（生成器还在唤起 Taptic Engine），用户会以为又坏了。
                     // 2026-11-01 用户：「所有的按键加一个震动反馈」。
                     Haptic.warmUp()
+                    // 点空白处取消选区的全局手势（window 级）。同样要在窗口就绪后挂。
+                    SelectionKiller.shared.install()
                     // 首次进入自动判定在家/在外
                     await store.bootstrap()
                 }

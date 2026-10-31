@@ -1427,16 +1427,9 @@ private struct AdminTabPage: View {
                         store.tab = .tasks
                     }
                     Spacer(minLength: 6)
-                    // 2026-11-01 用户：「后台面板点击刷新没有反应，
-                    // 你要让点击效果出来啊，点在点击按钮都没有反应也不知道是不是在刷新」。
-                    // 现在点下去：按钮立刻变成「刷新中」+ 转圈 + 半透明（看得见点到了），
-                    // 同时网页上盖一层「正在刷新…」的遮罩（看得见在干活），
-                    // 加载完遮罩消失、地址下面出现「已刷新 HH:mm」（看得见干完了）。
-                    PillButton(title: refreshing ? "刷新中" : "刷新",
-                               icon: "arrow.clockwise",
-                               loading: refreshing) {
-                        startRefresh()
-                    }
+                    // 2026-11-01 用户：「后台面板右上角的刷新按键移除不用了」。
+                    // 删掉之后这里只留「密钥」；网页自己会在切回这个 Tab 时重载，
+                    // 改完密钥也会自动重载（见 alert 里保存那段），不需要手动刷新。
                     PillButton(title: "密钥", icon: "key.fill") {
                         keyDraft = key
                         editingKey = true
