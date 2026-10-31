@@ -127,14 +127,17 @@ enum BootChannel {
 
     // MARK: - 小工具
 
+    /// 组装请求地址。候选可以是裸 IP（内网），也可以是带协议的完整地址（公网域名）。
+    ///
+    /// 为什么允许带协议：在家走内网 `http://192.168.1.88`，在外面走
+    /// `https://<域名>`（Cloudflare 隧道），两者只差一个前缀，
+    /// 没必要为它们写两套代码。
     private static func url(host: String, query: String) -> URL? {
         var h = host.trimmingCharacters(in: .whitespacesAndNewlines)
-        // 容错：用户/候选里可能带 scheme 或斜杠
-        if h.hasPrefix("http://") { h = String(h.dropFirst(7)) }
-        if h.hasPrefix("https://") { h = String(h.dropFirst(8)) }
-        if h.hasSuffix("/") { h = String(h.dropLast()) }
+        while h.hasSuffix("/") { h = String(h.dropLast()) }
         guard !h.isEmpty else { return nil }
-        return URL(string: "http://" + h + path + "?" + query)
+        if !h.contains("://") { h = "http://" + h }
+        return URL(string: h + path + "?" + query)
     }
 
     private static func escaped(_ s: String) -> String {

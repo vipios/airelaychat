@@ -611,12 +611,23 @@ struct SettingsView: View {
         // 这条路径的意义：中转站是最会卡死的那个东西，路由卡了想重启、
         // 中转站也卡着，指令就永远发不出去。uhttpd 是 C 进程，和中转站
         // 无关，中转站整个停掉也能应答（已实测）。
+        // 第一步先找内网（快）：找到了立刻发，最坏 1.2 秒。
+        // 找不到再走公网域名（慢，1~3 秒，但人在外面时只有它有戏）。
+        // 两条路都是**直连路由器**，不经过中转站。
         devMsg = "正在找路由器…"
         var hosts = settings.lanCandidates
         if !settings.bootHost.isEmpty { hosts.insert(settings.bootHost, at: 0) }
 
-        if let host = await BootChannel.discover(candidates: hosts) {
-            settings.bootHost = host          // 记住这条通的路，下次先用它
+        var host = await BootChannel.discover(candidates: hosts)
+        if host == nil, let pub = publicBootHost() {
+            devMsg = "内网没找到，试公网通道…"
+            host = await BootChannel.discover(candidates: [pub], timeout: 6)
+        }
+
+        if let host = host {
+            // 只有内网裸地址才记进 bootHost（它是当 IP 用的）；
+            // 公网那条带 https://，每次现拼就行，别混进 IP 池里。
+            if !host.contains("://") { settings.bootHost = host }
             do {
                 try await BootChannel.reboot(host: host, key: settings.accessKey)
                 devMsg = "重启指令已直接从路由器发出，约 40 秒后恢复…"
@@ -670,6 +681,14 @@ struct SettingsView: View {
         } catch {
             devMsg = authHint(error)
         }
+    }
+
+    /// 公网那条重启通道的完整地址（人不在家时用）。
+    /// 走 Cloudflare 隧道直连路由器的 80 端口，绕开中转站。
+    private func publicBootHost() -> String? {
+        let d = settings.publicDomain.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !d.isEmpty else { return nil }
+        return d.contains("://") ? d : "https://" + d
     }
 
     /// 把错误翻成「该去改哪里」。
