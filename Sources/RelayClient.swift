@@ -295,7 +295,8 @@ final class RelayClient {
         let hit = await withTaskGroup(of: (String, Bool)?.self) { group -> (String, Bool)? in
             group.addTask {
                 // 没装 ZeroTier 时这里会超时，但因为和扫描是并发的，不额外拖时间
-                await probeHealth(zt, timeout: 4.0, session: s) != nil ? (zt, false) : nil
+                let alive = await probeHealth(zt, timeout: 4.0, session: s) != nil
+                return alive ? (zt, false) : nil
             }
             if onWiFi {
                 group.addTask { [weak self] in
@@ -412,7 +413,8 @@ final class RelayClient {
         let hit = await withTaskGroup(of: (Int, String)?.self) { group -> (Int, String)? in
             if tryLan {
                 group.addTask {
-                    await probeHealth(lan, timeout: 0.9, session: lanS) != nil ? (0, lan) : nil
+                    let alive = await probeHealth(lan, timeout: 0.9, session: lanS) != nil
+                    return alive ? (0, lan) : nil
                 }
             }
             if tryPub {
@@ -420,7 +422,10 @@ final class RelayClient {
                     // 域名（https）给 8 秒：隧道冷启动实测 2.7~4.3 秒，
                     // 给 4 秒都不够稳。裸 IPv6 直连给 4 秒。
                     let t: TimeInterval = pub.hasPrefix("https://") ? 8.0 : 4.0
-                    await probeHealth(pub, timeout: t, session: pubS) != nil ? (1, pub) : nil
+                    let alive = await probeHealth(pub, timeout: t, session: pubS) != nil
+                    // 注意：这个闭包里有两行代码，属于「多语句闭包」，
+                    // 必须显式 return —— 只有单表达式闭包才允许隐式返回。
+                    return alive ? (1, pub) : nil
                 }
             }
             var lanHit: (Int, String)?
