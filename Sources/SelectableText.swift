@@ -64,6 +64,7 @@ struct SelectableText: UIViewRepresentable {
         tv.onRecall = onRecall
         tv.onRecallAndEdit = onRecallAndEdit
         tv.attributedText = Self.styled(text)
+        tv.appliedText = text
         return tv
     }
 
@@ -88,7 +89,16 @@ struct SelectableText: UIViewRepresentable {
     func updateUIView(_ tv: PasteTextView, context: Context) {
         // 只在文字真的变了才重设 attributedText：
         // 每帧重设会把用户正在拖的选区手柄打断。
-        if tv.text != text { tv.attributedText = Self.styled(text) }
+        //
+        // 2026-11-01 再加一道锁：比对的是**我们上次写进去的那串**，
+        // 不是 `tv.text`。UITextView 会做规范化（行尾、换行符），
+        // 一旦 `tv.text` 和原文永远不相等，这里就变成"每次刷新都重设一遍
+        // attributedText"——选区被清、滚动位置被顶回去，
+        // 表现就是用户说的「到底了一直在跳动」。
+        if tv.appliedText != text {
+            tv.appliedText = text
+            tv.attributedText = Self.styled(text)
+        }
         // 闭包捕获的是某一帧的 msg，必须每次刷新都换掉，
         // 否则撤回的会是上一次渲染时的那条消息（很隐蔽的 bug）
         tv.allowRecallMenu = allowRecall
@@ -113,16 +123,45 @@ struct SelectableText: UIViewRepresentable {
     /// 每次都真去 `sizeThatFits` 量一遍文字，量出来的高度差半像素就会让
     /// SwiftUI 重新排一次列表，一连串消息同时重排 —— 表现就是滑到底以后
     /// 所有文字一起抖。所以这里按 (文字, 宽度) 缓存，没变化直接返回上次结果。
+    ///
+    /// ⚠️ 2026-11-01 又抖（用户：「ai 给我回复我上滑的时候到底了一直在跳动」）。
+    /// 上一版的缓存有个洞：proposal.width 为 nil 时用 `UIScreen.main.bounds.width`
+    /// 当宽度去量，还把这个结果写进了缓存。于是同一个控件在两种量法之间来回切：
+    ///   宽度有值 → maxW = 353 → 高度 748
+    ///   宽度为 nil → maxW = 393 → 高度 812
+    /// 两套结果交替命中缓存，就成了"每秒抖很多遍"。
+    /// 现在两条规矩：
+    ///   1. 宽度量化到 0.5pt 栅格 —— 半像素级的浮动不再触发重排；
+    ///   2. proposal 没给宽度时**不写缓存**，只在有真实宽度时才落缓存。
+    /// 另外返回的矩形宽度也用同一个量化值，控件宽度和量出来的宽度永远一致，
+    /// 不会出现"按 350 量、按 353 摆"导致重新折行。
     func sizeThatFits(_ proposal: ProposedViewSize,
                       uiView: PasteTextView,
                       context: Context) -> CGSize? {
-        let maxW = proposal.width ?? UIScreen.main.bounds.width
-        guard maxW.isFinite, maxW > 0 else { return nil }
+        // 有真实宽度就用它；没有（ideal 询问）就退回上次量过的宽度，
+        // 实在没有才用屏幕宽度兜底 —— 但这两种兜底都**不写缓存**。
+        let rawWidth: CGFloat
+        let cacheable: Bool
+        if let w = proposal.width, w.isFinite, w > 0 {
+            rawWidth = w
+            cacheable = true
+        } else if uiView.measureMaxWidth > 0 {
+            rawWidth = uiView.measureMaxWidth
+            cacheable = false
+        } else {
+            rawWidth = UIScreen.main.bounds.width
+            cacheable = false
+        }
+
+        // 量化到 0.5pt：SwiftUI 传下来的宽度常在 353.0 / 352.98 之间来回，
+        // 这点差值不足以改变排版，却足以让缓存失效、让一屏消息重排一遍。
+        let maxW = (rawWidth * 2).rounded(.down) / 2
+        guard maxW > 0 else { return nil }
 
         let key = uiView.text ?? ""
         if uiView.measureKey == key,
            uiView.measureFills == fillsWidth,
-           abs(uiView.measureMaxWidth - maxW) < 0.5 {
+           abs(uiView.measureMaxWidth - maxW) < 0.01 {
             return uiView.measureSize
         }
 
@@ -145,10 +184,12 @@ struct SelectableText: UIViewRepresentable {
             result = CGSize(width: w, height: ceil(h))
         }
 
-        uiView.measureKey = key
-        uiView.measureFills = fillsWidth
-        uiView.measureMaxWidth = maxW
-        uiView.measureSize = result
+        if cacheable {
+            uiView.measureKey = key
+            uiView.measureFills = fillsWidth
+            uiView.measureMaxWidth = maxW
+            uiView.measureSize = result
+        }
         return result
     }
 
@@ -184,8 +225,29 @@ struct SelectableText: UIViewRepresentable {
                 textView?.copy(nil)
             })
 
-            actions.append(UIAction(title: "全选") { [weak textView] _ in
-                textView?.selectAll(nil)
+            // 「全选」+ 选完自动把菜单再弹出来。
+            //
+            // 2026-11-01 用户：「我点击了全选，他就全选了，但是全选完以后他不弹出来复制，
+            // 还要我点击一次被选的位置才能出来复制，你要改成我点击全选以后他自动跳出来复制」。
+            //
+            // 原因：`selectAll(nil)` 只是改了选区，系统不会因为"选区变了"重新弹一次菜单
+            // （菜单是被长按手势带出来的，不是被选区带出来的）。
+            // 这里没有公开的"显示菜单"API，所以走系统自己的机制：
+            // 让控件做第一响应者，然后把选区**先清零再设满** —— 二次改选区会让
+            // iOS 16 重新摆出手柄和编辑菜单，菜单里第一项就是「复制」。
+            // 中间隔一帧是必须的：同一帧里连续改两次选区，系统会合并成一次。
+            actions.append(UIAction(title: "全选",
+                                    image: UIImage(systemName: "textformat.size")) { [weak textView] _ in
+                guard let tv = textView else { return }
+                let full = NSRange(location: 0, length: (tv.text as NSString).length)
+                guard full.length > 0 else { return }
+                tv.becomeFirstResponder()
+                DispatchQueue.main.async {
+                    tv.selectedRange = NSRange(location: 0, length: 0)
+                    DispatchQueue.main.async {
+                        tv.selectedRange = full
+                    }
+                }
             })
 
             if parent.allowRecall {
@@ -235,6 +297,11 @@ final class PasteTextView: UITextView {
     var measureFills: Bool = false
     var measureMaxWidth: CGFloat = 0
     var measureSize: CGSize = .zero
+
+    /// 上一次真正写进 `attributedText` 的那串原文。
+    /// 不能拿 `text` 属性去比对 —— UITextView 会做规范化，两者永远不相等
+    /// 就会导致每次刷新都重设一遍文字（选区被清、滚动被顶回去，看着像在抖）。
+    var appliedText: String = ""
 
     // MARK: 自定义菜单项
 

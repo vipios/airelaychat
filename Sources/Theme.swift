@@ -73,6 +73,24 @@ enum Theme {
     /// 所以干脆收到一处，以后只改这一个数。
     static let bodySize: CGFloat = 16
 
+    /// 选中 / 按下的底色：深灰。
+    ///
+    /// 2026-11-01 用户：「在所有的界面都添加一个选中的状态…选中状态改为深灰色也行你自己定」。
+    /// 之前选中态用的是 `Color.primary`（纯黑），在白底上对比太硬，
+    /// 一排按钮里只要有一个黑的，整屏视线全被它抢走；深灰既明确又不刺眼。
+    static let press = Color(uiColor: UIColor { t in
+        t.userInterfaceStyle == .dark
+            ? UIColor(red: 0.780, green: 0.780, blue: 0.800, alpha: 1)   // 深色模式下反过来用浅灰
+            : UIColor(red: 0.235, green: 0.235, blue: 0.247, alpha: 1)   // #3C3C3F
+    })
+
+    /// 选中行/选中块的浅底（列表里那种"我在这一行"的提示，不能太重）
+    static let selectedRow = Color(uiColor: UIColor { t in
+        t.userInterfaceStyle == .dark
+            ? UIColor(red: 0.240, green: 0.240, blue: 0.255, alpha: 1)
+            : UIColor(red: 0.898, green: 0.898, blue: 0.918, alpha: 1)   // #E5E5EA
+    })
+
     /// 选中文字的高亮底色 + 两端手柄的颜色。
     ///
     /// 2026-10-31 用户拿 WorkBuddy 原版截图要求「拖动的样式和图中的一样的」：
@@ -125,49 +143,89 @@ extension View {
 /// 这层缩放（0.94）+ 变淡（0.72）足够让人确认"收到了"，
 /// 又不至于像系统高亮那样闪一片灰。
 struct PressableStyle: ButtonStyle {
-    var scale: CGFloat = 0.94
+    var scale: CGFloat = 0.90
+    /// 按下时的不透明度。小图标按钮可以用很低（要"啪"一下的感觉），
+    /// 整行列表项要留多一点（半片灰闪一下会像卡顿）。
+    var dim: CGFloat = 0.52
 
     func makeBody(configuration: Configuration) -> some View {
         configuration.label
+            // 2026-11-01 用户：「后台面板点击刷新没有反应，你要让点击效果出来啊」。
+            // 原来 0.94 / 0.72 这组在 #F8F8F8 上几乎看不出来，
+            // 现在压到 0.90 + 0.52，按下去整颗按钮明显缩一圈、暗一档。
+            // 只做缩放和透明度、不加灰色叠层：这个样式的宿主有胶囊也有圆角方块，
+            // 硬叠一个 Capsule 会在方角按钮上露出圆角，反而更花。
             .scaleEffect(configuration.isPressed ? scale : 1)
-            .opacity(configuration.isPressed ? 0.72 : 1)
+            .opacity(configuration.isPressed ? dim : 1)
             .animation(.easeOut(duration: 0.12), value: configuration.isPressed)
     }
 }
 
-/// 胶囊按钮：图标 + 文字，带底、带边、带按压反馈。
+/// 胶囊按钮：图标 + 文字，带底、带按压反馈。
 ///
-/// `filled = true` 是黑底白字（用于「返回」这种主操作），
-/// 否则是白底黑字 + 极淡描边（用于「刷新」「密钥」这些次要操作）。
-/// 后台面板顶栏那三个都用它，尺寸一致、手感一致。
+/// 2026-11-01 用户：「把后台面板中的胶囊颜色和聊天页右上角的胶囊颜色一样，
+/// 选中状态改为深灰色」。所以这里不再有"黑底主按钮"那一版 ——
+/// 三个胶囊统一成**和聊天页右上角那颗一模一样的白底 + 同款淡阴影**，
+/// 按下去整颗变深灰、字变白（这就是"选中状态"）。
 struct PillButton: View {
     let title: String
     let icon: String
-    var filled: Bool = false
+    /// 正在执行（刷新中）：图标换成转圈，按钮半透明且点不动。
+    ///
+    /// 2026-11-01 用户：「点在点击按钮都没有反应也不知道是不是在刷新」——
+    /// 光有按下态只解决了"点到了"，还得让人知道"点完在干活"。
+    /// 所以刷新期间按钮自己变成 loading，标题也换成「刷新中」。
+    var loading: Bool = false
+    /// 只是禁用（不改文字、不转圈）
+    var disabled: Bool = false
     let action: () -> Void
 
     var body: some View {
         Button(action: action) {
             HStack(spacing: 5) {
-                Image(systemName: icon)
-                    .font(.system(size: 12, weight: .semibold))
+                if loading {
+                    ProgressView()
+                        .scaleEffect(0.62)
+                        .frame(width: 12, height: 12)
+                        // 底是白的，转圈必须是深色，不然白转白等于没有
+                        .tint(Theme.press)
+                } else {
+                    Image(systemName: icon)
+                        .font(.system(size: 12, weight: .semibold))
+                }
                 Text(title)
                     .font(.system(size: 13, weight: .medium))
+                    .lineLimit(1)
             }
-            .foregroundStyle(filled ? Theme.card : Color.primary)
-            .padding(.horizontal, 13)
-            .padding(.vertical, 8)
-            .background(filled ? Color.primary : Theme.card)
-            .overlay(
-                Capsule().strokeBorder(
-                    filled ? Color.clear : Color.primary.opacity(0.10),
-                    lineWidth: 1
-                )
-            )
-            .clipShape(Capsule())
-            .shadow(color: .black.opacity(filled ? 0.16 : 0.06), radius: 6, y: 2)
+            // 内边距由 PillStyle 统一加（它在画底色，padding 必须在同一层）
             .contentShape(Capsule())
         }
-        .buttonStyle(PressableStyle(scale: 0.93))
+        .buttonStyle(PillStyle())
+        .disabled(disabled || loading)
+        .opacity(disabled || loading ? 0.65 : 1)
+        // 别让宽度随标题在「刷新 / 刷新中」之间左右跳 —— 顶栏左右两个胶囊
+        // 会跟着一起动，看起来像整行在抖。
+        .frame(minWidth: 78)
+    }
+}
+
+/// 胶囊自己的按压样式。
+///
+/// 为什么不用通用的 `PressableStyle`：只有这里**自己画底色**，
+/// 才能真正做到"按下去整颗变深灰、文字反白"，而通用样式只能缩放 + 变淡。
+/// 底和内边距都在 ButtonStyle 里画，颜色才能跟着 `isPressed` 一起换。
+private struct PillStyle: ButtonStyle {
+    func makeBody(configuration: Configuration) -> some View {
+        let pressed = configuration.isPressed
+        return configuration.label
+            .foregroundStyle(pressed ? Theme.card : Color.primary)
+            .padding(.horizontal, 13)
+            .padding(.vertical, 8)
+            .background(pressed ? Theme.press : Theme.card)
+            .clipShape(Capsule())
+            // 和聊天页右上角那颗胶囊用的是同一组数值（0.05 / radius 3 / y 1）
+            .shadow(color: .black.opacity(0.05), radius: 3, x: 0, y: 1)
+            .scaleEffect(pressed ? 0.95 : 1)
+            .animation(.easeOut(duration: 0.12), value: pressed)
     }
 }

@@ -36,6 +36,10 @@ struct MyFilesView: View {
     /// 旧版误存的聊天记录（纯文字、没有代码块），扫出来给用户一键清
     @State private var staleIds: Set<String> = []
     @State private var confirmPurge = false
+    /// 就地展开的那几个（点产物 = 展开/收起，不跳转）
+    @State private var expanded: Set<String> = []
+    /// 展开过的正文缓存，key = 文件 id
+    @State private var textCache: [String: String] = [:]
 
     private var title: String { sessionId == nil ? "我的文件" : "全部产物" }
 
@@ -263,7 +267,7 @@ struct MyFilesView: View {
             .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
             .contentShape(Rectangle())
         }
-        .buttonStyle(.plain)
+        .buttonStyle(PressableStyle(scale: 0.97, dim: 0.72))
         .padding(.bottom, 2)
     }
 
@@ -273,103 +277,198 @@ struct MyFilesView: View {
 
     private func row(_ f: AIFile) -> some View {
         let on = picked.contains(f.id)
-        return Button {
-            if picking {
-                if on { picked.remove(f.id) } else { picked.insert(f.id) }
-            } else {
-                preview = f
-            }
-        } label: {
-            HStack(spacing: 11) {
+        let open = expanded.contains(f.id)
+        return VStack(spacing: 0) {
+            Button {
                 if picking {
-                    Image(systemName: on ? "checkmark.circle.fill" : "circle")
-                        .font(.system(size: 19, weight: .regular))
-                        .foregroundStyle(on ? Color.accentColor : Color.secondary.opacity(0.4))
-                        .transition(.opacity)
+                    if on { picked.remove(f.id) } else { picked.insert(f.id) }
+                } else {
+                    // 2026-11-01 用户：「我要点击产物的时候不需要跳转到对话窗口，
+                    // 让他实现真实的收缩那种」—— 点一下就地展开内容，再点一下收起。
+                    // 想看全文/系统预览走长按菜单里的「打开」，不再"点一下就跳走"。
+                    withAnimation(.easeOut(duration: 0.18)) {
+                        if open { expanded.remove(f.id) } else { expanded.insert(f.id) }
+                    }
                 }
+            } label: {
+                HStack(spacing: 11) {
+                    if picking {
+                        Image(systemName: on ? "checkmark.circle.fill" : "circle")
+                            .font(.system(size: 19, weight: .regular))
+                            .foregroundStyle(on ? Color.accentColor : Color.secondary.opacity(0.4))
+                            .transition(.opacity)
+                    }
 
-                ZStack {
-                    RoundedRectangle(cornerRadius: 11, style: .continuous)
-                        .fill(f.kind.tint)
-                        .frame(width: 42, height: 42)
-                    Image(systemName: f.kind.icon)
-                        .font(.system(size: 18, weight: .regular))
-                        .foregroundStyle(.white)
+                    ZStack {
+                        RoundedRectangle(cornerRadius: 11, style: .continuous)
+                            .fill(f.kind.tint)
+                            .frame(width: 42, height: 42)
+                        Image(systemName: f.kind.icon)
+                            .font(.system(size: 18, weight: .regular))
+                            .foregroundStyle(.white)
+                    }
+
+                    VStack(alignment: .leading, spacing: 3) {
+                        Text(f.displayName)
+                            .font(.system(size: 15.5))
+                            .foregroundStyle(.primary)
+                            .lineLimit(1)
+                        Text("文件产物 · \(f.sizeText)")
+                            .font(.system(size: 12.5))
+                            .foregroundStyle(.secondary)
+                    }
+
+                    Spacer(minLength: 4)
+
+                    Text(shortTime(f.createdAt))
+                        .font(.system(size: 12))
+                        .foregroundStyle(.tertiary)
+
+                    if !picking {
+                        Image(systemName: "chevron.down")
+                            .font(.system(size: 10, weight: .semibold))
+                            .foregroundStyle(.tertiary)
+                            .rotationEffect(.degrees(open ? 180 : 0))
+                    }
                 }
-
-                VStack(alignment: .leading, spacing: 3) {
-                    Text(f.displayName)
-                        .font(.system(size: 15.5))
-                        .foregroundStyle(.primary)
-                        .lineLimit(1)
-                    Text("文件产物 · \(f.sizeText)")
-                        .font(.system(size: 12.5))
-                        .foregroundStyle(.secondary)
-                }
-
-                Spacer(minLength: 4)
-
-                Text(shortTime(f.createdAt))
-                    .font(.system(size: 12))
-                    .foregroundStyle(.tertiary)
+                .padding(.horizontal, 13)
+                .padding(.vertical, 12)
+                .contentShape(Rectangle())
             }
-            .padding(.horizontal, 13)
-            .padding(.vertical, 12)
-            .background(Theme.tile)
-            .clipShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
-            .overlay(
-                RoundedRectangle(cornerRadius: 14, style: .continuous)
-                    .stroke(Color.accentColor.opacity(picking && on ? 0.5 : 0), lineWidth: 1.2)
-            )
-            .contentShape(Rectangle())
+            .buttonStyle(PressableStyle(scale: 0.97, dim: 0.72))
+            // ScrollView 里没有 swipeActions，长按菜单顶替。
+            //
+            // 2026-10-31 用户点名要的四项：打开 / 共享 / 保存 / 添加到对话。
+            //   打开   = 在 App 里直接看（QuickLook）
+            //   共享   = 系统分享面板，发给任何 App
+            //   保存   = 存到「文件」App（iCloud 云盘 / 我的 iPhone 等位置）
+            //   添加到对话 = 把这份产物塞进指定对话的输入框
+            // 2026-11-01 加第五项「打开对话」—— 用户明确要求：
+            // 点产物本身**不跳**，只有菜单里这四个字才跳到那个聊天窗口。
+            .contextMenu {
+                Button {
+                    preview = f
+                } label: {
+                    Label("打开", systemImage: "eye")
+                }
+                Button {
+                    sharing = [f]
+                } label: {
+                    Label("共享", systemImage: "square.and.arrow.up")
+                }
+                Button {
+                    exportRequest = ExportRequest(urls: [f.url])
+                } label: {
+                    Label("保存", systemImage: "folder.badge.plus")
+                }
+                Button {
+                    attachFile = f
+                } label: {
+                    Label("添加到对话", systemImage: "text.bubble")
+                }
+                Button {
+                    openConversation(f)
+                } label: {
+                    Label("打开对话", systemImage: "arrowshape.turn.up.left")
+                }
+
+                Divider()
+
+                Button(role: .destructive) {
+                    confirmDelete = f
+                } label: {
+                    Label("删除", systemImage: "trash")
+                }
+                Button {
+                    withAnimation(.easeOut(duration: 0.18)) {
+                        picking = true
+                        picked = [f.id]
+                    }
+                } label: {
+                    Label("多选", systemImage: "checkmark.circle")
+                }
+            }
+
+            if open && !picking {
+                inlinePreview(f)
+            }
         }
-        .buttonStyle(.plain)
-        // ScrollView 里没有 swipeActions，长按菜单顶替。
-        //
-        // 2026-10-31 用户点名要的四项：打开 / 共享 / 保存 / 添加到对话。
-        //   打开   = 在 App 里直接看（QuickLook）
-        //   共享   = 系统分享面板，发给任何 App
-        //   保存   = 存到「文件」App（iCloud 云盘 / 我的 iPhone 等位置）
-        //   添加到对话 = 把这份产物塞进指定对话的输入框
-        // 删除和多选不是他点名的，但删掉就没地方删单个文件了，放在分隔线下面。
-        .contextMenu {
-            Button {
-                preview = f
-            } label: {
-                Label("打开", systemImage: "eye")
-            }
-            Button {
-                sharing = [f]
-            } label: {
-                Label("共享", systemImage: "square.and.arrow.up")
-            }
-            Button {
-                exportRequest = ExportRequest(urls: [f.url])
-            } label: {
-                Label("保存", systemImage: "folder.badge.plus")
-            }
-            Button {
-                attachFile = f
-            } label: {
-                Label("添加到对话", systemImage: "text.bubble")
-            }
+        // 底色和圆角包在**整块**上：展开出来的正文才会和标题行同属一张卡，
+        // 而不是标题一块、正文一块中途断开。
+        .background(Theme.tile)
+        .clipShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
+        .overlay(
+            RoundedRectangle(cornerRadius: 14, style: .continuous)
+                .stroke(Color.accentColor.opacity(picking && on ? 0.5 : 0), lineWidth: 1.2)
+        )
+        .contentShape(Rectangle())
+    }
 
-            Divider()
+    /// 就地展开的那段正文（只读前一大截，不做全文渲染）。
+    ///
+    /// 为什么截断：产物里经常是几百行代码，全渲染进 LazyVStack 会把这个半屏面板
+    /// 拖成幻灯片。这里给前 1200 字，够认出来是哪一份；要看全文点长按里的「打开」。
+    private func inlinePreview(_ f: AIFile) -> some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Divider().opacity(0.5)
+            Text(previewText(f))
+                .font(.system(size: 12, design: .monospaced))
+                .foregroundStyle(.secondary)
+                .lineSpacing(3)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .fixedSize(horizontal: false, vertical: true)
 
-            Button(role: .destructive) {
-                confirmDelete = f
-            } label: {
-                Label("删除", systemImage: "trash")
-            }
-            Button {
-                withAnimation(.easeOut(duration: 0.18)) {
-                    picking = true
-                    picked = [f.id]
+            HStack(spacing: 14) {
+                Button {
+                    preview = f
+                } label: {
+                    Label("打开全文", systemImage: "arrow.up.right.square")
+                        .font(.system(size: 12, weight: .medium))
                 }
-            } label: {
-                Label("多选", systemImage: "checkmark.circle")
+                .buttonStyle(PressableStyle(scale: 0.97, dim: 0.72))
+
+                Button {
+                    withAnimation(.easeOut(duration: 0.18)) { expanded.remove(f.id) }
+                } label: {
+                    Text("收起")
+                        .font(.system(size: 12))
+                }
+                .buttonStyle(PressableStyle(scale: 0.97, dim: 0.72))
+                .foregroundStyle(Theme.sub)
+
+                Spacer(minLength: 0)
             }
+            .foregroundStyle(Color.accentColor)
         }
+        .padding(.horizontal, 13)
+        .padding(.bottom, 12)
+        .transition(.opacity.combined(with: .move(edge: .top)))
+    }
+
+    /// 读产物正文（带缓存，同一个文件只在第一次展开时读盘）
+    private func previewText(_ f: AIFile) -> String {
+        if let cached = textCache[f.id] { return cached }
+        let limit = 1200
+        var out: String
+        if let s = try? String(contentsOf: f.url, encoding: .utf8) {
+            out = s.count > limit ? String(s.prefix(limit)) + "\n…（后面还有 \(s.count - limit) 字，点「打开全文」看）" : s
+            if out.isEmpty { out = "（空文件）" }
+        } else {
+            out = "（这个格式不能在这里预览，点「打开全文」看）"
+        }
+        // 写 @State 要放在渲染之后，不能直接在 body 里改；用异步落地
+        let key = f.id, value = out
+        DispatchQueue.main.async {
+            if textCache[key] == nil { textCache[key] = value }
+        }
+        return out
+    }
+
+    /// 菜单里的「打开对话」：关掉面板，切到这份产物所属的会话。
+    private func openConversation(_ f: AIFile) {
+        dismiss()
+        if !f.sessionId.isEmpty { store.openSession(f.sessionId) }
+        store.tab = .tasks
     }
 
     // MARK: 多选操作条
@@ -386,7 +485,7 @@ struct MyFilesView: View {
                     .background(Theme.card)
                     .clipShape(RoundedRectangle(cornerRadius: 13, style: .continuous))
             }
-            .buttonStyle(.plain)
+            .buttonStyle(PressableStyle(scale: 0.97, dim: 0.72))
             .foregroundStyle(picked.isEmpty ? Color.secondary : Color.primary)
             .disabled(picked.isEmpty)
 
@@ -400,7 +499,7 @@ struct MyFilesView: View {
                     .background(Theme.card)
                     .clipShape(RoundedRectangle(cornerRadius: 13, style: .continuous))
             }
-            .buttonStyle(.plain)
+            .buttonStyle(PressableStyle(scale: 0.97, dim: 0.72))
             .foregroundStyle(picked.isEmpty ? Color.secondary : Color.red)
             .disabled(picked.isEmpty)
         }
@@ -462,7 +561,10 @@ struct MyFilesView: View {
 ///
 /// 用数组而不是单个 URL：UIDocumentPicker 本来就支持多个，
 /// 以后多选里加「保存」不用再改这层结构。
-private struct ExportRequest: Identifiable {
+///
+/// 2026-11-01 从 `private` 放开成模块内可见：聊天页的产物卡长按也要「保存」，
+/// 两处共用同一个请求结构，省一套重复定义（重复定义还容易改一处忘一处）。
+struct ExportRequest: Identifiable {
     let id = UUID()
     let urls: [URL]
 }
@@ -492,7 +594,7 @@ struct SessionPickerSheet: View {
                         } label: {
                             row(s)
                         }
-                        .buttonStyle(.plain)
+                        .buttonStyle(PressableStyle(scale: 0.97, dim: 0.72))
                     }
                 }
                 .padding(.horizontal, 16)

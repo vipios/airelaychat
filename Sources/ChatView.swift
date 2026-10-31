@@ -46,6 +46,10 @@ struct ChatView: View {
     /// 点产物卡片 → 预览；预览里点分享 → 换成分享面板
     @State private var previewFile: AIFile?
     @State private var shareFile: AIFile?
+    /// 产物长按「保存」→ 系统「存到哪里」面板
+    @State private var saveRequest: ExportRequest?
+    /// 产物长按「添加到对话」→ 先选对话
+    @State private var attachFile: AIFile?
 
     @FocusState private var inputFocused: Bool
 
@@ -67,7 +71,16 @@ struct ChatView: View {
                            onClose: { closeDrawer() },
                            onOpenSettings: { showSettings = true },
                            onOpenDiag: { showDiag = true },
-                           onOpenFiles: { showFiles = true })
+                           onOpenFiles: { showFiles = true },
+                           // 2026-11-01：抽屉里的「我的文件」改成就地展开，
+                           // 展开出来的产物行要能长按出菜单 —— 打开 / 共享 / 保存 /
+                           // 添加到对话 / 打开对话。抽屉自己不挂 sheet（会抢层），
+                           // 所以弹层全部交回 ChatView 这边。
+                           onPreviewFile: { f in previewFile = f },
+                           onShareFile: { f in shareFile = f },
+                           onSaveFile: { f in saveRequest = ExportRequest(urls: [f.url]) },
+                           onAttachFile: { f in attachFile = f },
+                           onOpenConversation: { f in openConversation(of: f) })
                     .frame(width: DrawerView.width)
                     .frame(maxHeight: .infinity)
                     .transition(.move(edge: .leading))
@@ -120,6 +133,18 @@ struct ChatView: View {
             ShareSheet(items: [f.url])
                 .presentationDetents([.medium, .large])
                 .roundSheet(28)
+        }
+        // 产物长按「保存」：系统文件选择器负责问存到哪
+        .sheet(item: $saveRequest) { req in
+            DocumentExporter(urls: req.urls)
+                .ignoresSafeArea()
+        }
+        // 产物长按「添加到对话」：先选一个对话，把产物挂进它的输入框
+        .sheet(item: $attachFile) { f in
+            SessionPickerSheet(store: store, file: f) {
+                attachFile = nil
+            }
+            .roundSheet(28)
         }
         // 「生成交接」先说清楚代价：让 AI 整理＝花一次对话
         .confirmationDialog("生成交接包？", isPresented: $confirmHandoff, titleVisibility: .visible) {
@@ -224,6 +249,19 @@ struct ChatView: View {
         withAnimation(.spring(response: 0.34, dampingFraction: 0.88)) { drawerOpen = false }
     }
 
+    /// 产物「打开对话」：跳回这份产物所属的那个对话。
+    ///
+    /// 2026-11-01 用户：「我按住某一个产物的时候出现弹窗…里面再加上一个打开对话这四个字，
+    /// 我点击了他才跳转到那个聊天窗口」。所以点产物本身**不跳**，
+    /// 只有菜单里这一项才切会话 —— 顺序不能反。
+    private func openConversation(of f: AIFile) {
+        inputFocused = false
+        closeDrawer()
+        if !f.sessionId.isEmpty { store.openSession(f.sessionId) }
+        store.tab = .tasks
+        showFiles = false
+    }
+
     /// 聊天页本体（原 switch 里 .tasks 那一段），抽出来给 ZStack 用。
     private var taskTab: some View {
         VStack(spacing: 0) {
@@ -265,7 +303,7 @@ struct ChatView: View {
                     .background(Color.accentColor)
                     .clipShape(Capsule())
             }
-            .buttonStyle(.plain)
+            .buttonStyle(PressableStyle(scale: 0.95))
 
             Button {
                 store.needsHandoffHint = false
@@ -275,7 +313,7 @@ struct ChatView: View {
                     .foregroundStyle(.secondary)
                     .frame(width: 22, height: 22)
             }
-            .buttonStyle(.plain)
+            .buttonStyle(PressableStyle(scale: 0.95))
         }
         .padding(.horizontal, 12)
         .padding(.vertical, 8)
@@ -394,10 +432,13 @@ struct ChatView: View {
                             ZStack {
                                 // 2026-10-31 用户：「底栏圆钮还用咱们之前的那个就行」
                                 // 之前做的是圆角方块（27×23、圆角 7），别照原版改成黑圆。
+                                // 2026-11-01 底色从纯黑改成深灰（Theme.press）：
+                                // 纯黑在其他按钮都是白/浅灰的一屏里太抢，深灰仍是"选中"但更稳。
                                 if store.tab == t {
                                     RoundedRectangle(cornerRadius: 7, style: .continuous)
-                                        .fill(Color.primary)
+                                        .fill(Theme.press)
                                         .frame(width: 27, height: 23)
+                                        .transition(.opacity)
                                 }
                                 Image(systemName: store.tab == t ? t.iconFilled : t.icon)
                                     .font(.system(size: 15, weight: .regular))
@@ -413,7 +454,9 @@ struct ChatView: View {
                         .frame(maxWidth: .infinity)
                         .contentShape(Rectangle())
                     }
-                    .buttonStyle(.plain)
+                    // 2026-11-01：底栏三项都补上按下反馈 —— 点"后台面板"时
+                    // 至少能看到按钮被按了一下，不用等整页切过去才知道点到了。
+                    .buttonStyle(PressableStyle(scale: 0.94))
                 }
             }
             .padding(.top, 7)
@@ -444,7 +487,7 @@ struct ChatView: View {
                     .clipShape(Circle())
                     .shadow(color: .black.opacity(0.05), radius: 3, x: 0, y: 1)
             }
-            .buttonStyle(.plain)
+            .buttonStyle(PressableStyle(scale: 0.95))
 
             // 中间：第一行任务名，第二行模型（点它开模型选择）
             //
@@ -484,7 +527,7 @@ struct ChatView: View {
                 .frame(maxWidth: .infinity, alignment: .center)
                 .contentShape(Rectangle())
             }
-            .buttonStyle(.plain)
+            .buttonStyle(PressableStyle(scale: 0.95))
 
             // 右侧：一个白胶囊里并排两个图标（新建 / 更多），照截图
             HStack(spacing: 0) {
@@ -495,7 +538,7 @@ struct ChatView: View {
                         .frame(width: 38, height: 38)
                         .contentShape(Rectangle())
                 }
-                .buttonStyle(.plain)
+                .buttonStyle(PressableStyle(scale: 0.95))
 
                 Menu {
                     Button { store.syncCurrentSession() } label: {
@@ -764,7 +807,7 @@ struct ChatView: View {
                         .foregroundStyle(.primary)
                         .contentShape(Rectangle())
                     }
-                    .buttonStyle(.plain)
+                    .buttonStyle(PressableStyle(scale: 0.95))
                     .padding(.top, 2)
                 }
 
@@ -792,7 +835,7 @@ struct ChatView: View {
                         Label("重试", systemImage: "arrow.clockwise")
                             .font(.system(size: 12, weight: .medium))
                     }
-                    .buttonStyle(.plain)
+                    .buttonStyle(PressableStyle(scale: 0.95))
                     .foregroundStyle(.tint)
                 }
             }
@@ -939,7 +982,33 @@ struct ChatView: View {
             .clipShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
             .contentShape(Rectangle())
         }
-        .buttonStyle(.plain)
+        .buttonStyle(PressableStyle(scale: 0.95))
+        // 2026-11-01 用户：「这个产物我按住以后也要弹窗全部产物中的那种弹窗」。
+        // 所以聊天里这张卡和「全部产物」列表里的那行长按菜单保持一致：
+        // 打开 / 共享 / 保存 / 添加到对话。
+        // 这里**不放**「打开对话」—— 这张卡本来就长在那个对话里，跳自己等于没用。
+        .contextMenu {
+            Button {
+                previewFile = f
+            } label: {
+                Label("打开", systemImage: "eye")
+            }
+            Button {
+                shareFile = f
+            } label: {
+                Label("共享", systemImage: "square.and.arrow.up")
+            }
+            Button {
+                saveRequest = ExportRequest(urls: [f.url])
+            } label: {
+                Label("保存", systemImage: "folder.badge.plus")
+            }
+            Button {
+                attachFile = f
+            } label: {
+                Label("添加到对话", systemImage: "text.bubble")
+            }
+        }
     }
 
     // MARK: - 错误提示
@@ -956,7 +1025,7 @@ struct ChatView: View {
                 Button { store.errorText = nil } label: {
                     Image(systemName: "xmark").font(.system(size: 10, weight: .bold))
                 }
-                .buttonStyle(.plain)
+                .buttonStyle(PressableStyle(scale: 0.95))
             }
             if store.capSuggestion != nil {
                 Button { store.switchToFitModel() } label: {
@@ -965,7 +1034,7 @@ struct ChatView: View {
                     Label("换成「\(name)」", systemImage: "arrow.triangle.2.circlepath")
                         .font(.system(size: 12, weight: .semibold))
                 }
-                .buttonStyle(.plain)
+                .buttonStyle(PressableStyle(scale: 0.95))
             }
         }
         .foregroundStyle(.orange)
@@ -1022,7 +1091,7 @@ struct ChatView: View {
                                     .font(.system(size: 15))
                                     .foregroundStyle(.white, .black.opacity(0.55))
                             }
-                            .buttonStyle(.plain)
+                            .buttonStyle(PressableStyle(scale: 0.95))
                             .offset(x: 5, y: -5)
                         }
                     }
@@ -1044,66 +1113,90 @@ struct ChatView: View {
     /// 输入框始终在，所以焦点不会丢、键盘随时能弹。
     private var inputBar: some View {
         VStack(spacing: 0) {
-            // 单行胶囊，和原版一致： [ 声波   输入框    ＋   ↑ ]
+            // 2026-11-01 用户：「聊天界面不要 workbuddy 的效果，我要咱们之前的那个」，
+            // 并给了我们 1.8 那版的截图：**一颗胶囊分两行**
+            //   上行：发消息或按住说话…（整行输入）
+            //   下行：声波 · 绿点+模型名⌄ ……… ＋ · 圆形发送
             //
-            // 2026-10-31 从「输入框一行 + 工具条一行」的两层胶囊改成单行。
-            // 原版就是一条胶囊，我们那版比它高出一半，整屏重心都往下坠。
-            // 模型选择从工具条挪到顶栏第二行 —— 那里本来就显示模型名，点一下就能换。
-            HStack(alignment: .bottom, spacing: 8) {
-                HoldToTalkButton(voice: voice, disabled: store.sending,
-                                 existingText: store.input) { finalText in
-                    // 最终结果（已经拼好原有文字），直接写回输入框
-                    store.input = finalText
-                } onLive: { liveText in
-                    // 边说边显示：直接写进输入框，用户看到的字在长
-                    store.input = liveText
-                } onStarted: {
-                    // 开始听的时候收起键盘，免得两套输入打架
-                    inputFocused = false
-                }
-                .padding(.bottom, 2)
-
+            // 之前按原版做成了单行（声波 + 输入 + ＋ + ↑），看着确实更像 WorkBuddy，
+            // 但那是别人的样子。这一版回到我们自己的：模型名放回输入栏，
+            // 想换模型不用先摸到顶栏第二行。
+            VStack(spacing: 6) {
                 TextField("发消息或按住说话…", text: $store.input, axis: .vertical)
                     .lineLimit(1...5)
                     // 用我们自己的正文字号，不跟原版截图走的那个数
                     .font(.system(size: Theme.bodySize))
                     .focused($inputFocused)
-                    .padding(.vertical, 6)
+                    .padding(.horizontal, 2)
+                    .padding(.top, 2)
 
-                // 加号：附件
-                Button { inputFocused = false; showAttach = true } label: {
-                    Image(systemName: "plus")
-                        .font(.system(size: 20, weight: .regular))
-                        .foregroundStyle(Theme.inkSoft)
-                        .frame(width: 30, height: 30)
+                HStack(spacing: 8) {
+                    // 声波 / 按住说话
+                    HoldToTalkButton(voice: voice, disabled: store.sending,
+                                     existingText: store.input) { finalText in
+                        store.input = finalText
+                    } onLive: { liveText in
+                        store.input = liveText
+                    } onStarted: {
+                        inputFocused = false
+                    }
+
+                    // 连接灯 + 模型名 + 展开箭头。点一下开模型选择。
+                    Button {
+                        inputFocused = false
+                        showModelPicker = true
+                    } label: {
+                        HStack(spacing: 5) {
+                            Circle()
+                                .fill(linkColor)
+                                .frame(width: 5, height: 5)
+                            Text(modelTitle)
+                                .font(.system(size: 12.5))
+                                .foregroundStyle(Theme.sub)
+                                .lineLimit(1)
+                            Image(systemName: "chevron.up.chevron.down")
+                                .font(.system(size: 8, weight: .semibold))
+                                .foregroundStyle(Theme.sub.opacity(0.7))
+                        }
                         .contentShape(Rectangle())
-                }
-                .buttonStyle(.plain)
-                .disabled(store.sending)
-                .padding(.bottom, 2)
+                    }
+                    .buttonStyle(PressableStyle(scale: 0.96))
 
-                // 有内容才出现的发送键：黑色圆底白箭头（原版没有发送键，
-                // 但咱们必须有；放成圆形小按钮，不破坏单行胶囊的观感）
-                if canTapSend {
+                    Spacer(minLength: 4)
+
+                    // 加号：附件
+                    Button { inputFocused = false; showAttach = true } label: {
+                        Image(systemName: "plus")
+                            .font(.system(size: 19, weight: .regular))
+                            .foregroundStyle(Theme.inkSoft)
+                            .frame(width: 28, height: 28)
+                            .contentShape(Rectangle())
+                    }
+                    .buttonStyle(PressableStyle(scale: 0.88))
+                    .disabled(store.sending)
+
+                    // 圆形发送钮。
+                    // 2026-11-01：改成**常驻**（不能发的时候是灰底灰箭头），
+                    // 之前是"有内容才出现"，一出现整行往左挤 30pt，
+                    // 打第一个字时输入栏会跳一下。
                     Button { sendIfPossible() } label: {
                         Image(systemName: voice.recording ? "stop.fill" : "arrow.up")
-                            .font(.system(size: 15, weight: .semibold))
-                            .foregroundStyle(Theme.card)
+                            .font(.system(size: 14, weight: .bold))
+                            .foregroundStyle(canTapSend ? Theme.card : Theme.sub)
                             .frame(width: 30, height: 30)
-                            .background(Color.primary)
+                            // 可发送 = 深灰实心（和底栏选中块同色），
+                            // 不可发送 = 系统三级填充灰。全站统一这一个"重"色。
+                            .background(canTapSend ? Theme.press : Color(.tertiarySystemFill))
                             .clipShape(Circle())
                     }
-                    .buttonStyle(.plain)
-                    .padding(.bottom, 2)
-                    .transition(.scale.combined(with: .opacity))
+                    .buttonStyle(PressableStyle(scale: 0.88))
+                    .disabled(!canTapSend)
                 }
             }
-            .animation(.easeOut(duration: 0.15), value: canTapSend)
             .padding(.horizontal, 14)
-            // 上下 10：胶囊总高约 52pt —— 照原版截图量的（截图 66px ÷ 1.28）
             .padding(.vertical, 10)
             .background(Theme.card)
-            .clipShape(RoundedRectangle(cornerRadius: 26, style: .continuous))
+            .clipShape(RoundedRectangle(cornerRadius: 24, style: .continuous))
             .shadow(color: .black.opacity(0.05), radius: 5, x: 0, y: 1)
             .padding(.horizontal, 12)
             .padding(.top, 4)
@@ -1119,7 +1212,7 @@ struct ChatView: View {
                     Button { voice.error = nil } label: {
                         Image(systemName: "xmark").font(.system(size: 10, weight: .bold))
                     }
-                    .buttonStyle(.plain)
+                    .buttonStyle(PressableStyle(scale: 0.95))
                 }
                 .foregroundStyle(.orange)
                 .padding(.horizontal, 16)
@@ -1253,7 +1346,7 @@ private struct AttachSheet: View {
                             .background(Theme.card)
                             .clipShape(RoundedRectangle(cornerRadius: 16, style: .continuous))
                     }
-                    .buttonStyle(.plain)
+                    .buttonStyle(PressableStyle(scale: 0.95))
                     .padding(.horizontal, 16)
                     .padding(.top, 8)
                     .padding(.bottom, 22)
@@ -1282,7 +1375,7 @@ private struct AttachSheet: View {
             .padding(.vertical, 15)
             .contentShape(Rectangle())
         }
-        .buttonStyle(.plain)
+        .buttonStyle(PressableStyle(scale: 0.95))
     }
 }
 
@@ -1300,6 +1393,13 @@ private struct AdminTabPage: View {
     @State private var webLoading = true
     /// 是否已经成功载入过一次。用来区分「首次进入」和「切回来」。
     @State private var everLoaded = false
+    /// 是不是用户主动点了「刷新」。和首屏加载分开：首屏不给"已刷新"时间。
+    @State private var refreshing = false
+    /// 上一次加载完成的时间，显示在地址下面一行。
+    @State private var lastLoaded: Date?
+    /// 兜底复位：万一 didFinish / didFail 一个都不来（后台卡住、网页一直转），
+    /// 8 秒后自己把转圈收掉，免得按钮永远停在「刷新中」变成死键。
+    @State private var refreshGuard: DispatchWorkItem?
 
     private var base: String {
         // 优先用当前实际在用的地址：在家是内网、在外是域名
@@ -1318,12 +1418,21 @@ private struct AdminTabPage: View {
             // 按钮有 34 高、标题也有自己的呼吸空间，往下挪的问题一起解决。
             VStack(spacing: 14) {
                 HStack(spacing: 8) {
-                    PillButton(title: "返回", icon: "chevron.left", filled: true) {
+                    // 2026-11-01：「返回」不再用黑底 —— 三个胶囊统一成和
+                    // 聊天页右上角那颗一样的白底，按下去变深灰。
+                    PillButton(title: "返回", icon: "chevron.left") {
                         store.tab = .tasks
                     }
                     Spacer(minLength: 6)
-                    PillButton(title: "刷新", icon: "arrow.clockwise") {
-                        tick += 1
+                    // 2026-11-01 用户：「后台面板点击刷新没有反应，
+                    // 你要让点击效果出来啊，点在点击按钮都没有反应也不知道是不是在刷新」。
+                    // 现在点下去：按钮立刻变成「刷新中」+ 转圈 + 半透明（看得见点到了），
+                    // 同时网页上盖一层「正在刷新…」的遮罩（看得见在干活），
+                    // 加载完遮罩消失、地址下面出现「已刷新 HH:mm」（看得见干完了）。
+                    PillButton(title: refreshing ? "刷新中" : "刷新",
+                               icon: "arrow.clockwise",
+                               loading: refreshing) {
+                        startRefresh()
                     }
                     PillButton(title: "密钥", icon: "key.fill") {
                         keyDraft = key
@@ -1335,10 +1444,20 @@ private struct AdminTabPage: View {
                     Text("后台面板")
                         .font(.system(size: 22, weight: .bold))
                         .foregroundStyle(.primary)
-                    Text(base)
-                        .font(.system(size: 11.5, design: .monospaced))
-                        .foregroundStyle(Theme.sub)
-                        .lineLimit(1)
+                    HStack(spacing: 6) {
+                        Text(base)
+                            .font(.system(size: 11.5, design: .monospaced))
+                            .foregroundStyle(Theme.sub)
+                            .lineLimit(1)
+                        if let t = lastLoaded {
+                            Text("· 已刷新 \(clock(t))")
+                                .font(.system(size: 11))
+                                .foregroundStyle(Theme.sub.opacity(0.85))
+                                .lineLimit(1)
+                                .layoutPriority(1)
+                        }
+                        Spacer(minLength: 0)
+                    }
                 }
                 .frame(maxWidth: .infinity, alignment: .leading)
             }
@@ -1357,24 +1476,40 @@ private struct AdminTabPage: View {
                 // 加载态盖在网页上。为什么不直接用 ProgressView 顶掉 WebView：
                 // 顶掉会让 WebView 从视图树里消失、尺寸归零，回来又得重排重绘。
                 // 这里用 overlay 叠一层，WebView 始终在位。
+                //
+                // 2026-11-01：条件从 `webLoading && !everLoaded` 改成只看 `webLoading`。
+                // 原来只有第一次进入才盖，之后点「刷新」网页白着重新加载，
+                // 屏幕上一点变化都没有 —— 用户说「不知道是不是在刷新」就是这个。
                 .overlay {
-                    if webLoading && !everLoaded {
+                    if webLoading {
                         VStack(spacing: 10) {
                             ProgressView()
-                            Text("正在载入后台…")
+                            Text(refreshing ? "正在刷新…"
+                                            : (everLoaded ? "正在重新载入…" : "正在载入后台…"))
                                 .font(.system(size: 12))
                                 .foregroundStyle(.secondary)
                         }
                         .frame(maxWidth: .infinity, maxHeight: .infinity)
-                        .background(Theme.page)
+                        // 用淡淡的半透明而不是整片白：刷新时下面的网页还在，
+                        // 能看到它正在重绘，比一片白更有"在动"的感觉。
+                        .background(Theme.page.opacity(refreshing ? 0.82 : 1))
                         .clipShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
                         .padding(.horizontal, 10)
                         .padding(.bottom, 8)
                         .allowsHitTesting(false)
+                        .transition(.opacity)
                     }
                 }
+                .animation(.easeOut(duration: 0.18), value: webLoading)
                 .onChange(of: webLoading) { v in
-                    if !v { everLoaded = true }
+                    guard !v else { return }
+                    everLoaded = true
+                    // 加载结束（成功或失败）都要收掉「刷新中」，
+                    // 否则按钮会永远停在转圈上。
+                    refreshGuard?.cancel()
+                    refreshGuard = nil
+                    refreshing = false
+                    lastLoaded = Date()
                 }
         }
         .background(Theme.page)
@@ -1384,11 +1519,39 @@ private struct AdminTabPage: View {
             Button("保存") {
                 AdminKey.save(keyDraft)
                 key = keyDraft.trimmingCharacters(in: .whitespacesAndNewlines)
-                tick += 1
+                startRefresh()
             }
         } message: {
             Text("填一次就记住了，以后进后台不用再输。")
         }
+    }
+
+    /// 触发一次重新加载，并把界面切成「刷新中」。
+    ///
+    /// 2026-11-01 新增。之前刷新只是一个 `tick += 1`，
+    /// 界面上没有任何一处跟着变 —— 用户点完只能靠"猜"。
+    private func startRefresh() {
+        refreshing = true
+        webLoading = true
+        tick += 1
+
+        // 8 秒兜底：网页卡住不回调时自己复位，别让按钮变成死键
+        refreshGuard?.cancel()
+        let g = DispatchWorkItem {
+            guard refreshing else { return }
+            refreshing = false
+            webLoading = false
+            lastLoaded = Date()
+        }
+        refreshGuard = g
+        DispatchQueue.main.asyncAfter(deadline: .now() + 8, execute: g)
+    }
+
+    /// 只显示时分，不显示秒 —— 刷新时间精确到秒没有意义，还会让那行字一直变宽变窄
+    private func clock(_ d: Date) -> String {
+        let f = DateFormatter()
+        f.dateFormat = "HH:mm"
+        return f.string(from: d)
     }
 }
 

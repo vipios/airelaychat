@@ -31,6 +31,14 @@ struct DrawerView: View {
     var onOpenDiag: () -> Void = {}
     /// 打开「我的文件」。外面统一管弹层，抽屉不自己挂。
     var onOpenFiles: () -> Void = {}
+    /// 产物行的长按菜单 / 点击，全部交回外层执行（抽屉不挂 sheet）。
+    /// 2026-11-01 新增：用户要求「我的文件」在抽屉里**就地展开**，
+    /// 展开出来的产物要能和「全部产物」一样长按出菜单。
+    var onPreviewFile: (AIFile) -> Void = { _ in }
+    var onShareFile: (AIFile) -> Void = { _ in }
+    var onSaveFile: (AIFile) -> Void = { _ in }
+    var onAttachFile: (AIFile) -> Void = { _ in }
+    var onOpenConversation: (AIFile) -> Void = { _ in }
 
     static let width: CGFloat = 300
 
@@ -50,6 +58,15 @@ struct DrawerView: View {
 
     /// 折叠状态。key：自定义分组用 group.id，时间分组用 rawValue。
     @State private var collapsed: Set<String> = []
+    /// 「我的文件」是否就地展开成一串产物
+    @State private var filesOpen = false
+    /// 抽屉里展开正文的那个产物 id
+    @State private var expandedFile: String?
+
+    /// 抽屉里列出来的产物，新→旧
+    private var drawerFiles: [AIFile] {
+        lib.files.sorted { $0.createdAt > $1.createdAt }
+    }
 
     private var ungrouped: [SessionBucket] {
         store.ungroupedBuckets(query: query)
@@ -172,7 +189,7 @@ struct DrawerView: View {
                         .font(.system(size: 12))
                         .foregroundStyle(.tertiary)
                 }
-                .buttonStyle(.plain)
+                .buttonStyle(PressableStyle(scale: 0.97, dim: 0.72))
             }
         }
         .padding(.horizontal, 10)
@@ -190,38 +207,189 @@ struct DrawerView: View {
 
     private var filesButton: some View {
         Button {
-            close()
-            onOpenFiles()
+            // 2026-11-01 用户：「侧抽里面的我的文件那一栏点击以后
+            // 把所有的产物都展示在下面」—— 不再弹半屏面板，改成就地手风琴。
+            // 好处是不用离开抽屉、不丢上下文；想找某个产物直接往下看。
+            withAnimation(.easeOut(duration: 0.18)) {
+                filesOpen.toggle()
+                if !filesOpen { expandedFile = nil }
+            }
         } label: {
-            HStack(spacing: 6) {
-                Image(systemName: "folder")
-                    .font(.system(size: 15, weight: .medium))
-                Text("我的文件")
-                    .font(.system(size: 15, weight: .medium))
-                // 数量角标：没文件就不显示，别挂个「0」让人以为坏了
-                if !lib.files.isEmpty {
-                    Text("\(lib.files.count)")
-                        .font(.system(size: 11, weight: .medium))
-                        .foregroundStyle(.secondary)
-                        .padding(.horizontal, 5)
-                        .padding(.vertical, 1)
-                        .background(Color(.tertiarySystemFill))
-                        .clipShape(Capsule())
+            ZStack {
+                // 内容和「新建任务」一样居中
+                HStack(spacing: 6) {
+                    Image(systemName: "folder")
+                        .font(.system(size: 15, weight: .medium))
+                    Text("我的文件")
+                        .font(.system(size: 15, weight: .medium))
+                    // 数量角标：没文件就不显示，别挂个「0」让人以为坏了
+                    if !lib.files.isEmpty {
+                        Text("\(lib.files.count)")
+                            .font(.system(size: 11, weight: .medium))
+                            .foregroundStyle(.secondary)
+                            .padding(.horizontal, 5)
+                            .padding(.vertical, 1)
+                            .background(Color(.tertiarySystemFill))
+                            .clipShape(Capsule())
+                    }
                 }
+
+                // 展开箭头贴右边，不参与上面那行的居中
+                HStack {
+                    Spacer(minLength: 0)
+                    Image(systemName: "chevron.down")
+                        .font(.system(size: 10, weight: .semibold))
+                        .foregroundStyle(.tertiary)
+                        .rotationEffect(.degrees(filesOpen ? 180 : 0))
+                }
+                .padding(.trailing, 14)
             }
             .foregroundStyle(.primary)
             .frame(maxWidth: .infinity)
             .padding(.vertical, 11)
-            .background(Theme.card)
+            // 展开中换成浅灰底：按钮自己就有"已展开"的状态，
+            // 不用靠下面多出一截列表来暗示（2026-11-01 加）。
+            .background(filesOpen ? Theme.selectedRow : Theme.card)
             .overlay(
                 RoundedRectangle(cornerRadius: 14, style: .continuous)
                     .stroke(Color(.separator).opacity(0.7), lineWidth: 0.8)
             )
             .clipShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
         }
-        .buttonStyle(.plain)
+        .buttonStyle(PressableStyle(scale: 0.97))
         .padding(.horizontal, 14)
         .padding(.bottom, 8)
+    }
+
+    // MARK: 就地展开的产物列表
+
+    private var filesSection: some View {
+        VStack(spacing: 6) {
+            if drawerFiles.isEmpty {
+                Text("还没有产物。AI 每次给出代码，都会自动存一份到这里。")
+                    .font(.system(size: 11.5))
+                    .foregroundStyle(.tertiary)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .padding(.horizontal, 6)
+                    .padding(.vertical, 8)
+            } else {
+                ForEach(drawerFiles) { f in
+                    drawerFileRow(f)
+                }
+                Text("共 \(drawerFiles.count) 个")
+                    .font(.system(size: 10.5))
+                    .foregroundStyle(.tertiary)
+                    .frame(maxWidth: .infinity, alignment: .center)
+                    .padding(.top, 2)
+            }
+        }
+        .padding(.horizontal, 14)
+        .padding(.bottom, 10)
+        .transition(.opacity.combined(with: .move(edge: .top)))
+    }
+
+    /// 抽屉里的一行产物。抽屉只有 300 宽，所以副标题省略、图标压到 30。
+    private func drawerFileRow(_ f: AIFile) -> some View {
+        let open = expandedFile == f.id
+        return VStack(spacing: 0) {
+            Button {
+                withAnimation(.easeOut(duration: 0.16)) {
+                    expandedFile = open ? nil : f.id
+                }
+            } label: {
+                HStack(spacing: 8) {
+                    ZStack {
+                        RoundedRectangle(cornerRadius: 8, style: .continuous)
+                            .fill(f.kind.tint)
+                            .frame(width: 30, height: 30)
+                        Image(systemName: f.kind.icon)
+                            .font(.system(size: 13))
+                            .foregroundStyle(.white)
+                    }
+                    VStack(alignment: .leading, spacing: 1) {
+                        Text(f.displayName)
+                            .font(.system(size: 13))
+                            .foregroundStyle(.primary)
+                            .lineLimit(1)
+                        Text(f.sizeText)
+                            .font(.system(size: 10))
+                            .foregroundStyle(.tertiary)
+                    }
+                    Spacer(minLength: 2)
+                    Image(systemName: "chevron.down")
+                        .font(.system(size: 9, weight: .semibold))
+                        .foregroundStyle(.tertiary)
+                        .rotationEffect(.degrees(open ? 180 : 0))
+                }
+                .padding(.horizontal, 9)
+                .padding(.vertical, 8)
+                .contentShape(Rectangle())
+            }
+            .buttonStyle(PressableStyle(scale: 0.97, dim: 0.72))
+            // 和「全部产物」面板里那行长按菜单保持一致，只多一项「打开对话」
+            .contextMenu {
+                Button {
+                    onPreviewFile(f)
+                    close()
+                } label: {
+                    Label("打开", systemImage: "eye")
+                }
+                Button {
+                    onShareFile(f)
+                    close()
+                } label: {
+                    Label("共享", systemImage: "square.and.arrow.up")
+                }
+                Button {
+                    onSaveFile(f)
+                    close()
+                } label: {
+                    Label("保存", systemImage: "folder.badge.plus")
+                }
+                Button {
+                    onAttachFile(f)
+                    close()
+                } label: {
+                    Label("添加到对话", systemImage: "text.bubble")
+                }
+                Button {
+                    // 只有点这一项才真的跳到那个聊天窗口
+                    onOpenConversation(f)
+                    close()
+                } label: {
+                    Label("打开对话", systemImage: "arrowshape.turn.up.left")
+                }
+            }
+
+            if open {
+                Text(drawerFileText(f))
+                    .font(.system(size: 10.5, design: .monospaced))
+                    .foregroundStyle(.secondary)
+                    .lineSpacing(2)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .padding(.horizontal, 9)
+                    .padding(.bottom, 9)
+                    .transition(.opacity)
+            }
+        }
+        .background(Theme.card)
+        .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
+        .overlay(
+            RoundedRectangle(cornerRadius: 12, style: .continuous)
+                .stroke(Color(.separator).opacity(0.55), lineWidth: 0.7)
+        )
+    }
+
+    /// 抽屉里的正文预览：只取前 400 字。300pt 宽塞不下更多，
+    /// 真要读全文就去「打开」。
+    private func drawerFileText(_ f: AIFile) -> String {
+        guard let s = try? String(contentsOf: f.url, encoding: .utf8) else {
+            return "（这个格式不能在这里预览，长按选「打开」）"
+        }
+        if s.isEmpty { return "（空文件）" }
+        return s.count > 400 ? String(s.prefix(400)) + "\n…" : s
     }
 
     // MARK: 新建任务
@@ -249,7 +417,7 @@ struct DrawerView: View {
             )
             .clipShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
         }
-        .buttonStyle(.plain)
+        .buttonStyle(PressableStyle(scale: 0.97))
         .padding(.horizontal, 14)
         .padding(.bottom, 8)
     }
@@ -261,21 +429,29 @@ struct DrawerView: View {
             newGroupName = ""
             showNewGroup = true
         } label: {
+            // 2026-11-01 用户：「这个界面的创建分组四个字那个栏要和新建任务那个栏一样」。
+            // 之前它是灰字 + 左对齐的一行小链接，和上面那张白卡完全两个体系；
+            // 现在统一成同一张白底描边卡：同样的 15pt medium、同样的 11pt 上下留白、
+            // 同样居中、同样 14 圆角。只是图标换成「新建文件夹」以示区别。
             HStack(spacing: 6) {
                 Image(systemName: "folder.badge.plus")
-                    .font(.system(size: 13, weight: .medium))
+                    .font(.system(size: 15, weight: .medium))
                 Text("创建分组")
-                    .font(.system(size: 13))
-                Spacer(minLength: 0)
+                    .font(.system(size: 15, weight: .medium))
             }
-            .foregroundStyle(.secondary)
-            .padding(.horizontal, 12)
-            .padding(.vertical, 9)
-            .contentShape(Rectangle())
+            .foregroundStyle(.primary)
+            .frame(maxWidth: .infinity)
+            .padding(.vertical, 11)
+            .background(Theme.card)
+            .overlay(
+                RoundedRectangle(cornerRadius: 14, style: .continuous)
+                    .stroke(Color(.separator).opacity(0.7), lineWidth: 0.8)
+            )
+            .clipShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
         }
-        .buttonStyle(.plain)
+        .buttonStyle(PressableStyle(scale: 0.97))
         .padding(.horizontal, 14)
-        .padding(.bottom, 2)
+        .padding(.bottom, 8)
     }
 
     // MARK: 任务列表
@@ -283,6 +459,11 @@ struct DrawerView: View {
     private var list: some View {
         ScrollView {
             LazyVStack(alignment: .leading, spacing: 0) {
+                // 「我的文件」展开出来的产物就排在按钮正下方
+                if filesOpen {
+                    filesSection
+                }
+
                 if isEmptyAll {
                     Text(query.isEmpty ? "还没有任务" : "没有匹配的任务")
                         .font(.system(size: 12))
@@ -385,7 +566,7 @@ struct DrawerView: View {
                         .padding(.vertical, 10)
                         .contentShape(Rectangle())
                     }
-                    .buttonStyle(.plain)
+                    .buttonStyle(PressableStyle(scale: 0.97, dim: 0.72))
                 }
             }
             .padding(.bottom, 10)
@@ -433,7 +614,7 @@ struct DrawerView: View {
             .padding(.bottom, 6)
             .contentShape(Rectangle())
         }
-        .buttonStyle(.plain)
+        .buttonStyle(PressableStyle(scale: 0.97, dim: 0.72))
     }
 
     /// 任务项就是一行文字，选中项浅灰底 + 右侧小转圈。
@@ -461,12 +642,24 @@ struct DrawerView: View {
             }
             .padding(.horizontal, 14)
             .padding(.vertical, 11)
-            .background(active ? Color(.secondarySystemBackground) : Color.clear)
+            // 选中的会话：浅灰底 + 左侧一道深灰竖条。
+            // 2026-11-01 用户要求"所有界面都有选中状态"，光靠底色的 4 个色阶差
+            // 在小屏上几乎分不出来，加一道 2.5pt 的竖条就一目了然。
+            .background(active ? Theme.selectedRow : Color.clear)
+            .overlay(alignment: .leading) {
+                if active {
+                    RoundedRectangle(cornerRadius: 1.5, style: .continuous)
+                        .fill(Theme.press)
+                        .frame(width: 2.5)
+                        .padding(.vertical, 7)
+                        .padding(.leading, 3)
+                }
+            }
             .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
             .padding(.horizontal, 6)
             .contentShape(Rectangle())
         }
-        .buttonStyle(.plain)
+        .buttonStyle(PressableStyle(scale: 0.97, dim: 0.72))
         .contextMenu {
             // 用户要的核心操作：按住会话 → 塞进指定分组。
             // 用二级菜单而不是一长串按钮：分组可能建了十几个，
