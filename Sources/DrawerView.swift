@@ -191,7 +191,7 @@ struct DrawerView: View {
                         .font(.system(size: 12))
                         .foregroundStyle(.tertiary)
                 }
-                .buttonStyle(PressableStyle(scale: 0.97, dim: 0.72))
+                .buttonStyle(PressableStyle(scale: 0.90, tint: 0.09, tintRadius: 999, darken: 0))
             }
         }
         .padding(.horizontal, 10)
@@ -328,7 +328,8 @@ struct DrawerView: View {
                 .padding(.vertical, 8)
                 .contentShape(Rectangle())
             }
-            .buttonStyle(PressableStyle(scale: 0.97, dim: 0.72))
+            // 这一条没有底色，按下靠整条泛灰
+            .buttonStyle(PressableStyle(scale: 0.97, tint: 0.07, tintRadius: 10, darken: 0))
             // 和「全部产物」面板里那行长按菜单保持一致，只多一项「打开对话」
             .contextMenu {
                 Button {
@@ -582,7 +583,7 @@ struct DrawerView: View {
                         .padding(.vertical, 10)
                         .contentShape(Rectangle())
                     }
-                    .buttonStyle(PressableStyle(scale: 0.97, dim: 0.72))
+                    .buttonStyle(PressableStyle(scale: 0.97, tint: 0.07, tintRadius: 10, darken: 0))
                 }
             }
             .padding(.bottom, 10)
@@ -630,7 +631,7 @@ struct DrawerView: View {
             .padding(.bottom, 6)
             .contentShape(Rectangle())
         }
-        .buttonStyle(PressableStyle(scale: 0.97, dim: 0.72))
+        .buttonStyle(PressableStyle(scale: 0.97))
     }
 
     /// 任务项就是一行文字，选中项浅灰底 + 右侧小转圈。
@@ -675,7 +676,7 @@ struct DrawerView: View {
             .padding(.horizontal, 6)
             .contentShape(Rectangle())
         }
-        .buttonStyle(PressableStyle(scale: 0.97, dim: 0.72))
+        .buttonStyle(PressableStyle(scale: 0.97))
         .contextMenu {
             // 用户要的核心操作：按住会话 → 塞进指定分组。
             // 用二级菜单而不是一长串按钮：分组可能建了十几个，

@@ -136,6 +136,8 @@ struct DiagView: View {
         }
         .navigationTitle("连接诊断")
         .navigationBarTitleDisplayMode(.inline)
+        // 系统列表按钮，只加震动不改样子（同设置页）
+        .buttonStyle(HapticStyle())
         .task {
             if diag.rows.isEmpty { await diag.run() }
         }

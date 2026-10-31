@@ -63,6 +63,11 @@ struct SettingsView: View {
                     publicSection
                     aboutSection
                 }
+                // 2026-11-01 用户：「所有的按键加一个震动反馈」。
+                // 这里用 HapticStyle 而不是 PressableStyle：设置页是系统分组列表，
+                // 套缩放 + 灰底会把行高和分隔线弄乱，HapticStyle 只震不改样子。
+                // 放在 Form 上会通过 environment 传给里面每个 Button，不用逐个加。
+                .buttonStyle(HapticStyle())
                 // 下拉刷新：重新探测连接 + 刷新模型清单 + 更新设备状态。
                 // 设置页里看到的值（连的是哪个地址、模型有没有变、内存多少）
                 // 全是从服务端现拉的，下拉一把就全刷新，不用退出去重进。

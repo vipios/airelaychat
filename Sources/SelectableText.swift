@@ -60,6 +60,13 @@ struct SelectableText: UIViewRepresentable {
         tv.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
         tv.setContentHuggingPriority(.defaultLow, for: .horizontal)
 
+        // 自己挂一个编辑菜单交互：系统没有"以代码显示菜单"的公开 API，
+        // 这是让「全选」之后菜单能自动再弹出来的唯一路子（见 Coordinator.presentMenu）。
+        // 它不影响长按 —— 长按仍由 UITextView 自带的交互处理。
+        let editor = UIEditMenuInteraction(delegate: context.coordinator)
+        tv.addInteraction(editor)
+        context.coordinator.editMenu = editor
+
         tv.allowRecallMenu = allowRecall
         tv.onRecall = onRecall
         tv.onRecallAndEdit = onRecallAndEdit
@@ -193,10 +200,18 @@ struct SelectableText: UIViewRepresentable {
         return result
     }
 
-    final class Coordinator: NSObject, UITextViewDelegate {
+    final class Coordinator: NSObject, UITextViewDelegate, UIEditMenuInteractionDelegate {
         /// 当前这一帧的配置。菜单里要不要「撤回」由它决定，
         /// 每次 updateUIView 都会刷新，不能只在 init 时拿一次。
         var parent: SelectableText
+        /// 自己挂到 textView 上的编辑菜单交互。
+        ///
+        /// 为什么要自己挂一个：iOS 没有"以代码显示文字菜单"的公开 API，
+        /// `selectAll(nil)` 只改选区、不会把菜单重新弹出来 —— 这才是
+        /// 「点了全选还得再点一下才出复制」的真正原因（2026-11-01 用户第二次反馈）。
+        /// `UIEditMenuInteraction` 是 iOS 16 公开类，`presentEditMenu(with:)`
+        /// 能主动把菜单弹出来，菜单内容由下面 delegate 提供，和长按出来的那份完全一样。
+        weak var editMenu: UIEditMenuInteraction?
 
         init(parent: SelectableText) { self.parent = parent }
 
@@ -216,54 +231,79 @@ struct SelectableText: UIViewRepresentable {
             // 只是点了下文字、没选中任何东西时（range 长度为 0）不接管，
             // 交给系统出「粘贴/查询」那套，免得点一下也弹四个纵向项。
             guard range.length > 0 else { return nil }
+            return buildMenu(for: textView)
+        }
 
+        /// 菜单内容只在这里拼一次。
+        ///
+        /// 长按弹出的、和「全选」之后主动弹出的，必须是同一份 ——
+        /// 两处各写一遍的话，改文案时总有一处会漏（这个坑踩过）。
+        private func buildMenu(for textView: UITextView) -> UIMenu {
             var actions: [UIAction] = []
 
             // 「复制」= 系统 copy:，只拿走当前选中的那一段
             actions.append(UIAction(title: "复制",
                                     image: UIImage(systemName: "doc.on.doc")) { [weak textView] _ in
                 textView?.copy(nil)
+                Haptic.press()
             })
 
-            // 「全选」+ 选完自动把菜单再弹出来。
+            // 「全选」：选满之后**自己把菜单再弹一次**。
             //
-            // 2026-11-01 用户：「我点击了全选，他就全选了，但是全选完以后他不弹出来复制，
-            // 还要我点击一次被选的位置才能出来复制，你要改成我点击全选以后他自动跳出来复制」。
-            //
-            // 原因：`selectAll(nil)` 只是改了选区，系统不会因为"选区变了"重新弹一次菜单
-            // （菜单是被长按手势带出来的，不是被选区带出来的）。
-            // 这里没有公开的"显示菜单"API，所以走系统自己的机制：
-            // 让控件做第一响应者，然后把选区**先清零再设满** —— 二次改选区会让
-            // iOS 16 重新摆出手柄和编辑菜单，菜单里第一项就是「复制」。
-            // 中间隔一帧是必须的：同一帧里连续改两次选区，系统会合并成一次。
+            // 2026-11-01 用户两次反馈：「全选完以后他不弹出来复制，还要我点击一次
+            // 被选的位置才能出来复制」。上一版试过"先清零再设满选区"，指望系统
+            // 因为选区变化自动重弹 —— 实测不行：菜单是被长按手势带出来的，
+            // 选区变化不会触发它。所以这里改成显式调用 `presentEditMenu`。
+            // 中间的 0.08s 是等系统把旧菜单收干净，太快会两个菜单打架。
             actions.append(UIAction(title: "全选",
-                                    image: UIImage(systemName: "textformat.size")) { [weak textView] _ in
+                                    image: UIImage(systemName: "textformat.size")) { [weak self, weak textView] _ in
                 guard let tv = textView else { return }
                 let full = NSRange(location: 0, length: (tv.text as NSString).length)
                 guard full.length > 0 else { return }
                 tv.becomeFirstResponder()
-                DispatchQueue.main.async {
-                    tv.selectedRange = NSRange(location: 0, length: 0)
-                    DispatchQueue.main.async {
-                        tv.selectedRange = full
-                    }
+                tv.selectedRange = full
+                Haptic.tap()
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.08) {
+                    self?.presentMenu(on: tv)
                 }
             })
 
             if parent.allowRecall {
                 actions.append(UIAction(title: "撤回",
                                         image: UIImage(systemName: "arrow.uturn.backward")) { [weak self] _ in
+                    Haptic.hard()
                     // 菜单收起后再执行，否则弹窗和状态变更抢同一帧，会闪一下
                     DispatchQueue.main.async { self?.parent.onRecall() }
                 })
                 // 只改菜单上显示的字，动作还是原来那个（撤回 + 把原文填回输入框）
                 actions.append(UIAction(title: "重新编辑",
                                         image: UIImage(systemName: "square.and.pencil")) { [weak self] _ in
+                    Haptic.tap()
                     DispatchQueue.main.async { self?.parent.onRecallAndEdit() }
                 })
             }
 
             return UIMenu(options: .displayInline, children: actions)
+        }
+
+        /// 主动弹菜单。锚点取控件顶部中间：
+        /// 全选时控件是整段正文那么高，取顶部才不会把菜单甩到屏幕外面去。
+        func presentMenu(on tv: UITextView) {
+            guard tv.window != nil, let menu = editMenu else { return }
+            let point = CGPoint(x: max(1, tv.bounds.midX), y: max(1, tv.bounds.minY + 1))
+            menu.presentEditMenu(with: UIEditMenuConfiguration(identifier: nil,
+                                                               sourcePoint: point))
+        }
+
+        // MARK: UIEditMenuInteractionDelegate
+
+        /// 主动弹出时菜单内容的来源。`presentEditMenu` 必调这个，
+        /// 返回 nil 就什么也不显示。
+        func editMenuInteraction(_ interaction: UIEditMenuInteraction,
+                                 menuFor configuration: UIEditMenuConfiguration,
+                                 suggestedActions: [UIMenuElement]) -> UIMenu? {
+            guard let tv = interaction.view as? UITextView else { return nil }
+            return buildMenu(for: tv)
         }
     }
 }

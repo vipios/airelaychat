@@ -149,7 +149,7 @@ struct ModelPickerSheet: View {
                         }
                         .foregroundStyle(.secondary)
                     }
-                    .buttonStyle(.plain)
+                    .buttonStyle(PressableStyle(scale: 0.92, tint: 0.07, tintRadius: 8, darken: 0))
                 }
 
                 VStack(alignment: .leading, spacing: 1) {
@@ -176,7 +176,7 @@ struct ModelPickerSheet: View {
                         .background(Color(.secondarySystemBackground))
                         .clipShape(Circle())
                 }
-                .buttonStyle(.plain)
+                .buttonStyle(PressableStyle(scale: 0.90))
             }
             .padding(.horizontal, 18)
             .padding(.top, 4)
@@ -199,7 +199,7 @@ struct ModelPickerSheet: View {
                                 .font(.system(size: 12))
                                 .foregroundStyle(.tertiary)
                         }
-                        .buttonStyle(.plain)
+                        .buttonStyle(PressableStyle(scale: 0.90, tint: 0.09, tintRadius: 999, darken: 0))
                     }
                 }
                 .padding(.horizontal, 10)
@@ -289,7 +289,7 @@ struct ModelPickerSheet: View {
             .clipShape(RoundedRectangle(cornerRadius: 16, style: .continuous))
             .contentShape(Rectangle())
         }
-        .buttonStyle(.plain)
+        .buttonStyle(PressableStyle(scale: 0.97))
         .contextMenu {
             Button {
                 newName = p.name
@@ -358,7 +358,7 @@ struct ModelPickerSheet: View {
             .clipShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
             .contentShape(Rectangle())
         }
-        .buttonStyle(.plain)
+        .buttonStyle(PressableStyle(scale: 0.97))
     }
 
     @ViewBuilder

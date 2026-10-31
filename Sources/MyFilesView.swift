@@ -267,7 +267,7 @@ struct MyFilesView: View {
             .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
             .contentShape(Rectangle())
         }
-        .buttonStyle(PressableStyle(scale: 0.97, dim: 0.72))
+        .buttonStyle(PressableStyle(scale: 0.97))
         .padding(.bottom, 2)
     }
 
@@ -335,7 +335,7 @@ struct MyFilesView: View {
                 .padding(.vertical, 12)
                 .contentShape(Rectangle())
             }
-            .buttonStyle(PressableStyle(scale: 0.97, dim: 0.72))
+            .buttonStyle(PressableStyle(scale: 0.97))
             // ScrollView 里没有 swipeActions，长按菜单顶替。
             //
             // 2026-10-31 用户点名要的四项：打开 / 共享 / 保存 / 添加到对话。
@@ -425,7 +425,7 @@ struct MyFilesView: View {
                     Label("打开全文", systemImage: "arrow.up.right.square")
                         .font(.system(size: 12, weight: .medium))
                 }
-                .buttonStyle(PressableStyle(scale: 0.97, dim: 0.72))
+                .buttonStyle(PressableStyle(scale: 0.97))
 
                 Button {
                     // `Set.remove` 返回被删掉的元素（Optional），
@@ -437,7 +437,7 @@ struct MyFilesView: View {
                     Text("收起")
                         .font(.system(size: 12))
                 }
-                .buttonStyle(PressableStyle(scale: 0.97, dim: 0.72))
+                .buttonStyle(PressableStyle(scale: 0.97))
                 .foregroundStyle(Theme.sub)
 
                 Spacer(minLength: 0)
@@ -489,7 +489,7 @@ struct MyFilesView: View {
                     .background(Theme.card)
                     .clipShape(RoundedRectangle(cornerRadius: 13, style: .continuous))
             }
-            .buttonStyle(PressableStyle(scale: 0.97, dim: 0.72))
+            .buttonStyle(PressableStyle(scale: 0.97))
             .foregroundStyle(picked.isEmpty ? Color.secondary : Color.primary)
             .disabled(picked.isEmpty)
 
@@ -503,7 +503,7 @@ struct MyFilesView: View {
                     .background(Theme.card)
                     .clipShape(RoundedRectangle(cornerRadius: 13, style: .continuous))
             }
-            .buttonStyle(PressableStyle(scale: 0.97, dim: 0.72))
+            .buttonStyle(PressableStyle(scale: 0.97))
             .foregroundStyle(picked.isEmpty ? Color.secondary : Color.red)
             .disabled(picked.isEmpty)
         }
@@ -598,7 +598,7 @@ struct SessionPickerSheet: View {
                         } label: {
                             row(s)
                         }
-                        .buttonStyle(PressableStyle(scale: 0.97, dim: 0.72))
+                        .buttonStyle(PressableStyle(scale: 0.97))
                     }
                 }
                 .padding(.horizontal, 16)

@@ -313,7 +313,7 @@ struct ChatView: View {
                     .foregroundStyle(.secondary)
                     .frame(width: 22, height: 22)
             }
-            .buttonStyle(PressableStyle(scale: 0.95))
+            .buttonStyle(PressableStyle(scale: 0.90, tint: 0.09, tintRadius: 999, darken: 0))
         }
         .padding(.horizontal, 12)
         .padding(.vertical, 8)
@@ -538,7 +538,8 @@ struct ChatView: View {
                         .frame(width: 38, height: 38)
                         .contentShape(Rectangle())
                 }
-                .buttonStyle(PressableStyle(scale: 0.95))
+                // 图标本身没有底，按下时在它身后铺一层淡灰（会被父级胶囊裁成胶囊形）
+                .buttonStyle(PressableStyle(scale: 0.94, tint: 0.09, tintRadius: 999, darken: 0))
 
                 Menu {
                     Button { store.syncCurrentSession() } label: {
@@ -807,7 +808,8 @@ struct ChatView: View {
                         .foregroundStyle(.primary)
                         .contentShape(Rectangle())
                     }
-                    .buttonStyle(PressableStyle(scale: 0.95))
+                    // 纯文字、没有底色 → 光靠变暗看不出来，叠一层淡灰
+                    .buttonStyle(PressableStyle(scale: 0.95, tint: 0.07, tintRadius: 9))
                     .padding(.top, 2)
                 }
 
@@ -835,7 +837,7 @@ struct ChatView: View {
                         Label("重试", systemImage: "arrow.clockwise")
                             .font(.system(size: 12, weight: .medium))
                     }
-                    .buttonStyle(PressableStyle(scale: 0.95))
+                    .buttonStyle(PressableStyle(scale: 0.95, tint: 0.07, tintRadius: 8))
                     .foregroundStyle(.tint)
                 }
             }
@@ -1025,7 +1027,7 @@ struct ChatView: View {
                 Button { store.errorText = nil } label: {
                     Image(systemName: "xmark").font(.system(size: 10, weight: .bold))
                 }
-                .buttonStyle(PressableStyle(scale: 0.95))
+                .buttonStyle(PressableStyle(scale: 0.90, tint: 0.10, tintRadius: 999, darken: 0))
             }
             if store.capSuggestion != nil {
                 Button { store.switchToFitModel() } label: {
@@ -1160,7 +1162,7 @@ struct ChatView: View {
                         }
                         .contentShape(Rectangle())
                     }
-                    .buttonStyle(PressableStyle(scale: 0.96))
+                    .buttonStyle(PressableStyle(scale: 0.96, tint: 0.07, tintRadius: 10, darken: 0))
 
                     Spacer(minLength: 4)
 
@@ -1172,7 +1174,7 @@ struct ChatView: View {
                             .frame(width: 28, height: 28)
                             .contentShape(Rectangle())
                     }
-                    .buttonStyle(PressableStyle(scale: 0.88))
+                    .buttonStyle(PressableStyle(scale: 0.86, tint: 0.10, tintRadius: 999, darken: 0))
                     .disabled(store.sending)
 
                     // 圆形发送钮。
@@ -1212,7 +1214,7 @@ struct ChatView: View {
                     Button { voice.error = nil } label: {
                         Image(systemName: "xmark").font(.system(size: 10, weight: .bold))
                     }
-                    .buttonStyle(PressableStyle(scale: 0.95))
+                    .buttonStyle(PressableStyle(scale: 0.90, tint: 0.10, tintRadius: 999, darken: 0))
                 }
                 .foregroundStyle(.orange)
                 .padding(.horizontal, 16)
@@ -1375,7 +1377,8 @@ private struct AttachSheet: View {
             .padding(.vertical, 15)
             .contentShape(Rectangle())
         }
-        .buttonStyle(PressableStyle(scale: 0.95))
+        // 整行没有自己的底色，按下要整行泛灰才看得出选的是哪一行
+        .buttonStyle(PressableStyle(scale: 0.98, tint: 0.07, tintRadius: 0, darken: 0))
     }
 }
 

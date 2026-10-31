@@ -13,6 +13,10 @@ struct AIRelayChatApp: App {
         WindowGroup {
             ChatView(store: store)
                 .task {
+                    // 触感生成器预热。不预热的话 App 起来后**第一下**点击
+                    // 经常不震（生成器还在唤起 Taptic Engine），用户会以为又坏了。
+                    // 2026-11-01 用户：「所有的按键加一个震动反馈」。
+                    Haptic.warmUp()
                     // 首次进入自动判定在家/在外
                     await store.bootstrap()
                 }

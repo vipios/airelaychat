@@ -32,6 +32,9 @@ struct HoldToTalkButton: View {
             } else {
                 wire()
                 onStarted()
+                // 开始听的时候再重一点震一下：光有按钮按下那下 light，
+                // 用户分不清"我点到了"和"它真的在听了"。
+                Haptic.press()
                 Task { await voice.start(prefix: existingText) }
             }
         } label: {
@@ -55,7 +58,7 @@ struct HoldToTalkButton: View {
             .opacity(disabled ? 0.4 : 1)
             .animation(.easeOut(duration: 0.15), value: voice.recording)
         }
-        .buttonStyle(.plain)
+        .buttonStyle(PressableStyle(scale: 0.90, tint: 0.08, tintRadius: 999, darken: 0))
         .disabled(disabled)
     }
 
