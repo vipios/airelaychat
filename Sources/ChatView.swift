@@ -28,6 +28,11 @@ struct ChatView: View {
     @State private var healthTimer: Timer?
 
     @State private var drawerOpen = false
+    /// 顶栏右侧「⋯」那一块有没有被按住。
+    ///
+    /// 它是个 `Menu`，不是 Button —— `Menu` 不认 `buttonStyle`，
+    /// 所以拿不到 PressableStyle 的 isPressed，只能自己用 0 秒长按手势盯。
+    @GestureState private var morePressed = false
     /// 去过哪些 Tab。
     ///
     /// 2026-10-31 为了让后台面板"进去就显示"改了 Tab 的承载方式：
@@ -549,16 +554,24 @@ struct ChatView: View {
             .buttonStyle(PressableStyle(scale: 0.96, tint: 0.06, tintRadius: 14))
 
             // 右侧：一个白胶囊里并排两个图标（新建 / 更多），照截图
+            //
+            // 2026-11-01 用户：「ipa 聊天页右上角胶囊点击不是黑色，改一下」。
+            // 原因：白底原来画在整条 HStack 上，两个按钮自己是透明的 ——
+            // 按下走的 `colorInvert()` 只反按钮**自身像素**，透明区域反完还是透明，
+            // 所以按下去只看到一丁点淡灰。
+            // 现在白底挪到每一段自己身上，按下那一段直接反成纯黑，
+            // 两段拼起来就是整条黑胶囊。
             HStack(spacing: 0) {
                 Button { store.newSession(); store.tab = .tasks } label: {
                     Image(systemName: "plus.bubble")
                         .font(.system(size: 15, weight: .medium))
                         .foregroundStyle(.primary)
-                        .frame(width: 38, height: 38)
+                        .frame(width: 41, height: 38)
+                        .background(Theme.card)
                         .contentShape(Rectangle())
                 }
-                // 图标本身没有底，按下时在它身后铺一层淡灰（会被父级胶囊裁成胶囊形）
-                .buttonStyle(PressableStyle(scale: 0.94, tint: 0.09, tintRadius: 999, darken: 0))
+                // 不缩放：整条胶囊是两段拼的，缩放会在接缝处露出一道底色缝
+                .buttonStyle(PressableStyle(scale: 1.0, fills: true))
 
                 Menu {
                     Button { store.syncCurrentSession() } label: {
@@ -584,15 +597,24 @@ struct ChatView: View {
                         Label("生成交接", systemImage: "arrow.triangle.swap")
                     }
                 } label: {
+                    // Menu 不吃 `buttonStyle`，按下态只能自己盯：
+                    // 挂一个 0 秒的长按手势（simultaneous 不抢 Menu 的点击），
+                    // 手指一落下就为真、抬起为假，用它换底色和图标色。
                     Image(systemName: "ellipsis")
                         .font(.system(size: 15, weight: .medium))
-                        .foregroundStyle(.primary)
-                        .frame(width: 38, height: 38)
+                        .foregroundStyle(morePressed ? Theme.card : Color.primary)
+                        .frame(width: 41, height: 38)
+                        .background(morePressed ? Theme.press : Theme.card)
                         .contentShape(Rectangle())
                 }
+                .simultaneousGesture(
+                    LongPressGesture(minimumDuration: 0)
+                        .updating($morePressed) { value, state, _ in state = value }
+                )
+                .onChange(of: morePressed) { now in
+                    if now { Haptic.tap() }
+                }
             }
-            .padding(.horizontal, 3)
-            .background(Theme.card)
             .clipShape(Capsule())
             .shadow(color: .black.opacity(0.05), radius: 3, x: 0, y: 1)
         }
