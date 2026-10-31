@@ -1,6 +1,7 @@
 import SwiftUI
 import PhotosUI
 import UniformTypeIdentifiers
+import UIKit   // UIPasteboard：气泡下面「复制」用
 
 // MARK: - 聊天主界面（仿 WorkBuddy 手机端）
 
@@ -40,6 +41,8 @@ struct ChatView: View {
     @State private var visitedTabs: Set<MainTab> = [.tasks]
     /// 抽屉里的「我的文件」。和抽屉共用外层弹层，抽屉自己不挂 sheet。
     @State private var showFiles = false
+    /// 「生成交接」的确认（让 AI 整理要花一次对话，先说清楚）
+    @State private var confirmHandoff = false
     /// 点产物卡片 → 预览；预览里点分享 → 换成分享面板
     @State private var previewFile: AIFile?
     @State private var shareFile: AIFile?
@@ -79,15 +82,19 @@ struct ChatView: View {
                 .roundSheet(28)
         }
         .sheet(isPresented: $showFiles) {
-            MyFilesView(store: store, embedded: true)
+            // 传 sessionId：聊天页点「全部产物」只看这个对话的产物。
+            // 抽屉里的「我的文件」不传，看整个文件库。
+            MyFilesView(store: store, embedded: true, sessionId: store.currentSessionId)
                 .roundSheet(28)
+                .presentationDetents([.medium, .large])
+                .presentationDragIndicator(.visible)
         }
         // 产物卡片的预览 / 分享
         .sheet(item: $previewFile) { f in
             NavigationStack {
                 QuickLookView(url: f.url)
                     .ignoresSafeArea()
-                    .navigationTitle(f.title)
+                    .navigationTitle(f.displayName)
                     .navigationBarTitleDisplayMode(.inline)
                     .toolbar {
                         ToolbarItem(placement: .navigationBarTrailing) {
@@ -113,6 +120,22 @@ struct ChatView: View {
             ShareSheet(items: [f.url])
                 .presentationDetents([.medium, .large])
                 .roundSheet(28)
+        }
+        // 「生成交接」先说清楚代价：让 AI 整理＝花一次对话
+        .confirmationDialog("生成交接包？", isPresented: $confirmHandoff, titleVisibility: .visible) {
+            Button("生成（让 AI 重新整理，消耗一次对话）") {
+                store.generateHandoffPackage()
+            }
+            Button("只取本地摘要（不花积分）") {
+                store.prepareHandoff()
+            }
+            Button("取消", role: .cancel) {}
+        } message: {
+            Text("""
+            「生成」让 AI 重新整理交接文档和全部源码，消耗一次对话。
+            「本地摘要」不调用模型：把目标、结论、进度拼成文档，顺带从聊天里扫出仓库地址、项目路径和构建命令。
+            如果这个项目是 AI 在电脑上做的（手机里没有文件），建议先用「本地摘要」——它扫出的地址比自己重写的代码准。
+            """)
         }
         .sheet(isPresented: $showCamera) {
             CameraPicker { img in store.addImage(img) }
@@ -369,6 +392,8 @@ struct ChatView: View {
                     } label: {
                         VStack(spacing: 3) {
                             ZStack {
+                                // 2026-10-31 用户：「底栏圆钮还用咱们之前的那个就行」
+                                // 之前做的是圆角方块（27×23、圆角 7），别照原版改成黑圆。
                                 if store.tab == t {
                                     RoundedRectangle(cornerRadius: 7, style: .continuous)
                                         .fill(Color.primary)
@@ -467,19 +492,12 @@ struct ChatView: View {
                     Image(systemName: "plus.bubble")
                         .font(.system(size: 15, weight: .medium))
                         .foregroundStyle(.primary)
-                        .frame(width: 34, height: 34)
+                        .frame(width: 38, height: 38)
                         .contentShape(Rectangle())
                 }
                 .buttonStyle(.plain)
 
                 Menu {
-                    Button {
-                        store.prepareHandoff()
-                        showModelPicker = false
-                    } label: {
-                        Label("生成交接说明（换账号续聊）", systemImage: "arrow.triangle.swap")
-                    }
-                    Divider()
                     Button { store.syncCurrentSession() } label: {
                         Label("保存会话", systemImage: "tray.and.arrow.down")
                     }
@@ -490,11 +508,23 @@ struct ChatView: View {
                     } label: {
                         Label("清空会话", systemImage: "trash")
                     }
+                    Divider()
+                    // 2026-10-31 用户要求：文案从「生成交接说明（换账号续聊）」
+                    // 缩成「生成交接」，位置挪到「清空会话」下面。
+                    //
+                    // 点它会**替用户发一条格式指令**给当前 AI（不用自己打字），
+                    // 拿到回复后拆成交接文档 + 源码两个文件，挂到输入框附件区。
+                    // 因为要花一次对话，先弹确认：也能选不花积分的本地摘要。
+                    Button {
+                        confirmHandoff = true
+                    } label: {
+                        Label("生成交接", systemImage: "arrow.triangle.swap")
+                    }
                 } label: {
                     Image(systemName: "ellipsis")
                         .font(.system(size: 15, weight: .medium))
                         .foregroundStyle(.primary)
-                        .frame(width: 34, height: 34)
+                        .frame(width: 38, height: 38)
                         .contentShape(Rectangle())
                 }
             }
@@ -546,7 +576,7 @@ struct ChatView: View {
     private var messagesArea: some View {
         ScrollViewReader { proxy in
             ScrollView {
-                LazyVStack(alignment: .leading, spacing: 18) {
+                LazyVStack(alignment: .leading, spacing: 20) {
                     if store.messages.isEmpty { emptyHint }
                     ForEach(store.messages) { msg in
                         bubble(msg).id(msg.id)
@@ -562,8 +592,8 @@ struct ChatView: View {
                         .id("thinking")
                     }
                 }
-                .padding(.horizontal, 16)
-                .padding(.top, 14)
+                .padding(.horizontal, 20)
+                .padding(.top, 16)
                 .padding(.bottom, 10)
             }
             .onChange(of: store.messages.count) { _ in
@@ -622,7 +652,7 @@ struct ChatView: View {
                             Image(systemName: "arrow.uturn.backward")
                                 .font(.system(size: 10, weight: .semibold))
                             Text(msg.text.isEmpty ? "附件已撤回" : msg.text)
-                                .font(.system(size: 15.5))
+                                .font(.system(size: Theme.bodySize))
                                 .strikethrough(true, color: .secondary)
                                 .lineLimit(3)
                         }
@@ -659,12 +689,23 @@ struct ChatView: View {
                         .shadow(color: Color.black.opacity(0.045), radius: 5, y: 1)
                     }
 
-                    // 撤回入口说明（2026-10-31 最终形态）：
-                    // 用户先要"气泡下面加个小图标"，随后又要求
-                    // 「长按弹窗里包括所有 + 文字能任意选词复制」。
-                    // 两者取长按菜单那版：一个弹窗里既有「拷贝/全选/查询」
-                    // 也有「撤回/撤回并重新编辑」，比在每条消息下面挂图标更省地方。
-                    // 所以这里不再画图标，入口在 SelectableText 的菜单里。
+                    // 气泡下面的「复制 / 撤回」（2026-10-31 用户：
+                    // 「我发送出去的对话下面你没有加上复制和撤回的按钮」）。
+                    //
+                    // 之前只把这两个操作塞在长按菜单里，觉得省地方；
+                    // 实际用起来没人知道要长按，等于没有。现在显式摆出来，
+                    // 长按菜单里那两项也留着，两条路都能走。
+                    if !msg.recalled, !msg.text.isEmpty {
+                        HStack(spacing: 6) {
+                            bubbleAction("复制", icon: "doc.on.doc") {
+                                UIPasteboard.general.string = msg.text
+                            }
+                            bubbleAction("撤回", icon: "arrow.uturn.backward") {
+                                store.recall(msg)
+                            }
+                        }
+                        .padding(.top, 1)
+                    }
                 }
             }
         } else {
@@ -672,44 +713,78 @@ struct ChatView: View {
                 attachmentsView(msg)
 
                 if !msg.text.isEmpty || msg.attachments.isEmpty {
-                    Text(msg.text.isEmpty ? " " : msg.text)
-                        .font(.system(size: 15.5))
-                        .foregroundStyle(.primary)
-                        .fixedSize(horizontal: false, vertical: true)
-                        .textSelection(.enabled)
+                    // 2026-10-31 用户要求：「拷贝换成复制，拖动的样式和图中一样」。
+                    //
+                    // 这两件事（菜单文案、薄荷绿选区+手柄）只有底层 UITextView 做得到：
+                    // SwiftUI `Text` 的 `.textSelection` 既不能改颜色，也不能改菜单名。
+                    //
+                    // 抖动怎么防的（上一版就是栽在这）：
+                    //   1. 高度只由 `sizeThatFits(proposal:)` 一处算，并按 (文字, 宽) 缓存，
+                    //      不再有 intrinsicContentSize 的回环 —— 见 SelectableText 里的注释；
+                    //   2. **正在流式输出这条**仍然用轻量 `Text`：一句话每秒变好几次，
+                    //      每次都重排一遍 UITextView 才是真的卡。等它说完再换成可选中的。
+                    let streaming = store.sending && msg.id == store.messages.last?.id
+                    if streaming {
+                        Text(msg.text.isEmpty ? " " : msg.text)
+                            .font(.system(size: Theme.bodySize))
+                            .foregroundStyle(.primary)
+                            .fixedSize(horizontal: false, vertical: true)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                    } else {
+                        SelectableText(
+                            text: msg.text.isEmpty ? " " : msg.text,
+                            allowRecall: false,
+                            fillsWidth: true,
+                            onRecall: {},
+                            onRecallAndEdit: {}
+                        )
                         .frame(maxWidth: .infinity, alignment: .leading)
+                    }
                 }
 
-                // 这条回复落盘的那份产物（ChatStore.archiveReply 写的）
-                if let f = artifact(for: msg) {
-                    artifactCard(f)
-                }
+                // 这条回复产生的产物卡片。对齐原版：
+                // 整宽、浅灰底、实心色图标、15.5pt 文件名，一条回复出几个就排几张。
+                artifactCards(msg)
 
-                // 整个会话的产物入口。只有真的存到了东西才显示，
-                // 免得每条回复下面都挂一个「全部产物 (0)」。
+                // 「全部产物」入口：每条 AI 回复下面都要有。
+                // 2026-10-31 用户明确纠正过：「我需要每条 ai 下面显示全部产物这个我需要」。
+                // 字号/颜色照原版：15pt、正文字色，不是蓝色小链接。
                 let all = lib.files(sessionId: store.currentSessionId)
                 if !all.isEmpty {
                     Button {
                         inputFocused = false
                         showFiles = true
                     } label: {
-                        HStack(spacing: 4) {
-                            Image(systemName: "folder")
-                                .font(.system(size: 11, weight: .medium))
+                        HStack(spacing: 3) {
                             Text("全部产物 (\(all.count))")
-                                .font(.system(size: 12))
+                                .font(.system(size: 15))
+                            Image(systemName: "chevron.right")
+                                .font(.system(size: 10, weight: .semibold))
                         }
-                        .foregroundStyle(Color.accentColor)
+                        .foregroundStyle(.primary)
                         .contentShape(Rectangle())
                     }
                     .buttonStyle(.plain)
+                    .padding(.top, 2)
                 }
 
-                if !msg.model.isEmpty {
-                    Text(shortName(msg.model))
-                        .font(.system(size: 10))
-                        .foregroundStyle(.quaternary)
-                        .padding(.top, 1)
+                // 底部一行：复制（一键全文）+ 模型名。
+                // 复制按钮放在这而不是气泡右上角，是因为 AI 回复很长，
+                // 悬浮按钮会一直压在字上面挡视线。
+                if !msg.model.isEmpty || !msg.text.isEmpty {
+                    HStack(spacing: 10) {
+                        if !msg.text.isEmpty {
+                            bubbleAction("复制", icon: "doc.on.doc") {
+                                UIPasteboard.general.string = msg.text
+                            }
+                        }
+                        if !msg.model.isEmpty {
+                            Text(shortName(msg.model))
+                                .font(.system(size: 10))
+                                .foregroundStyle(.quaternary)
+                        }
+                    }
+                    .padding(.top, 1)
                 }
 
                 if msg.failed {
@@ -725,9 +800,36 @@ struct ChatView: View {
         }
     }
 
+    /// 用户气泡下面那排小操作（复制 / 撤回）。
+    ///
+    /// 做成小胶囊而不是纯图标：图标两个字宽不到 10pt，点在白底上
+    /// 完全看不出边界，用户会以为这行是装饰。胶囊至少有底、有边，
+    /// 按下去还有一档缩放，能确认"我点到了"。
+    private func bubbleAction(_ title: String,
+                              icon: String,
+                              action: @escaping () -> Void) -> some View {
+        Button(action: action) {
+            HStack(spacing: 4) {
+                Image(systemName: icon)
+                    .font(.system(size: 10, weight: .medium))
+                Text(title)
+                    .font(.system(size: 11.5))
+            }
+            .foregroundStyle(Theme.sub)
+            .padding(.horizontal, 9)
+            .padding(.vertical, 4)
+            // 白底 + 细描边：页面底色本身就是 #F8F8F8，
+            // 用浅灰底（Theme.tile）整颗胶囊会糊进背景里，等于没画。
+            .background(Theme.card)
+            .overlay(Capsule().strokeBorder(Color.primary.opacity(0.10), lineWidth: 1))
+            .clipShape(Capsule())
+            .contentShape(Capsule())
+        }
+        .buttonStyle(PressableStyle())
+    }
+
     @ViewBuilder
-    private func attachmentsView(_ msg: ChatMessage) -> some View {
-        ForEach(msg.attachments) { a in
+    private func attachmentsView(_ msg: ChatMessage) -> some View {        ForEach(msg.attachments) { a in
             if let img = a.preview {
                 Image(uiImage: img)
                     .resizable()
@@ -770,59 +872,74 @@ struct ChatView: View {
         }
     }
 
-    // MARK: - 产物卡片
+    // MARK: - 产物
 
-    /// 这条回复对应的那个文件。
+    /// 这条回复落盘的所有产物。
     ///
-    /// archiveReply 存的时候用「messages 里的下标」当 messageIndex，
-    /// 所以这里按 id 反查下标，再在文件库里按 (会话, 下标) 找。
+    /// archiveReply 用「messages 里的下标」当 messageIndex，所以按 id 反查下标。
     /// 不按文本匹配：文本会被流式改动，下标在归档那一刻就固定了。
-    private func artifact(for msg: ChatMessage) -> AIFile? {
-        guard let idx = store.messages.firstIndex(where: { $0.id == msg.id }) else { return nil }
-        return lib.files.first {
-            $0.sessionId == store.currentSessionId && $0.messageIndex == idx
+    /// 返回数组而不是单个 —— 一条回复将来可能同时出 md + 代码 + 图。
+    private func artifacts(for msg: ChatMessage) -> [AIFile] {
+        guard let idx = store.messages.firstIndex(where: { $0.id == msg.id }) else { return [] }
+        return lib.files
+            .filter { $0.sessionId == store.currentSessionId && $0.messageIndex == idx }
+            .sorted { $0.createdAt < $1.createdAt }
+    }
+
+    @ViewBuilder
+    private func artifactCards(_ msg: ChatMessage) -> some View {
+        let items = artifacts(for: msg)
+        if !items.isEmpty {
+            VStack(spacing: 8) {
+                ForEach(items) { f in
+                    artifactCard(f)
+                }
+            }
         }
     }
 
+    /// 产物卡片。尺寸照原版截图量的：
+    ///   整宽、圆角 14、浅灰底无描边、图标 42 圆角 11 实心色、
+    ///   文件名 15.5、副标题 12.5、右上角一个 ↗。
     private func artifactCard(_ f: AIFile) -> some View {
         Button {
             inputFocused = false
             previewFile = f
         } label: {
-            HStack(spacing: 9) {
+            HStack(spacing: 11) {
                 ZStack {
-                    RoundedRectangle(cornerRadius: 8, style: .continuous)
-                        .fill(Color.accentColor.opacity(0.12))
-                        .frame(width: 30, height: 30)
+                    RoundedRectangle(cornerRadius: 11, style: .continuous)
+                        .fill(f.kind.tint)
+                        .frame(width: 42, height: 42)
                     Image(systemName: f.kind.icon)
-                        .font(.system(size: 13))
-                        .foregroundStyle(Color.accentColor)
+                        .font(.system(size: 18, weight: .regular))
+                        .foregroundStyle(.white)
                 }
-                VStack(alignment: .leading, spacing: 1) {
-                    Text(f.fileName)
-                        .font(.system(size: 12.5))
+
+                VStack(alignment: .leading, spacing: 3) {
+                    Text(f.displayName)
+                        .font(.system(size: 15.5))
                         .foregroundStyle(.primary)
                         .lineLimit(1)
-                    Text("\(f.kind.label) · \(f.sizeText)")
-                        .font(.system(size: 10))
+                    Text("文件产物 · \(f.sizeText)")
+                        .font(.system(size: 12.5))
                         .foregroundStyle(.secondary)
                 }
-                Image(systemName: "chevron.right")
-                    .font(.system(size: 10, weight: .semibold))
-                    .foregroundStyle(.quaternary)
+
+                Spacer(minLength: 6)
+
+                Image(systemName: "arrow.up.right")
+                    .font(.system(size: 14, weight: .medium))
+                    .foregroundStyle(.tertiary)
             }
-            .padding(.horizontal, 11)
-            .padding(.vertical, 8)
-            .background(Theme.card)
-            .overlay(
-                RoundedRectangle(cornerRadius: 14, style: .continuous)
-                    .stroke(Color(.separator).opacity(0.5), lineWidth: 0.7)
-            )
+            .padding(.horizontal, 13)
+            .padding(.vertical, 12)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .background(Theme.tile)
             .clipShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
             .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
-        .padding(.top, 2)
     }
 
     // MARK: - 错误提示
@@ -927,84 +1044,67 @@ struct ChatView: View {
     /// 输入框始终在，所以焦点不会丢、键盘随时能弹。
     private var inputBar: some View {
         VStack(spacing: 0) {
-            VStack(alignment: .leading, spacing: 6) {
-                // ---- 第一行：输入框 ----
-                TextField("发消息...", text: $store.input, axis: .vertical)
-                    .lineLimit(1...6)
-                    .font(.system(size: 16))
-                    .focused($inputFocused)
-                    .padding(.horizontal, 14)
-                    .padding(.top, 12)
-
-                // ---- 第二行：工具条 ----
-                HStack(spacing: 10) {
-                    HoldToTalkButton(voice: voice, disabled: store.sending,
-                                     existingText: store.input) { finalText in
-                        // 最终结果（已经拼好原有文字），直接写回输入框
-                        store.input = finalText
-                    } onLive: { liveText in
-                        // 边说边显示：直接写进输入框，用户看到的字在长
-                        store.input = liveText
-                    } onStarted: {
-                        // 开始听的时候收起键盘，免得两套输入打架
-                        inputFocused = false
-                    }
-
-                    // 模型下拉：点它在这个位置正上方弹出选择面板
-                    Button { inputFocused = false; showModelPicker = true } label: {
-                        HStack(spacing: 4) {
-                            // 模型名前也有个小灯，和顶栏同一份数据
-                            Circle()
-                                .fill(linkColor)
-                                .frame(width: 5, height: 5)
-                            Text(modelTitle)
-                                .font(.system(size: 12))
-                                .foregroundStyle(.secondary)
-                                .lineLimit(1)
-                                .truncationMode(.tail)
-                            Image(systemName: "chevron.up.chevron.down")
-                                .font(.system(size: 8, weight: .semibold))
-                                .foregroundStyle(.tertiary)
-                        }
-                        .frame(maxWidth: 190, alignment: .leading)
-                        .contentShape(Rectangle())
-                    }
-                    .buttonStyle(.plain)
-
-                    Spacer(minLength: 0)
-
-                    // 加号：附件。用户说它已经能选文件了，保持不动
-                    Button { inputFocused = false; showAttach = true } label: {
-                        Image(systemName: "plus")
-                            .font(.system(size: 19, weight: .regular))
-                            .foregroundStyle(Theme.inkSoft)
-                            .frame(width: 30, height: 30)
-                            .contentShape(Rectangle())
-                    }
-                    .buttonStyle(.plain)
-                    .disabled(store.sending)
-
-                    // 发送：胶囊样式「发送」两个字，颜色跟加号一致
-                    Button { sendIfPossible() } label: {
-                        Text(voice.recording ? "停止" : "发送")
-                            .font(.system(size: 13, weight: .medium))
-                            .foregroundStyle(canTapSend ? Theme.card : Theme.sub)
-                            .padding(.horizontal, 14)
-                            .padding(.vertical, 7)
-                            .background(canTapSend ? Color.primary : Color(.tertiarySystemFill))
-                            .clipShape(Capsule())
-                    }
-                    .buttonStyle(.plain)
-                    .disabled(!canTapSend)
-                    .animation(.easeOut(duration: 0.15), value: canTapSend)
+            // 单行胶囊，和原版一致： [ 声波   输入框    ＋   ↑ ]
+            //
+            // 2026-10-31 从「输入框一行 + 工具条一行」的两层胶囊改成单行。
+            // 原版就是一条胶囊，我们那版比它高出一半，整屏重心都往下坠。
+            // 模型选择从工具条挪到顶栏第二行 —— 那里本来就显示模型名，点一下就能换。
+            HStack(alignment: .bottom, spacing: 8) {
+                HoldToTalkButton(voice: voice, disabled: store.sending,
+                                 existingText: store.input) { finalText in
+                    // 最终结果（已经拼好原有文字），直接写回输入框
+                    store.input = finalText
+                } onLive: { liveText in
+                    // 边说边显示：直接写进输入框，用户看到的字在长
+                    store.input = liveText
+                } onStarted: {
+                    // 开始听的时候收起键盘，免得两套输入打架
+                    inputFocused = false
                 }
-                .padding(.horizontal, 12)
-                .padding(.bottom, 10)
-                .padding(.top, 2)
+                .padding(.bottom, 2)
+
+                TextField("发消息或按住说话…", text: $store.input, axis: .vertical)
+                    .lineLimit(1...5)
+                    // 用我们自己的正文字号，不跟原版截图走的那个数
+                    .font(.system(size: Theme.bodySize))
+                    .focused($inputFocused)
+                    .padding(.vertical, 6)
+
+                // 加号：附件
+                Button { inputFocused = false; showAttach = true } label: {
+                    Image(systemName: "plus")
+                        .font(.system(size: 20, weight: .regular))
+                        .foregroundStyle(Theme.inkSoft)
+                        .frame(width: 30, height: 30)
+                        .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+                .disabled(store.sending)
+                .padding(.bottom, 2)
+
+                // 有内容才出现的发送键：黑色圆底白箭头（原版没有发送键，
+                // 但咱们必须有；放成圆形小按钮，不破坏单行胶囊的观感）
+                if canTapSend {
+                    Button { sendIfPossible() } label: {
+                        Image(systemName: voice.recording ? "stop.fill" : "arrow.up")
+                            .font(.system(size: 15, weight: .semibold))
+                            .foregroundStyle(Theme.card)
+                            .frame(width: 30, height: 30)
+                            .background(Color.primary)
+                            .clipShape(Circle())
+                    }
+                    .buttonStyle(.plain)
+                    .padding(.bottom, 2)
+                    .transition(.scale.combined(with: .opacity))
+                }
             }
+            .animation(.easeOut(duration: 0.15), value: canTapSend)
+            .padding(.horizontal, 14)
+            // 上下 10：胶囊总高约 52pt —— 照原版截图量的（截图 66px ÷ 1.28）
+            .padding(.vertical, 10)
             .background(Theme.card)
-            .clipShape(RoundedRectangle(cornerRadius: 24, style: .continuous))
-            .shadow(color: .black.opacity(0.05), radius: 4, x: 0, y: 1)
+            .clipShape(RoundedRectangle(cornerRadius: 26, style: .continuous))
+            .shadow(color: .black.opacity(0.05), radius: 5, x: 0, y: 1)
             .padding(.horizontal, 12)
             .padding(.top, 4)
             .padding(.bottom, 8)
@@ -1174,7 +1274,7 @@ private struct AttachSheet: View {
                     .foregroundStyle(.primary)
                     .frame(width: 26)
                 Text(title)
-                    .font(.system(size: 16))
+                    .font(.system(size: Theme.bodySize))
                     .foregroundStyle(.primary)
                 Spacer()
             }
@@ -1208,46 +1308,43 @@ private struct AdminTabPage: View {
 
     var body: some View {
         VStack(spacing: 0) {
-            // 顶栏：标题 + 两个按钮（刷新 / 改密钥）
-            HStack(spacing: 8) {
-                VStack(alignment: .leading, spacing: 2) {
+            // 顶部：按钮行 + 标题块（2026-10-31 用户要求：
+            //   1. 左上角加返回
+            //   2. 整页往下挪，别紧贴状态栏
+            //   3. 三个按钮都用胶囊，按下去要有反应）
+            //
+            // 为什么按钮单独占一行：标题 + 三个胶囊挤一行，
+            // 胶囊会被压成"三个小圆点"，白做。分两行以后
+            // 按钮有 34 高、标题也有自己的呼吸空间，往下挪的问题一起解决。
+            VStack(spacing: 14) {
+                HStack(spacing: 8) {
+                    PillButton(title: "返回", icon: "chevron.left", filled: true) {
+                        store.tab = .tasks
+                    }
+                    Spacer(minLength: 6)
+                    PillButton(title: "刷新", icon: "arrow.clockwise") {
+                        tick += 1
+                    }
+                    PillButton(title: "密钥", icon: "key.fill") {
+                        keyDraft = key
+                        editingKey = true
+                    }
+                }
+
+                VStack(alignment: .leading, spacing: 4) {
                     Text("后台面板")
-                        .font(.system(size: 17, weight: .semibold))
+                        .font(.system(size: 22, weight: .bold))
+                        .foregroundStyle(.primary)
                     Text(base)
-                        .font(.system(size: 10, design: .monospaced))
-                        .foregroundStyle(.secondary)
+                        .font(.system(size: 11.5, design: .monospaced))
+                        .foregroundStyle(Theme.sub)
                         .lineLimit(1)
                 }
-                Spacer()
-                Button {
-                    tick += 1
-                } label: {
-                    Image(systemName: "arrow.clockwise")
-                        .font(.system(size: 15, weight: .medium))
-                        .foregroundStyle(.primary)
-                        .frame(width: 34, height: 34)
-                        .background(Theme.card)
-                        .clipShape(Circle())
-                }
-                .buttonStyle(.plain)
-
-                Button {
-                    keyDraft = key
-                    editingKey = true
-                } label: {
-                    Image(systemName: "key")
-                        .font(.system(size: 15, weight: .medium))
-                        .foregroundStyle(.primary)
-                        .frame(width: 34, height: 34)
-                        .background(Theme.card)
-                        .clipShape(Circle())
-                }
-                .buttonStyle(.plain)
+                .frame(maxWidth: .infinity, alignment: .leading)
             }
-            .padding(.horizontal, 14)
-            // 顶部 8 → 16：标题原来贴着状态栏时间，用户反馈「整体往下」
-            .padding(.top, 16)
-            .padding(.bottom, 10)
+            .padding(.horizontal, 16)
+            .padding(.top, 8)
+            .padding(.bottom, 12)
             .background(Theme.page)
 
             // 底部 Tab 已经常驻，网页不能再 ignoresSafeArea(.bottom)：

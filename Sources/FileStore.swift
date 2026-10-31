@@ -35,14 +35,17 @@ struct AIFile: Codable, Identifiable, Hashable {
     enum Kind: String, Codable {
         case markdown
         case text
+        case code
         case image
         case other
 
         var icon: String {
             switch self {
-            case .markdown, .text: return "doc.text"
-            case .image: return "photo"
-            case .other: return "doc"
+            case .markdown: return "doc.text.fill"
+            case .text: return "text.alignleft"
+            case .code: return "chevron.left.forwardslash.chevron.right"
+            case .image: return "photo.fill"
+            case .other: return "questionmark.square.dashed"
             }
         }
 
@@ -50,10 +53,42 @@ struct AIFile: Codable, Identifiable, Hashable {
             switch self {
             case .markdown: return "MD"
             case .text: return "TXT"
+            case .code: return "CODE"
             case .image: return "图片"
             case .other: return "文件"
             }
         }
+
+        /// 图标颜色。一色一类，扫一眼就知道这堆里有什么。
+        ///
+        /// 用固定 RGB 而不是 .tint：整页如果都是同一个强调色，
+        /// 一下就退化成「一排一样的方块」，分类信息等于没有。
+        /// 这几个色号在浅色/深色下都压得住白底和 #1C1C1E。
+        var tint: Color {
+            switch self {
+            case .markdown: return Color(red: 0.06, green: 0.60, blue: 0.46)   // 青
+            case .text:     return Color(red: 0.42, green: 0.45, blue: 0.50)   // 灰
+            case .code:     return Color(red: 0.49, green: 0.36, blue: 0.84)   // 紫
+            case .image:    return Color(red: 0.17, green: 0.48, blue: 0.90)   // 蓝
+            case .other:    return Color(red: 0.29, green: 0.50, blue: 0.84)   // 蓝
+            }
+        }
+    }
+
+    /// 给人看的文件名：去掉时间戳那一段。
+    ///
+    /// 磁盘上必须留时间戳（同一秒生成两个同名文件会互相覆盖），
+    /// 但列表里显示「刷机指南-20261031-001030.md」纯属噪音 ——
+    /// 用户认的是「刷机指南.md」，时间戳他根本不看。
+    var displayName: String {
+        let ext = (fileName as NSString).pathExtension
+        var stem = (fileName as NSString).deletingPathExtension
+        // 尾部形如 -20261031-001030 或 -20261031-001030-2
+        if let r = stem.range(of: #"-\d{8}-\d{6}(-\d+)?$"#, options: .regularExpression) {
+            stem = String(stem[stem.startIndex..<r.lowerBound])
+        }
+        if stem.isEmpty { stem = title.isEmpty ? "未命名" : title }
+        return ext.isEmpty ? stem : "\(stem).\(ext)"
     }
 
     /// 「841.5 KB」这种人话
@@ -291,6 +326,8 @@ enum FileStore {
         case "png", "jpg", "jpeg", "heic", "gif", "webp": kind = .image
         case "md": kind = .markdown
         case "txt": kind = .text
+        case "swift", "py", "js", "ts", "json", "sh", "c", "h", "cpp", "html", "css", "yaml", "yml":
+            kind = .code
         default: kind = .other
         }
         return AIFile(fileName: name, title: base, sessionId: sessionId,
@@ -319,6 +356,26 @@ enum FileStore {
             }
         }
         return list
+    }
+
+    /// 这个已有文件是不是「旧版误存的聊天记录」。
+    ///
+    /// 判据就一条：**里面没有代码块**。
+    ///
+    /// 为什么敢这么判：2026-10-31 之后产物只收代码块/文件内容块
+    /// （见 ChatStore.archiveReply），所以库里纯文字的 md 全都是
+    /// 老逻辑把整段聊天正文存下来的残渣 —— 用户原话
+    /// 「我不需要的是把 ai 的聊天记录都当成产物」。
+    ///
+    /// 只看 md / txt：图片、代码文件这些一律不动，那不是聊天能存出来的。
+    /// 大文件也不读整段，直接看头部 32KB 就够判断有没有 ```。
+    static func isChatArchive(_ f: AIFile) -> Bool {
+        guard f.kind == .markdown || f.kind == .text else { return false }
+        guard let h = try? FileHandle(forReadingFrom: f.url) else { return false }
+        defer { try? h.close() }
+        let data = (try? h.read(upToCount: 32768)) ?? Data()
+        guard let s = String(data: data, encoding: .utf8) else { return false }
+        return !s.contains("```")
     }
 }
 
@@ -379,9 +436,19 @@ final class FileLibrary: ObservableObject {
         FileStore.save(files)
     }
 
-    /// 某个会话产生的文件（聊天页「全部产物」用）
+    /// 某个会话产生的文件（聊天页尾端「全部产物」用）
     func files(sessionId: String) -> [AIFile] {
         files.filter { $0.sessionId == sessionId }
+    }
+
+    /// 重新从磁盘读一遍索引，顺手清掉「记录还在、文件没了」的孤儿。
+    /// 面板下拉刷新走这里：别的时候 App 不会主动重读，
+    /// 但用户下拉就是在说「我不信这是最新的」。
+    func reload() {
+        var list = FileStore.load()
+        list = list.filter { FileManager.default.fileExists(atPath: $0.url.path) }
+        files = list.sorted { $0.createdAt > $1.createdAt }
+        FileStore.save(files)
     }
 
     /// 按关键词搜（标题 + 文件名）
@@ -441,4 +508,23 @@ struct QuickLookView: UIViewControllerRepresentable {
             url as NSURL
         }
     }
+}
+
+/// 「保存」：把产物另存到「文件」App（iCloud 云盘 / 我的 iPhone / 其它位置）。
+///
+/// 为什么不用 SwiftUI 的 `fileExporter`：那套要包一个 FileDocument，
+/// 每种类型都得单独实现一遍；UIDocumentPicker 支持任意类型、支持一次多个，
+/// 弹出来的还是系统标准的「存到哪里」界面，用户一看就懂。
+///
+/// `asCopy: true` 是关键：库里那份必须留着，否则「保存」等于搬家。
+struct DocumentExporter: UIViewControllerRepresentable {
+    let urls: [URL]
+
+    func makeUIViewController(context: Context) -> UIDocumentPickerViewController {
+        let picker = UIDocumentPickerViewController(forExporting: urls, asCopy: true)
+        picker.shouldShowFileExtensions = true
+        return picker
+    }
+
+    func updateUIViewController(_ c: UIDocumentPickerViewController, context: Context) {}
 }

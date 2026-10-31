@@ -19,6 +19,18 @@ final class ChatStore: ObservableObject {
     @Published var errorText: String?
     /// 附件相关的一次性提示（比如视频太大）
     @Published var toast: String?
+
+    /// 正在让 AI 整理交接包。
+    ///
+    /// 2026-10-31 用户问「怎么让他直接生成交接文档和源码，而不是我一个字一个字去打字」——
+    /// 所以「生成交接」不再只是本地拼一段摘要，而是自动替用户发一条格式指令，
+    /// 拿到回复后当场拆成交接文档 + 源码两个文件。这个标记用来：
+    ///   1. 让界面显示"正在整理"
+    ///   2. 在 runSend 结束时认领这一轮回复（走专门拆包，不做普通归档）
+    @Published var handoffBuilding = false
+    /// 起手看门狗：万一模型/连接有问题根本没发出去，几秒后把标记复位，
+    /// 否则按钮会一直卡在"整理中"。
+    private var handoffWatch: Task<Void, Never>?
     /// 刚换过来源/账号，界面提示「要不要把上一个 AI 的进度交接过来」。
     ///
     /// 2026-10-31 用户要求「换另一个账号的 AI 继续，别断开记忆」：
@@ -251,8 +263,11 @@ final class ChatStore: ObservableObject {
     /// - Parameter upTo: 只统计到这个下标之前（不含）的消息。
     ///   自动交接时用「换账号那一刻的条数」，这样换完之后新说的话
     ///   不会被当成"背景"重复带进去。
-    ///   传 nil = 用当前全部消息（手动点「生成交接说明」时用）。
-    func buildHandoff(upTo: Int? = nil) -> String {
+    ///   传 nil = 用当前全部消息（手动点「生成交接」时用）。
+    /// - Parameter mentionSource: 是否在结尾提一句「另外附了源码」。
+    ///   只有手动「生成交接」会同时发源码文件（见 prepareHandoff），
+    ///   自动交接只是把摘要插进消息里、并没有附件，写这句就是骗人。
+    func buildHandoff(upTo: Int? = nil, mentionSource: Bool = false) -> String {
         let pool: ArraySlice<ChatMessage>
         if let upTo {
             let end = min(upTo, messages.count)
@@ -342,9 +357,214 @@ final class ChatStore: ObservableObject {
         }
         out.append("")
 
+        // ── 4. 项目线索：仓库地址、磁盘路径、构建命令
+        //
+        // 用户真实场景：让 AI 在电脑上把项目做完，聊天里一个代码块都没有。
+        // 这时《源码》那份是空的，必须有这一节兜住，否则交接等于没交。
+        let clues = buildProjectClues(upTo: upTo)
+        if clues.count > 0 {
+            out.append("")
+            out.append(clues.doc)
+            out.append("")
+        }
+
         out.append("---")
         out.append("以上是背景。请接着做，不要再问一遍上面已经说清的事。")
+        if mentionSource {
+            out.append("")
+            out.append("另外我一并发了《源码》那份文件（同一个消息里的另一个 md），")
+            out.append("里面是这次对话里出现过的全部代码。需要看实现就直接用它，")
+            out.append("不要让我再重新贴一遍。")
+        } else if clues.count > 0 {
+            // 没源码但有线索：把「你自己去取」这句话说清楚，
+            // 否则模型会以为项目是空的，要求用户从头贴一遍。
+            out.append("")
+            out.append("这次对话里没有贴代码（活是在我电脑上干的，手机拿不到文件），")
+            out.append("但上面「项目线索」里有真实的仓库地址、路径和命令。")
+            out.append("请按那些地址自己去取代码，不要让我重新贴。")
+        }
         return out.joined(separator: "\n")
+    }
+
+    /// 从对话里扫出「项目线索」：仓库地址、磁盘路径、构建命令、版本号。
+    ///
+    /// 为什么需要这一节：用户经常是让 AI 在**电脑上**把活干完
+    /// （比如从零做完一个 ipa），聊天里只留下「做好了」。
+    /// 这时《源码》那份是空的，交接文档里若再没有路径和仓库地址，
+    /// 下一个 AI 等于从零开始问起 —— 而这些东西本来就在聊天文字里躺着：
+    /// 「项目在 E:\xxx，仓库是 github.com/xxx/yyy，推上去跑 CI」。
+    ///
+    /// 全部用正则从已有文字里捞，不花一次对话、不烧积分。
+    ///
+    /// - Parameter upTo: 只统计这个下标之前（不含），语义同 buildHandoff。
+    func buildProjectClues(upTo: Int? = nil) -> (doc: String, count: Int) {
+        let pool: ArraySlice<ChatMessage>
+        if let upTo {
+            let end = min(upTo, messages.count)
+            pool = messages[0..<max(0, end)]
+        } else {
+            pool = messages[messages.startIndex...]
+        }
+        let text = pool.filter { !$0.recalled }.map(\.text).joined(separator: "\n")
+        guard !text.isEmpty else { return ("", 0) }
+
+        var sections: [String] = []
+        var total = 0
+
+        // 仓库 / 网址
+        let urls = Self.unique(Self.matches(#"https?://[A-Za-z0-9._\-/:@?=&#%+~]+"#, in: text), limit: 12)
+            + Self.unique(Self.matches(#"github\.com/[A-Za-z0-9_.\-]+/[A-Za-z0-9_.\-]+"#, in: text), limit: 8)
+        if !urls.isEmpty {
+            sections.append("### 仓库 / 网址")
+            for u in Self.unique(urls, limit: 14) { sections.append("- " + u) }
+            total += urls.count
+        }
+
+        // 磁盘路径
+        var paths = Self.unique(Self.matches(#"[A-Za-z]:\\[^\s"'<>|，。；）]+"#, in: text), limit: 12)
+        paths += Self.unique(Self.matches(#"/(?:Users|home|opt|etc|var|www|usr|private)/[^\s"'<>|，。；）]+"#, in: text), limit: 12)
+        if !paths.isEmpty {
+            sections.append("### 项目所在路径")
+            for p in Self.unique(paths, limit: 18) { sections.append("- `" + p + "`") }
+            total += paths.count
+        }
+
+        // 项目内文件（带扩展名的那种）
+        //
+        // 尾巴上的 `(?![A-Za-z0-9])` 不能省：没有它，`github.com` 会被
+        // 当成「一个叫 github.c 的文件」，`relay.example.com` 同理。
+        // 加了之后要求扩展名后面不能再跟字母数字，误报就没了。
+        let files = Self.unique(Self.matches(
+            #"[A-Za-z0-9_][A-Za-z0-9_./\-]*\.(?:swift|py|sh|mm|m|h|c|js|ts|jsx|tsx|json|yml|yaml|plist|xml|md|deb|ipa|zip|conf|ini|toml)(?![A-Za-z0-9])"#,
+            in: text), limit: 20)
+        if !files.isEmpty {
+            sections.append("### 提到的文件")
+            for f in files { sections.append("- `" + f + "`") }
+            total += files.count
+        }
+
+        // 构建 / 部署命令：按行扫，认常见的工具前缀
+        let cmdMarks = ["git ", "npm ", "pnpm ", "yarn ", "pip ", "pip3 ",
+                        "python ", "python3 ", "xcodebuild", "xcodegen",
+                        "brew ", "docker ", "gh ", "curl ", "ssh ", "scp ",
+                        "make ", "cargo ", "go build", "swift build",
+                        "dpkg-deb", "ldid", "codesign", "Sideloadly"]
+        var cmds: [String] = []
+        var seenCmd = Set<String>()
+        for raw in text.components(separatedBy: "\n") {
+            var line = raw.trimmingCharacters(in: .whitespaces)
+            if line.hasPrefix("```") || line.isEmpty || line.count > 160 { continue }
+            // 去掉行首的 $ 或 > 提示符
+            while let f = line.first, f == "$" || f == ">" || f == " " { line.removeFirst() }
+            guard cmdMarks.contains(where: { line.hasPrefix($0) }) else { continue }
+            guard !seenCmd.contains(line) else { continue }
+            seenCmd.insert(line)
+            cmds.append(line)
+            if cmds.count >= 15 { break }
+        }
+        if !cmds.isEmpty {
+            sections.append("### 构建 / 运行命令")
+            for c in cmds { sections.append("```\n" + c + "\n```") }
+            total += cmds.count
+        }
+
+        // 版本号（只在有别的线索时才提，单纯出现一个数字没意义）
+        if total > 0 {
+            let vers = Self.unique(Self.matches(#"\b\d+\.\d+\.\d+\b"#, in: text), limit: 6)
+            if !vers.isEmpty {
+                sections.append("### 出现过的版本号")
+                sections.append("- " + vers.joined(separator: "、"))
+            }
+        }
+
+        guard total > 0 else { return ("", 0) }
+
+        var out: [String] = []
+        out.append("## 项目线索（从聊天记录里原样扫出来的）")
+        out.append("")
+        out.append("> 下面这些地址、路径、命令都不是我编的，是对话里真实出现过的原文。")
+        out.append("> **请直接按这些去定位代码，不要再问我要。**")
+        out.append("")
+        out.append(contentsOf: sections)
+        return (out.joined(separator: "\n"), total)
+    }
+
+    /// 按出现顺序去重
+    private static func unique(_ list: [String], limit: Int) -> [String] {
+        var seen = Set<String>()
+        var out: [String] = []
+        for s in list where !seen.contains(s) {
+            seen.insert(s)
+            out.append(s)
+            if out.count >= limit { break }
+        }
+        return out
+    }
+
+    /// 把一个正则的所有命中按出现顺序取出来（自带去重与清洗）
+    private static func matches(_ pattern: String, in text: String) -> [String] {
+        guard let re = try? NSRegularExpression(pattern: pattern, options: [.caseInsensitive]) else {
+            return []
+        }
+        let ns = text as NSString
+        var out: [String] = []
+        for m in re.matches(in: text, options: [], range: NSRange(location: 0, length: ns.length)) {
+            var s = ns.substring(with: m.range).trimmingCharacters(in: .whitespacesAndNewlines)
+            // 正则贪婪吃到中文标点时切掉，否则「E:\项目\README.md。」会带个句号
+            while let last = s.last {
+                if "，。；、）】".contains(last) { s.removeLast() } else { break }
+            }
+            guard s.count >= 4 else { continue }
+            out.append(s)
+        }
+        return out
+    }
+
+    /// 把会话里出现过的代码块按顺序汇总成一份「源码」文档。
+    ///
+    /// 为什么不打包成 zip：这是个聊天 App，本地并没有工程目录，
+    /// 唯一的「源码」就是对话里贴出来的那些代码；而下一个 AI 读纯文本
+    /// 最省事，zip 它未必解得开。所以拼成一个 md，每段带语言标注。
+    ///
+    /// - Parameter upTo: 只统计这个下标之前（不含），语义同 buildHandoff。
+    func buildSourceBundle(upTo: Int? = nil) -> (doc: String, count: Int) {
+        let pool: ArraySlice<ChatMessage>
+        if let upTo {
+            let end = min(upTo, messages.count)
+            pool = messages[0..<max(0, end)]
+        } else {
+            pool = messages[messages.startIndex...]
+        }
+        let live = pool.filter { !$0.recalled && !$0.text.isEmpty }
+
+        var body: [String] = []
+        var n = 0
+        for m in live where m.role == "assistant" {
+            for b in Self.splitCodeBlocks(m.text).blocks {
+                let code = b.code.trimmingCharacters(in: .whitespacesAndNewlines)
+                guard !code.isEmpty else { continue }
+                n += 1
+                let lang = b.lang.isEmpty ? "text" : b.lang
+                body.append("## \(n). \(lang)")
+                body.append("")
+                body.append("```\(lang)")
+                body.append(code)
+                body.append("```")
+                body.append("")
+            }
+        }
+        guard n > 0 else { return ("", 0) }
+
+        let trip = currentSessionTitle.isEmpty ? "本次会话" : currentSessionTitle
+        var head: [String] = []
+        head.append("# 源码：\(trip)")
+        head.append("")
+        head.append("> 从这次对话里按出现顺序摘出的全部代码，共 \(n) 段。")
+        head.append("> 请配合《交接-\(trip)》一起看：那份讲目标、结论和进度，这份是代码本身。")
+        head.append("")
+        head.append("---")
+        head.append("")
+        return ((head + body).joined(separator: "\n"), n)
     }
 
     /// 取一行、压掉多余空白、超长截断
@@ -359,24 +579,283 @@ final class ChatStore: ObservableObject {
         return t
     }
 
-    /// 把交接摘要放进输入框，用户看一眼就能发。
+    // MARK: - 让 AI 自己整理交接包（一键，不用用户打字）
+
+    /// 「生成交接 → 生成」时替用户发出去的格式指令。
     ///
-    /// 为什么放输入框而不是直接发：
-    /// 用户可能想补一句"现在是改到第 3 步"，直接发出去就改不了了。
-    /// 放输入框还能顺手把不想给新 AI 看到的段落删掉。
-    func prepareHandoff() {
-        let h = buildHandoff()
-        guard !h.isEmpty else {
+    /// 为什么走正常聊天通道、而不是偷偷调一次接口：
+    /// 用户在聊天里能看到"我让它整理交接"这件事，不会凭空多出一条没来源的消息；
+    /// 而且重连、换地址、能力判断这些逻辑全部复用，不用另写一份。
+    static let handoffPrompt = """
+    换 AI 前把材料整理好。请严格按下面两段格式输出，两段之外不要写别的话：
+
+    ===HANDOFF===
+    # 项目目标（一句话）
+    # 已经完成的
+    # 还没做的
+    # 关键约束（技术栈、不能改的地方、已经踩过的坑）
+    ===SOURCES===
+    全部源码，一个文件一个代码块；每个代码块第一行用注释写出文件路径
+    """
+
+    /// 一键生成交接包：自动让 AI 把交接文档和全部源码写出来。
+    ///
+    /// 2026-10-31 用户：「我怎么能让他直接生成交接文档和源码，
+    /// 而不是我一个字一个字去打字让他给我准备」。
+    ///
+    /// 所以这一步是**替用户发指令**，不是本地拼一段摘要：
+    /// 发出去 → 等这一轮回复结束 → 拆成两个文件 → 挂到输入框附件区。
+    /// 代价是一次模型调用，界面上会先问一句再动手。
+    func generateHandoffPackage() {
+        guard !sending, !sendStarting else {
+            toast = "等这条回复说完再生成"
+            return
+        }
+        guard messages.contains(where: { $0.role == "user" }) else {
             toast = "这个会话还没有内容，不用交接"
             return
         }
-        input = h
+        handoffBuilding = true
+        input = Self.handoffPrompt
+        send()
+
+        // 起手看门狗：3 秒还没真正开始发送（没选模型、没连上），
+        // 就把标记复位，否则按钮会一直挂在"整理中"。
+        handoffWatch?.cancel()
+        handoffWatch = Task { [weak self] in
+            try? await Task.sleep(nanoseconds: 3_000_000_000)
+            guard let self, !Task.isCancelled else { return }
+            if self.handoffBuilding, !self.sending, !self.sendStarting {
+                self.handoffBuilding = false
+                self.toast = "没能开始整理，检查一下模型和连接"
+            }
+        }
+    }
+
+    /// 把这一轮回复拆成交接文档 + 源码两个文件，并挂到输入框附件区。
+    ///
+    /// 兜底策略（模型不照格式写的时候）：交接文档退成本地摘要、
+    /// 源码退成"从这段回复里扒代码块"。宁可少，也别给用户一个空文件。
+    private func materializeHandoffPack(at idx: Int) {
+        guard idx >= 0, idx < messages.count else { return }
+        let m = messages[idx]
+        // 发送失败时会留下「（没发出去）」，别把它做成交接文档
+        guard !m.failed else {
+            toast = "这次没发出去，等连上再点一次「生成交接」"
+            return
+        }
+        let reply = m.text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !reply.isEmpty else {
+            toast = "AI 没给出内容，再点一次「生成交接」试试"
+            return
+        }
+
+        let trip = currentSessionTitle.isEmpty ? "本次会话" : currentSessionTitle
+        let parts = Self.splitHandoffPack(reply)
+
+        // 交接正文
+        let aiBrief = (parts.handoff ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+        let brief = aiBrief.isEmpty ? buildHandoff() : aiBrief
+
+        // 源码正文：优先用 SOURCES 段；没有就从整段回复里扒代码块
+        var src = (parts.sources ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+        if src.isEmpty {
+            let blocks = Self.splitCodeBlocks(reply)
+            src = blocks.blocks.isEmpty ? "" : Self.reassemble(blocks).trimmingCharacters(in: .whitespacesAndNewlines)
+        }
+        let files = Self.countCodeBlocks(src)
+
+        let df = DateFormatter()
+        df.dateFormat = "yyyy-MM-dd HH:mm"
+
+        var doc = "# 交接：\(trip)\n\n"
+        doc += "> 由上一个 AI 整理于 \(df.string(from: Date()))\n"
+        if !src.isEmpty {
+            doc += "> 源码另附一份（同一个消息里的《源码-\(trip)》），要看实现直接用它。\n"
+        }
+        doc += "\n---\n\n"
+        doc += brief
+        doc += "\n"
+
+        var made: [AIFile] = []
+        if let rec = FileStore.writeText(title: "交接-\(trip)",
+                                        body: doc,
+                                        ext: "md",
+                                        sessionId: currentSessionId,
+                                        sessionTitle: currentSessionTitle) {
+            FileLibrary.shared.add(rec)
+            made.append(rec)
+        }
+
+        var srcDoc = ""
+        if !src.isEmpty {
+            srcDoc = "# 源码：\(trip)\n\n"
+            srcDoc += files > 0 ? "> 共 \(files) 个代码块。\n\n---\n\n" : "> 整理于 \(df.string(from: Date()))\n\n---\n\n"
+            srcDoc += src
+            srcDoc += "\n"
+            if let rec = FileStore.writeText(title: "源码-\(trip)",
+                                             body: srcDoc,
+                                             ext: "md",
+                                             sessionId: currentSessionId,
+                                             sessionTitle: currentSessionTitle) {
+                FileLibrary.shared.add(rec)
+                made.append(rec)
+            }
+        }
+
+        guard !made.isEmpty else {
+            toast = "文件没写成功，看看手机存储是不是满了"
+            return
+        }
+
+        // 挂到输入框附件区，只替换上一次的交接包
+        let added = made.compactMap { Attachment.file(from: $0.url).0 }
+        pending = pending.filter {
+            !($0.name.hasPrefix("交接-") || $0.name.hasPrefix("源码-"))
+        } + added
+
+        if input.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            input = "这是上一个 AI 的交接文档和源码，都在附件里。请接着做，别从头再问一遍。"
+        }
+
+        toast = src.isEmpty
+            ? "交接文档做好了，但 AI 这次没贴源码；已放到输入框"
+            : "交接文档 + 源码（\(files) 个代码块）都做好了，已放到输入框，点发送即可"
+    }
+
+    /// 从回复里切出 ===HANDOFF=== 和 ===SOURCES=== 两段。
+    ///
+    /// 模型不老实、标记缺一个的时候也要能认出另一半，
+    /// 所以不是"两个都有才解析"那种硬匹配。
+    private static func splitHandoffPack(_ s: String) -> (handoff: String?, sources: String?) {
+        let hTag = "===HANDOFF==="
+        let sTag = "===SOURCES==="
+        let h = s.range(of: hTag, options: .caseInsensitive)
+        let src = s.range(of: sTag, options: .caseInsensitive)
+
+        switch (h, src) {
+        case let (h?, s?):
+            if h.upperBound <= s.lowerBound {
+                return (String(s[h.upperBound..<s.lowerBound]), String(s[s.upperBound...]))
+            }
+            // 两段顺序反了：按标记各自切，别丢内容
+            return (String(s[s.upperBound..<h.lowerBound]), String(s[h.upperBound...]))
+        case let (h?, nil):
+            return (String(s[h.upperBound...]), nil)
+        case let (nil, s?):
+            return (String(s[..<s.lowerBound]), String(s[s.upperBound...]))
+        case (nil, nil):
+            return (s, nil)
+        }
+    }
+
+    /// 数一下源码文档里有多少个代码块（给人看的概览，不参与逻辑）
+    private static func countCodeBlocks(_ s: String) -> Int {
+        var n = 0
+        var pos = s.startIndex
+        while let r = s.range(of: "```", range: pos..<s.endIndex) {
+            n += 1
+            pos = r.upperBound
+        }
+        return n / 2
+    }
+
+    /// 生成交接包：**交接文档 + 源码**，两份都落进产物库，
+    /// 并直接挂到输入框的附件区 —— 用户点一下发送，两份东西一起送给下一个 AI。
+    ///
+    /// 2026-10-31 用户要求：「字改成生成交接，位置放在清空会话下面，
+    /// 点击生成交接以后，他会给我生成交接文档和源码，
+    /// 我直接二个东西都发送给下个 ai 他就能直接干活了」。
+    ///
+    /// 所以不再把摘要塞进输入框：那样得用户自己复制粘贴，几千字还会把
+    /// 输入区撑满。改成附件后，交接文档和源码天然是"两个文件"，
+    /// 转给谁都不用二次加工。
+    func prepareHandoff() {
+        // 先算源码，才知道交接文档结尾要不要提「另附源码」这件事
+        let src = buildSourceBundle()
+        let brief = buildHandoff(mentionSource: src.count > 0)
+        guard !brief.isEmpty else {
+            toast = "这个会话还没有内容，不用交接"
+            return
+        }
+        let trip = currentSessionTitle.isEmpty ? "本次会话" : currentSessionTitle
+
+        var made: [AIFile] = []
+
+        // ① 交接文档：目标 / 已定结论 / 进行到哪一步
+        if let rec = FileStore.writeText(title: "交接-\(trip)",
+                                        body: brief,
+                                        ext: "md",
+                                        sessionId: currentSessionId,
+                                        sessionTitle: currentSessionTitle) {
+            FileLibrary.shared.add(rec)
+            made.append(rec)
+        }
+
+        // ② 源码：对话里出现过的全部代码
+        if src.count > 0,
+           let rec = FileStore.writeText(title: "源码-\(trip)",
+                                         body: src.doc,
+                                         ext: "md",
+                                         sessionId: currentSessionId,
+                                         sessionTitle: currentSessionTitle) {
+            FileLibrary.shared.add(rec)
+            made.append(rec)
+        }
+
+        guard !made.isEmpty else {
+            toast = "文件没写成功，看看手机存储是不是满了"
+            return
+        }
+
         // 记到会话上，下次点还能看到上次生成的那份
         if let i = sessions.firstIndex(where: { $0.id == currentSessionId }) {
-            sessions[i].handoff = h
+            sessions[i].handoff = brief
             SessionStore.save(sessions)
         }
-        toast = "交接说明已放进输入框，确认后直接发送"
+
+        // 直接挂到输入框附件区。用户不用去产物面板里找，
+        // 也不用分别点两次分享 —— 点发送就是"两个东西一起发出去"。
+        //
+        // 只替换上一次生成的交接包（按文件名前缀认："交接-" / "源码-"），
+        // 不一把清空：用户手上可能还挂着别的附件（截图之类），
+        // 点一下交接就把它们弄没了会很恼火。
+        let added = made.compactMap { Attachment.file(from: $0.url).0 }
+        pending = pending.filter {
+            !($0.name.hasPrefix("交接-") || $0.name.hasPrefix("源码-"))
+        } + added
+
+        // 输入框空着就补一句引导语：AI 收到两个附件，还得知道要他干什么。
+        // 用户已经打了字就不动，免得把他写的覆盖掉。
+        if input.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            input = "这是上一个 AI 的交接文档和源码，都在附件里。请接着做，别从头再问一遍。"
+        }
+
+        if src.count > 0 {
+            toast = "已生成交接文档 + 源码（\(src.count) 段代码），已放到输入框，点发送即可"
+        } else {
+            toast = "已生成交接文档（这次对话没有代码，没生成源码），点发送即可"
+        }
+    }
+
+    /// 把产物挂到某个对话的输入框附件区（产物面板长按 →「添加到对话」）。
+    ///
+    /// 顺序很关键：`openSession` 会把 pending 清空（换对话就该从干净的输入区开始），
+    /// 所以必须**先切对话、再挂附件**，反过来的话刚挂上的会被清掉。
+    func attach(file: AIFile, to targetSessionId: String) {
+        guard sessions.contains(where: { $0.id == targetSessionId }) else { return }
+        guard let a = Attachment.file(from: file.url).0 else {
+            toast = "这个文件读不出来，没法添加"
+            return
+        }
+        if targetSessionId != currentSessionId {
+            openSession(targetSessionId)
+        }
+        // 同名附件只留一份：连点几次不该在输入框里堆出好几个一样的芯片
+        pending = pending.filter { $0.name != a.name } + [a]
+
+        let name = sessions.first(where: { $0.id == targetSessionId })?.displayTitle ?? "对话"
+        toast = "已添加到「\(name)」，去输入框点发送"
     }
 
     func renameSession(_ id: String, to title: String) {
@@ -991,6 +1470,16 @@ final class ChatStore: ObservableObject {
         // 这时候再 sync / archive 会写进一条已撤回的内容，必须挡掉。
         if Task.isCancelled { return }
         syncCurrentSession()
+
+        // 「生成交接」引发的那一轮回复：交给拆包逻辑处理，不做普通归档。
+        // 否则产物库里会多出一份跟交接包重复的 md，用户看到两个一样的东西。
+        if handoffBuilding {
+            handoffBuilding = false
+            handoffWatch?.cancel()
+            materializeHandoffPack(at: idx)
+            return
+        }
+
         // 回复完成，把它存成文件进「我的文件」。
         // 放在 syncCurrentSession 之后：那时标题已经从首条用户消息补齐，
         // 文件名才能是「中转站搭建」而不是「新对话」。
@@ -1020,27 +1509,21 @@ final class ChatStore: ObservableObject {
         let body = m.text.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !body.isEmpty else { return }
 
-        // 把回复拆成「正文」和「代码块」两部分
+        // 把回复拆成「正文」和「代码块」两部分（正文现在不写进文件，只用来判断）
         let parts = Self.splitCodeBlocks(body)
-        let prose = parts.prose.trimmingCharacters(in: .whitespacesAndNewlines)
         let codeCount = parts.blocks.count
 
-        // 判定标准：有代码块 → 是产物；没代码块但正文里有清单/步骤 → 也算
-        // 纯对话（"好了""可以""这是因为"）一律不存
-        let looksLikeDeliverable = codeCount > 0
-            || Self.hasDeliverableShape(prose)
-        guard looksLikeDeliverable else { return }
+        // 判定标准（2026-10-31 第二次收紧，用户原话：
+        // 「我不需要的是把 ai 的聊天记录都当成产物」）：
+        //   **只有带代码块 / 文件内容块才算产物。**
+        //
+        // 上一版还允许「有编号列表、出现'步骤''清单'字样」也算，
+        // 结果只要 AI 正常解释一件事（"分三步：1、… 2、…"），
+        // 整段聊天就被存成 md —— 判定太松，等于没判定。
+        // 这不是产物，这是聊天记录，聊天记录本来就在会话里。
+        guard codeCount > 0 else { return }
 
-        // 纯解释 + 代码时，正文里只保留「结论那几句」，不要整段复述
-        let keptProse: String = {
-            if codeCount == 0 { return prose }
-            // 有代码时正文只留前 400 字（通常是"改这里/原因是"），
-            // 避免把大段复述也写进文件
-            if prose.count <= 400 { return prose }
-            return String(prose.prefix(400)) + "\n\n…（说明过长已省略，正文以代码为准）"
-        }()
-
-        // 找这条回复对应的那个问题，做成 md 的标题
+        // 找这条回复对应的那个问题，做成文件标题
         var question = ""
         var i = idx - 1
         while i >= 0 {
@@ -1048,20 +1531,16 @@ final class ChatStore: ObservableObject {
             i -= 1
         }
 
+        // 文件里**只放产物本身**：一行标题 + 代码块。
+        // 模型名、时间、解释性正文全部不写进去 ——
+        // 那些是对话过程，写进文件会让产物看起来还是聊天记录。
+        // 时间在文件名里已经有了（-20261031-001030），不重复。
         var doc = ""
         if !question.isEmpty {
             doc += "# \(question.replacingOccurrences(of: "\n", with: " "))\n\n"
         }
-        doc += "> 模型：\(m.model.isEmpty ? currentModel : m.model)\n"
-        doc += "> 时间：\(Self.stampText())\n\n---\n\n"
-        if !keptProse.isEmpty {
-            doc += keptProse
-            doc += "\n\n"
-        }
-        if codeCount > 0 {
-            doc += Self.reassemble(parts)
-            doc += "\n"
-        }
+        doc += Self.reassemble(parts)
+        doc += "\n"
 
         let title = question.isEmpty
             ? (currentSessionTitle.isEmpty ? "产出" : currentSessionTitle)
@@ -1117,8 +1596,12 @@ final class ChatStore: ObservableObject {
         return out
     }
 
-    /// 没有代码块时，判断正文是不是「交付物形状」：
-    /// 有编号列表 / 步骤 / 文件路径 / 明确给出可复制内容。
+    /// 没有代码块时，判断正文是不是「交付物形状」。
+    ///
+    /// ⚠️ 2026-10-31 起**已停用**（archiveReply 只认代码块）。
+    /// 保留在这里只是为了说明教训：靠「出现'步骤''清单'字样」来判断产物，
+    /// 任何一段正常解释都会被误判。真要做这层判断得靠模型返回结构化标记，
+    /// 不能靠关键词命中。
     private static func hasDeliverableShape(_ s: String) -> Bool {
         guard s.count >= 80 else { return false }   // 太短的一律当对话
         let markers = ["1. ", "1、", "步骤", "清单", "保存为", "文件名",
