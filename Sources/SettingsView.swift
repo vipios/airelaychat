@@ -544,7 +544,7 @@ struct SettingsView: View {
         } header: {
             Text("设备")
         } footer: {
-            Text("卡住的时候点一下就能重启，不用进路由器后台。\n重启后约 40 秒自动恢复，App 会自己重新连上。")
+            Text("重启指令直接发给路由器，**不经过中转站** —— 中转站卡死、打不开后台的时候照样能重启。\n重启后约 40 秒自动恢复，App 会自己重新连上。")
         }
     }
 
@@ -585,7 +585,7 @@ struct SettingsView: View {
         // 探过就用它；没探过就先 bootstrap 一次，否则一定是空的。
         if store.base == nil { await store.bootstrap(loadModels: false) }
         guard let b = store.base else {
-            devMsg = "还没连上中转站，没法读取设备状态"
+            devMsg = "中转站暂时连不上（后台可能打不开），但「重启路由器」照样能用 —— 那条指令是直连路由器的。"
             return
         }
         devLoading = true
@@ -603,14 +603,51 @@ struct SettingsView: View {
             devMsg = "还差后台密钥，填了才能重启"
             return
         }
+        rebooting = true
+        defer { rebooting = false }
+
+        // ── 第一步：走路由器的独立通道（不经过中转站）──
+        //
+        // 这条路径的意义：中转站是最会卡死的那个东西，路由卡了想重启、
+        // 中转站也卡着，指令就永远发不出去。uhttpd 是 C 进程，和中转站
+        // 无关，中转站整个停掉也能应答（已实测）。
+        devMsg = "正在找路由器…"
+        var hosts = settings.lanCandidates
+        if !settings.bootHost.isEmpty { hosts.insert(settings.bootHost, at: 0) }
+
+        if let host = await BootChannel.discover(candidates: hosts) {
+            settings.bootHost = host          // 记住这条通的路，下次先用它
+            do {
+                try await BootChannel.reboot(host: host, key: settings.accessKey)
+                devMsg = "重启指令已直接从路由器发出，约 40 秒后恢复…"
+                waitingBack = true
+                store.markRebooting()
+                Task {
+                    try? await Task.sleep(nanoseconds: 45_000_000_000)
+                    waitingBack = false
+                    store.clearRebooting()
+                    await store.bootstrap()
+                    await loadDevice()
+                    if devStatus != nil { devMsg = "设备已恢复" }
+                }
+                return
+            } catch {
+                // 通道在、但指令被拒（多半是密钥不对），如实报出来，别偷偷退回中转站
+                if let e = error as? BootError, case .badKey = e {
+                    devMsg = "后台密钥不对，重启被路由器拒绝"
+                    return
+                }
+                devMsg = "直连通道没发成功，改走中转站…"
+            }
+        }
+
+        // ── 第二步：退回到中转站（在外面没开 ZeroTier 时只能靠它）──
         guard let b = store.base else {
-            devMsg = "还没连上中转站，没法重启"
+            devMsg = "连不上路由器：不在家里 WiFi 时请开 ZeroTier，或先用网页后台重启"
             return
         }
-        rebooting = true
-        devMsg = nil
-        defer { rebooting = false }
         do {
+            devMsg = "正在通过中转站发重启指令…"
             try await RelayClient.shared.rebootDevice(base: b, key: settings.accessKey)
             // 指令已受理，设备 2 秒后真的重启，接下来约 40 秒会连不上。
             // 这里不干等，而是给个软提示 + 60 秒后自动刷一次状态，

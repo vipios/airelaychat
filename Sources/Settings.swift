@@ -120,6 +120,12 @@ final class Settings: ObservableObject {
     /// 现在改成记一池：每次真正连通都把地址学进来，换网段后旧地址失效，
     /// 新地址还能从池子里命中，不必重新猜。
     @Published var lanPool: [String] { didSet { store() } }
+    /// 上次「重启通道」走通的地址（纯 IP，不带端口）。
+    ///
+    /// 2026-10-31：重启改成直连路由器的 uhttpd（`/cgi-bin/airboot`），
+    /// 不经过中转站。这条通道和中转站用的是**不同端口**（80 vs 8080），
+    /// 能连通中转站的地址不一定能连通它，所以单独记一份，下次优先用它。
+    @Published var bootHost: String { didSet { store() } }
     /// 上次「在外」成功用过的公网地址（域名或裸 IPv6），同样用于冷启动秒连。
     @Published var lastPubBase: String { didSet { store() } }
     @Published var gatewayKey: String { didSet { store() } }
@@ -148,6 +154,9 @@ final class Settings: ObservableObject {
         /// 导致**整个设置解码失败** —— 用户的 API Key、模型选择、来源配置全丢，
         /// App 会像刚装一样要重新配一遍。可选类型缺 key 时自动变 nil，旧数据安全。
         var lanPool: [String]?
+        /// 上次走通的重启通道地址（纯 IP）。
+        /// 同样必须可选：后加字段，老 JSON 里没有，声明成非可选会让整个设置解码失败。
+        var bootHost: String?
         var gatewayKey: String
         var homeModel: String
         var awayModel: String
@@ -178,7 +187,7 @@ final class Settings: ObservableObject {
         if s == nil, let old = UserDefaults.standard.data(forKey: oldKey),
            let v1 = try? JSONDecoder().decode(StoredV1.self, from: old) {
             s = Stored(lanHost: v1.lanHost, publicDomain: nil, publicAddrs: v1.publicAddrs,
-                       lastLanBase: nil, lastPubBase: nil, lanPool: nil,
+                       lastLanBase: nil, lastPubBase: nil, lanPool: nil, bootHost: nil,
                        gatewayKey: v1.gatewayKey, homeModel: v1.homeModel,
                        awayModel: v1.awayModel, port: v1.port, gistId: v1.gistId,
                        gistOwner: v1.gistOwner, providers: nil, activeProvider: nil)
@@ -205,6 +214,7 @@ final class Settings: ObservableObject {
         } else {
             lanPool = []
         }
+        bootHost = s?.bootHost ?? ""
         gatewayKey = s?.gatewayKey ?? ""
         homeModel = s?.homeModel ?? ""
         awayModel = s?.awayModel ?? ""
@@ -227,6 +237,7 @@ final class Settings: ObservableObject {
         let s = Stored(lanHost: lanHost, publicDomain: publicDomain, publicAddrs: publicAddrs,
                        lastLanBase: lastLanBase, lastPubBase: lastPubBase,
                        lanPool: lanPool,
+                       bootHost: bootHost,
                        gatewayKey: gatewayKey,
                        homeModel: homeModel, awayModel: awayModel, port: port,
                        gistId: gistId, gistOwner: gistOwner,
