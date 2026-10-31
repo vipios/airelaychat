@@ -85,6 +85,8 @@ struct AdminWebView: UIViewRepresentable {
     let key: String
     /// 每次切到这个 Tab 时 +1，用来触发 reload
     let reloadTick: Int
+    /// 页面是否已经画出第一帧。用来盖住白屏期（2026-10-31 加）。
+    @Binding var loading: Bool
 
     func makeCoordinator() -> Coordinator { Coordinator() }
 
@@ -120,6 +122,7 @@ struct AdminWebView: UIViewRepresentable {
         wv.scrollView.contentInsetAdjustmentBehavior = .never
         wv.isOpaque = false
         wv.backgroundColor = UIColor(red: 0.973, green: 0.973, blue: 0.973, alpha: 1)
+        context.coordinator.loadingBinding = $loading
         context.coordinator.load(wv, base: base, tick: reloadTick)
         return wv
     }
@@ -143,16 +146,54 @@ struct AdminWebView: UIViewRepresentable {
         private var loadedURL: String = ""
         private var lastTick: Int = -1
         private var loadedKey: String = ""
+        /// 由 makeUIView 塞进来，用来把加载状态回传给 SwiftUI
+        var loadingBinding: Binding<Bool>?
+
+        private func setLoading(_ v: Bool) {
+            Task { @MainActor in self.loadingBinding?.wrappedValue = v }
+        }
 
         func load(_ wv: WKWebView, base: String, tick: Int) {
+            // base 可能还没探测出来（App 刚启动时 store.base 是 nil，
+            // 退化成 settings.lanBase 也可能是空串）。空串拼出来的 "admin"
+            // 不是合法 URL，这时候直接跳过，等 base 有了再自然触发一次。
+            guard !base.isEmpty else { return }
             let url = base.hasSuffix("/") ? base + "admin" : base + "/admin"
-            let changedKey = (loadedKey != base)
-            guard tick != lastTick || loadedURL != url || changedKey else { return }
+            let changedBase = (loadedKey != base)
+            guard tick != lastTick || loadedURL != url || changedBase else { return }
             lastTick = tick
             loadedURL = url
             loadedKey = base
             guard let u = URL(string: url) else { return }
-            wv.load(URLRequest(url: u, cachePolicy: .reloadIgnoringLocalCacheData, timeoutInterval: 20))
+
+            // 2026-10-31 用户要求「进后台面板直接就显示，别等」：
+            // 原来是 .reloadIgnoringLocalCacheData —— 每次进入都丢掉全部缓存
+            // （后台首页 900 多 KB 的 HTML + JS + CSS），手机上重新下载 + 重新
+            // 解析执行就是那几秒白等。
+            //
+            // 改成 .useProtocolCachePolicy：有缓存先用缓存秒开，同时按服务端
+            // 的 Cache-Control / ETag 去校验。
+            //
+            // 为什么不会"看到旧数据"：后台的数据全是 XHR/fetch 拉的，
+            // 那部分本来就带 no-store，网页壳子旧一点完全无感。
+            // 真正需要强制刷新时，用户点顶栏那个刷新按钮（tick += 1）走
+            // 下面的忽略缓存分支。
+            let policy: NSURLRequest.CachePolicy =
+                (tick == 0) ? .useProtocolCachePolicy : .reloadIgnoringLocalCacheData
+            setLoading(true)
+            wv.load(URLRequest(url: u, cachePolicy: policy, timeoutInterval: 20))
+        }
+
+        func webView(_ webView: WKWebView, didStartProvisionalNavigation navigation: WKNavigation!) {
+            setLoading(true)
+        }
+
+        func webView(_ webView: WKWebView, didFail navigation: WKNavigation!, withError error: Error) {
+            setLoading(false)
+        }
+
+        func webView(_ webView: WKWebView, didFailProvisionalNavigation navigation: WKNavigation!, withError error: Error) {
+            setLoading(false)
         }
 
         /// 后台有可能弹出 target=_blank 的链接（比如复制 Key 的说明页），
@@ -177,6 +218,7 @@ struct AdminWebView: UIViewRepresentable {
         /// 而是复用已经渲染好的页面：读 body 的纯文本，如果开头像 JSON 错误，
         /// 就把整页替换成一句人话，并把原始内容折叠在下面备查。
         func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
+            setLoading(false)
             let js = """
             (function(){
               try {

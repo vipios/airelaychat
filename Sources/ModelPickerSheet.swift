@@ -328,7 +328,7 @@ struct ModelPickerSheet: View {
     private func modelRow(_ m: ModelItem) -> some View {
         let selected = m.id == store.currentModel
         return Button {
-            store.currentModel = m.id
+            store.selectModel(m.id)
             onClose()
         } label: {
             HStack(spacing: 10) {

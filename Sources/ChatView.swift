@@ -27,6 +27,17 @@ struct ChatView: View {
     @State private var healthTimer: Timer?
 
     @State private var drawerOpen = false
+    /// 去过哪些 Tab。
+    ///
+    /// 2026-10-31 为了让后台面板"进去就显示"改了 Tab 的承载方式：
+    /// 从 switch（切走即销毁）改成 ZStack 常驻。但常驻不能一上来就全建 ——
+    /// 那样 App 启动、用户还在聊天页时就会去加载后台那个 900KB 的网页，
+    /// 跟首屏抢网络，反而更慢。
+    ///
+    /// 所以记一下：**去过一次之后**才让它常驻。
+    /// 第一次进后台仍然要等它加载（没办法，那是真没加载过），
+    /// 但从第二次起就是瞬间显示。
+    @State private var visitedTabs: Set<MainTab> = [.tasks]
     /// 抽屉里的「我的文件」。和抽屉共用外层弹层，抽屉自己不挂 sheet。
     @State private var showFiles = false
     /// 点产物卡片 → 预览；预览里点分享 → 换成分享面板
@@ -135,8 +146,25 @@ struct ChatView: View {
         .fileImporter(isPresented: $showFilePicker,
                       allowedContentTypes: [.item],
                       allowsMultipleSelection: true) { result in
-            if case .success(let urls) = result {
+            // 2026-10-31 修「选了文件点确定没反应」：
+            // 原来只处理 .success，用户取消 / 权限失败 / 沙盒读不到 全都静默。
+            // 尤其是「文件」App 里某些位置（iCloud 未下载、第三方网盘占位）
+            // 会直接走 .failure，界面一动不动，看起来就是"点了确定没反应"。
+            switch result {
+            case .success(let urls):
+                guard !urls.isEmpty else {
+                    store.toast = "没选到文件"
+                    return
+                }
                 for u in urls { store.addFile(u) }
+            case .failure(let err):
+                // 用户主动取消也会走到这里，那种不用提示
+                let ns = err as NSError
+                if ns.domain == NSCocoaErrorDomain,
+                   ns.code == CocoaError.Code.userCancelled.rawValue {
+                    return
+                }
+                store.toast = "打不开这个位置：\(err.localizedDescription)"
             }
         }
         // 单参数闭包是 iOS 16 写法，双参数要 iOS 17
@@ -173,22 +201,104 @@ struct ChatView: View {
         withAnimation(.spring(response: 0.34, dampingFraction: 0.88)) { drawerOpen = false }
     }
 
+    /// 聊天页本体（原 switch 里 .tasks 那一段），抽出来给 ZStack 用。
+    private var taskTab: some View {
+        VStack(spacing: 0) {
+            topBar
+            // 换过来源/账号 → 提示可以把上一个 AI 的进度交接过来。
+            // 2026-10-31 用户要求「换账号别断开记忆」：光有菜单入口不够，
+            // 用户换完来源根本不会想起来去点菜单，得主动递到眼前。
+            if store.needsHandoffHint { handoffBanner }
+            messagesArea
+            if let err = store.errorText { errorBanner(err) }
+            if !store.pending.isEmpty { pendingStrip }
+            inputBar
+        }
+    }
+
+    /// 「换个 AI 接着聊」提示条。点右边按钮 → 摘要进输入框。
+    private var handoffBanner: some View {
+        HStack(spacing: 10) {
+            Image(systemName: "arrow.triangle.swap")
+                .font(.system(size: 13, weight: .medium))
+                .foregroundStyle(Color.accentColor)
+            VStack(alignment: .leading, spacing: 1) {
+                Text("已经换成另一个 AI 了")
+                    .font(.system(size: 12.5, weight: .medium))
+                Text("它还不知道前面做到哪了")
+                    .font(.system(size: 11))
+                    .foregroundStyle(.secondary)
+            }
+            Spacer(minLength: 4)
+            Button {
+                store.prepareHandoff()
+                store.needsHandoffHint = false
+            } label: {
+                Text("交接")
+                    .font(.system(size: 12, weight: .medium))
+                    .foregroundStyle(.white)
+                    .padding(.horizontal, 12)
+                    .padding(.vertical, 6)
+                    .background(Color.accentColor)
+                    .clipShape(Capsule())
+            }
+            .buttonStyle(.plain)
+
+            Button {
+                store.needsHandoffHint = false
+            } label: {
+                Image(systemName: "xmark")
+                    .font(.system(size: 10, weight: .semibold))
+                    .foregroundStyle(.secondary)
+                    .frame(width: 22, height: 22)
+            }
+            .buttonStyle(.plain)
+        }
+        .padding(.horizontal, 12)
+        .padding(.vertical, 8)
+        .background(Theme.card)
+        .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
+        .padding(.horizontal, 10)
+        .padding(.bottom, 6)
+    }
+
     // MARK: - 主列
 
     private var mainColumn: some View {
         VStack(spacing: 0) {
-            switch store.tab {
-            case .tasks:
-                topBar
-                messagesArea
-                if let err = store.errorText { errorBanner(err) }
-                if !store.pending.isEmpty { pendingStrip }
-                inputBar
-            case .admin:
-                AdminTabPage(store: store)
-            case .mine:
-                MineTabPage(store: store)
+            // 三个 Tab 用 ZStack 常驻，**不要用 switch**。
+            //
+            // 2026-10-31 用户要求「进入后台面板页面直接就显示，现在等得太久」：
+            // 原来写的是 switch store.tab，切走时 SwiftUI 会把 AdminTabPage
+            // 整个拆掉 —— 里面的 WKWebView 跟着销毁，@State tick 归零。
+            // 切回来就是"新建 WebView + tick 从 0 开始"，必然重新全量加载
+            // 那个 900 多 KB 的后台首页，还要重新执行里面的 JS。
+            //
+            // 改成常驻后：WebView 只在第一次进入时建一次，之后切回来
+            // 页面还在、滚动位置还在，等于零等待。
+            // 用 opacity + allowsHitTesting 而不是 hidden()，因为 hidden
+            // 会让布局塌掉，WebView 尺寸被压成 0，回来又要重排。
+            //
+            // 但「常驻」不能一上来就建 —— 那会在 App 启动、用户还在聊天页时
+            // 就去加载后台网页，和首屏抢网络。所以用 visitedTabs 记录：
+            // 只有去过一次之后才放进 ZStack 常驻，没去过就不建。
+            ZStack {
+                taskTab
+                    .opacity(store.tab == .tasks ? 1 : 0)
+                    .allowsHitTesting(store.tab == .tasks)
+                if visitedTabs.contains(.admin) {
+                    AdminTabPage(store: store)
+                        .opacity(store.tab == .admin ? 1 : 0)
+                        .allowsHitTesting(store.tab == .admin)
+                }
+                if visitedTabs.contains(.mine) {
+                    MineTabPage(store: store)
+                        .opacity(store.tab == .mine ? 1 : 0)
+                        .allowsHitTesting(store.tab == .mine)
+                }
             }
+            .onAppear { visitedTabs.insert(store.tab) }
+            .onChange(of: store.tab) { t in visitedTabs.insert(t) }
             // 底部导航常驻。
             // 之前后台面板页把它藏起来（想让网页全屏），代价是进去以后
             // 想切到「我的」只能先左滑回聊天页 —— 三个 Tab 里少一个，
@@ -203,21 +313,43 @@ struct ChatView: View {
         .simultaneousGesture(
             DragGesture(minimumDistance: 20)
                 .onEnded { g in
-                    guard !drawerOpen else { return }
                     let horizontal = abs(g.translation.height) < 70
-                    if store.tab == .tasks {
-                        // 聊天页：左缘右滑 → 出抽屉
-                        if g.startLocation.x < 30, horizontal,
-                           g.translation.width > 70 {
-                            openDrawer()
+                    guard horizontal else { return }
+
+                    // 2026-10-31 用户要求「再加一个右划返回上一页，就像左滑那种」。
+                    // 之前的规则是单向的（后台/我的页只能左滑回聊天），
+                    // 用户从这两页往右划没反应，和 iOS 系统手势直觉相反。
+                    //
+                    // 现在按「当前在哪一层」决定返回目标，左右都认：
+                    //   抽屉开着        → 右滑关抽屉（回到聊天页本体）
+                    //   后台面板/我的   → 左右滑都回聊天页
+                    //   聊天页原点      → 只在左缘右滑才出抽屉（防误触）
+
+                    if drawerOpen {
+                        // 抽屉铺在聊天页上面，它的"上一页"就是聊天页。
+                        // 这里只听右滑：抽屉本体里还有列表要上下滚，
+                        // 左滑留着不抢，避免和列表滑动打架。
+                        if g.translation.width > 70 { closeDrawer() }
+                        return
+                    }
+
+                    if store.tab != .tasks {
+                        // 后台面板 / 我的：左右都能回聊天页
+                        // （左滑是原有行为，右滑是这次新增的）
+                        if g.translation.width < -70 || g.translation.width > 70 {
+                            inputFocused = false
+                            withAnimation(.easeInOut(duration: 0.2)) {
+                                store.tab = .tasks
+                            }
                         }
-                    } else if horizontal, g.translation.width < -70 {
-                        // 后台面板 / 我的：左滑返回聊天页。
-                        // 用户要求「不管到哪个界面都应该左滑返回上个界面」。
-                        inputFocused = false
-                        withAnimation(.easeInOut(duration: 0.2)) {
-                            store.tab = .tasks
-                        }
+                        return
+                    }
+
+                    // 聊天页：左缘右滑 → 出抽屉。
+                    // 保持 x < 30 的边缘判定，否则在消息列表中间随手一划就弹抽屉。
+                    // 非左缘的右滑在聊天页不做事 —— 聊天页已经是根，没有"上一页"。
+                    if g.startLocation.x < 30, g.translation.width > 70 {
+                        openDrawer()
                     }
                 }
         )
@@ -341,6 +473,13 @@ struct ChatView: View {
                 .buttonStyle(.plain)
 
                 Menu {
+                    Button {
+                        store.prepareHandoff()
+                        showModelPicker = false
+                    } label: {
+                        Label("生成交接说明（换账号续聊）", systemImage: "arrow.triangle.swap")
+                    }
+                    Divider()
                     Button { store.syncCurrentSession() } label: {
                         Label("保存会话", systemImage: "tray.and.arrow.down")
                     }
@@ -471,18 +610,57 @@ struct ChatView: View {
                 Spacer(minLength: 48)
                 VStack(alignment: .trailing, spacing: 6) {
                     attachmentsView(msg)
-                    if !msg.text.isEmpty || msg.attachments.isEmpty {
-                        Text(msg.text.isEmpty ? " " : msg.text)
-                            .font(.system(size: 15.5))
-                            .foregroundStyle(.primary)
-                            .multilineTextAlignment(.leading)
-                            .textSelection(.enabled)
-                            .padding(.horizontal, 14)
-                            .padding(.vertical, 10)
-                            .background(Theme.card)
-                            .clipShape(RoundedRectangle(cornerRadius: 18, style: .continuous))
-                            .shadow(color: Color.black.opacity(0.045), radius: 5, y: 1)
+                    if msg.recalled {
+                        // 2026-10-31 撤回功能：撤回后不直接消失。
+                        // 用户要能看见「我撤过什么」，否则会怀疑自己到底发没发出去。
+                        // 所以保留位置、灰显、加删除线，并标一行「已撤回」。
+                        HStack(spacing: 5) {
+                            Image(systemName: "arrow.uturn.backward")
+                                .font(.system(size: 10, weight: .semibold))
+                            Text(msg.text.isEmpty ? "附件已撤回" : msg.text)
+                                .font(.system(size: 15.5))
+                                .strikethrough(true, color: .secondary)
+                                .lineLimit(3)
+                        }
+                        .foregroundStyle(.secondary)
+                        .multilineTextAlignment(.leading)
+                        .padding(.horizontal, 14)
+                        .padding(.vertical, 10)
+                        .background(Theme.card.opacity(0.5))
+                        .overlay(
+                            RoundedRectangle(cornerRadius: 18, style: .continuous)
+                                .strokeBorder(Color.secondary.opacity(0.25),
+                                              style: StrokeStyle(lineWidth: 1, dash: [4, 3]))
+                        )
+                        .clipShape(RoundedRectangle(cornerRadius: 18, style: .continuous))
+
+                        // 撤错了怎么办：点一下这条灰掉的消息，把原文填回输入框。
+                        // 为什么不给独立按钮：撤回是个小概率手滑的操作，
+                        // 再挂一个按钮上去会让这条灰条变得比正常消息还热闹。
+                        .onTapGesture { store.recallAndRestore(msg) }
+                    } else if !msg.text.isEmpty || msg.attachments.isEmpty {
+                        // 2026-10-31 换成 SelectableText：
+                        // 用户要「长按弹窗包括所有」+「文字上能任意选词复制」，
+                        // SwiftUI 原生 Text 满足不了（两个手势互斥），
+                        // 所以改用 UITextView 底层实现，把撤回塞进系统选择菜单里。
+                        SelectableText(
+                            text: msg.text.isEmpty ? " " : msg.text,
+                            onRecall: { store.recall(msg) },
+                            onRecallAndEdit: { store.recallAndRestore(msg) }
+                        )
+                        .padding(.horizontal, 14)
+                        .padding(.vertical, 10)
+                        .background(Theme.card)
+                        .clipShape(RoundedRectangle(cornerRadius: 18, style: .continuous))
+                        .shadow(color: Color.black.opacity(0.045), radius: 5, y: 1)
                     }
+
+                    // 撤回入口说明（2026-10-31 最终形态）：
+                    // 用户先要"气泡下面加个小图标"，随后又要求
+                    // 「长按弹窗里包括所有 + 文字能任意选词复制」。
+                    // 两者取长按菜单那版：一个弹窗里既有「拷贝/全选/查询」
+                    // 也有「撤回/撤回并重新编辑」，比在每条消息下面挂图标更省地方。
+                    // 所以这里不再画图标，入口在 SelectableText 的菜单里。
                 }
             }
         } else {
@@ -876,8 +1054,9 @@ struct ChatView: View {
         }
         guard store.canSend else { return }
         inputFocused = false
+        // send() 现在自己建 Task（为了撤回能掐断），所以这里不再包 Task。
+        store.send()
         Task {
-            await store.send()
             // 发完立刻探一次灯，让用户马上看到通没通
             await store.pingNow()
         }
@@ -1013,6 +1192,10 @@ private struct AdminTabPage: View {
     @State private var tick = 0
     @State private var editingKey = false
     @State private var keyDraft = ""
+    /// 网页是否还在加载。用来盖住白屏期（2026-10-31 加）。
+    @State private var webLoading = true
+    /// 是否已经成功载入过一次。用来区分「首次进入」和「切回来」。
+    @State private var everLoaded = false
 
     private var base: String {
         // 优先用当前实际在用的地址：在家是内网、在外是域名
@@ -1066,10 +1249,32 @@ private struct AdminTabPage: View {
             // 底部 Tab 已经常驻，网页不能再 ignoresSafeArea(.bottom)：
             // 那样网页最后一行会钻到 Tab 栏底下点不到。
             // 这里让它只铺到 Tab 之上，四周留 12 的圆角卡片感，和演示图一致。
-            AdminWebView(base: base, key: key, reloadTick: tick)
+            AdminWebView(base: base, key: key, reloadTick: tick, loading: $webLoading)
                 .clipShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
                 .padding(.horizontal, 10)
                 .padding(.bottom, 8)
+                // 加载态盖在网页上。为什么不直接用 ProgressView 顶掉 WebView：
+                // 顶掉会让 WebView 从视图树里消失、尺寸归零，回来又得重排重绘。
+                // 这里用 overlay 叠一层，WebView 始终在位。
+                .overlay {
+                    if webLoading && !everLoaded {
+                        VStack(spacing: 10) {
+                            ProgressView()
+                            Text("正在载入后台…")
+                                .font(.system(size: 12))
+                                .foregroundStyle(.secondary)
+                        }
+                        .frame(maxWidth: .infinity, maxHeight: .infinity)
+                        .background(Theme.page)
+                        .clipShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
+                        .padding(.horizontal, 10)
+                        .padding(.bottom, 8)
+                        .allowsHitTesting(false)
+                    }
+                }
+                .onChange(of: webLoading) { v in
+                    if !v { everLoaded = true }
+                }
         }
         .background(Theme.page)
         .alert("后台管理密钥", isPresented: $editingKey) {

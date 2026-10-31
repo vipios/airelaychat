@@ -151,9 +151,16 @@ enum AttachmentMaker {
 
     // MARK: 普通文件
 
-    /// 按类型分派：文本读内容、PDF 抽文字、其它只记名字。
-    /// 认不出的格式也照样能发 —— 用户至少能问「这个文件是什么」。
-    static func file(from url: URL) -> Attachment? {
+    /// 按类型分派：文本读内容、PDF 抽文字、图片视频各自处理。
+    ///
+    /// ⚠️ 2026-10-31 修「选了文件点确定没反应」（用户报的第二个问题）：
+    ///   原来认不出的格式返回 `payload: ""`，附件照样进了待发列表，但内容全空。
+    ///   用户看到的就是「点了确定，什么也没发生」——既没提示，发出去 AI 也读不到。
+    ///
+    /// 现在第二个返回值带一句人话说明，调用方会弹 toast。
+    /// 认不出内容的**照样能发**（用户至少能问「这个文件是什么」），
+    /// 但要先告诉用户「内容是读不到的，只传了文件名」。
+    static func file(from url: URL) -> (Attachment?, String?) {
         let name = url.lastPathComponent
         let ext = url.pathExtension.lowercased()
 
@@ -166,10 +173,11 @@ enum AttachmentMaker {
         // 从「文件」里选到的图片也当图片处理
         if ["jpg", "jpeg", "png", "heic", "heif", "webp", "gif"].contains(ext),
            let d = try? Data(contentsOf: url), let a = image(from: d, name: name) {
-            return a
+            return (a, nil)
         }
         if ["mp4", "mov", "m4v"].contains(ext) {
-            return video(from: url, name: name).0
+            let (a, err) = video(from: url, name: name)
+            return (a, err)
         }
 
         let textExts: Set<String> = ["txt", "md", "markdown", "json", "csv", "tsv", "xml",
@@ -181,9 +189,13 @@ enum AttachmentMaker {
             if s.count > maxTextChars {
                 s = String(s.prefix(maxTextChars)) + "\n\n…（文件太长，已截断）"
             }
-            return Attachment(kind: .text, name: name, byteSize: size,
-                              payload: s, mime: "text/plain",
-                              thumb: nil, videoThumb: nil, duration: 0)
+            // 文本读到但一个字符都没有（空文件/解不开的编码）也要说清楚
+            if s.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                return (nil, "「\(name)」是空文件，没什么可发的")
+            }
+            return (Attachment(kind: .text, name: name, byteSize: size,
+                               payload: s, mime: "text/plain",
+                               thumb: nil, videoThumb: nil, duration: 0), nil)
         }
 
         if ext == "pdf", var s = pdfText(url) {
@@ -191,15 +203,31 @@ enum AttachmentMaker {
                 s = String(s.prefix(maxTextChars)) + "\n\n…（文件太长，已截断）"
             }
             if !s.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-                return Attachment(kind: .document, name: name, byteSize: size,
-                                  payload: s, mime: "application/pdf",
-                                  thumb: nil, videoThumb: nil, duration: 0)
+                return (Attachment(kind: .document, name: name, byteSize: size,
+                                   payload: s, mime: "application/pdf",
+                                   thumb: nil, videoThumb: nil, duration: 0), nil)
             }
+            // 扫描件没有文字层，抽不出来
+            return (Attachment(kind: .binary, name: name, byteSize: size,
+                               payload: binaryNote(name, size), mime: "application/pdf",
+                               thumb: nil, videoThumb: nil, duration: 0),
+                    "「\(name)」是扫描版 PDF，取不到文字，只把文件名发给 AI 了")
         }
 
-        return Attachment(kind: .binary, name: name, byteSize: size,
-                          payload: "", mime: "application/octet-stream",
-                          thumb: nil, videoThumb: nil, duration: 0)
+        // 认不出内容的格式（deb / ipa / zip / 各类二进制）：
+        // 不返回 nil —— nil 会让 addFile 只弹「读取失败」，用户更懵。
+        // 返回一个带说明的附件，至少 AI 知道有这么个文件。
+        return (Attachment(kind: .binary, name: name, byteSize: size,
+                           payload: binaryNote(name, size), mime: "application/octet-stream",
+                           thumb: nil, videoThumb: nil, duration: 0),
+                "「\(name)」是二进制文件，AI 读不到内容，只发了文件名和大小")
+    }
+
+    /// 二进制文件给 AI 的一句说明，替掉原来那个空 payload。
+    private static func binaryNote(_ name: String, _ size: Int) -> String {
+        let kb = max(1, size / 1024)
+        let human = kb >= 1024 ? String(format: "%.1f MB", Double(kb) / 1024.0) : "\(kb) KB"
+        return "［附件：\(name)，\(human)。二进制文件，正文无法作为文本读取。］"
     }
 
     static func readText(_ url: URL) -> String? {

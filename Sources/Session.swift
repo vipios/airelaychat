@@ -51,12 +51,24 @@ struct StoredMessage: Codable, Hashable {
     var text: String
     var model: String
     var failed: Bool
+    /// 是否被撤回。
+    ///
+    /// 2026-10-31 加：撤回必须能跨重启保持。
+    /// 之前只标在内存里的 ChatMessage 上，一旦 syncCurrentSession 落盘
+    /// 就丢了标记，重启 App 被撤回的消息会"复活"重新出现在历史里 ——
+    /// 那等于撤回没生效。
+    ///
+    /// 给默认值 false 是为了兼容旧数据：老 sessions.json 里没有这个字段，
+    /// Codable 解码时会用默认值补上，不会因为缺 key 而整份历史解析失败。
+    var recalled: Bool = false
 
-    init(role: String, text: String, model: String = "", failed: Bool = false) {
+    init(role: String, text: String, model: String = "", failed: Bool = false,
+         recalled: Bool = false) {
         self.role = role
         self.text = text
         self.model = model
         self.failed = failed
+        self.recalled = recalled
     }
 
     init(_ m: ChatMessage) {
@@ -64,6 +76,7 @@ struct StoredMessage: Codable, Hashable {
         text = m.text
         model = m.model
         failed = m.failed
+        recalled = m.recalled
     }
 
     /// 还原成界面用的消息。附件不再保留，但给个可见的痕迹，
@@ -71,6 +84,7 @@ struct StoredMessage: Codable, Hashable {
     func toChatMessage() -> ChatMessage {
         var msg = ChatMessage(role: role, text: text, model: model)
         msg.failed = failed
+        msg.recalled = recalled
         return msg
     }
 }
@@ -83,6 +97,17 @@ struct Session: Codable, Identifiable, Hashable {
     var updatedAt: Date = Date()
     /// 归属的自定义分组。nil = 未分组（按时间归档）
     var groupId: String?
+    /// 手动设置的「交接摘要」。
+    ///
+    /// 2026-10-31 用户要求「换另一个账号的 AI 继续做，别让他断开记忆重新开始」：
+    /// 换来源/换账号时上下文会归零（不同模型不认识对方的对话），
+    /// 所以这里允许存一份摘要，换过去之后作为开场白注入。
+    ///
+    /// 为什么是可选 + 手填而不是全自动：
+    /// 全自动摘要要用另一次模型调用去压缩历史，等于再烧一遍积分 ——
+    /// 而用户恰好常常是**因为没积分了**才要换账号，这时候不可能再调一次。
+    /// 所以做成"本地拼一份、用户过一眼、确认后才发"。
+    var handoff: String?
 
     var isEmpty: Bool { messages.isEmpty }
 

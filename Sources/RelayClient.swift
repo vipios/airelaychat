@@ -33,6 +33,13 @@ struct ChatMessage: Identifiable, Equatable {
     var attachments: [Attachment] = []
     /// 用了哪个模型答的（助手消息上显示，方便对照）
     var model: String = ""
+    /// 被用户撤回。
+    ///
+    /// 2026-10-31 用户要求：发出去的消息上面加撤回。
+    /// 撤回后：
+    ///   1. 这条消息**不参与**下一次请求的历史（等于没说过）
+    ///   2. 界面上灰显划掉，不直接消失（用户要看得见自己撤了什么）
+    var recalled: Bool = false
 }
 
 // MARK: - 错误
@@ -516,6 +523,11 @@ final class RelayClient {
         var collected = ""
 
         for try await line in bytes.lines {
+            // 2026-10-31 用户要求「撤回后 AI 不再请求响应」：
+            // 撤回时 ChatStore 会 cancel 掉发送 Task，这里每读一行检查一次，
+            // 一旦被取消就立刻停止读流、断开连接（URLSession 的 bytes 流在
+            // Task 取消后会抛 CancellationError，这里提前 return 更干脆）。
+            if Task.isCancelled { throw CancellationError() }
             let l = line.trimmingCharacters(in: .whitespaces)
             guard l.hasPrefix("data:") else { continue }
             sawSSE = true
