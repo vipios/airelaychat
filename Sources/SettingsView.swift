@@ -22,6 +22,8 @@ struct SettingsView: View {
     @State private var devMsg: String?
     @State private var confirmReboot = false
     @State private var rebooting = false
+    /// 只重启中转站服务时的忙碌态（和 rebooting 分开，因为两者后果差很远）
+    @State private var restartingRelay = false
     /// 重启后进入"等它回来"的倒计时状态
     @State private var waitingBack = false
     /// 后台密钥（access_key）的输入草稿。落盘走钥匙串，见 body 里的 onChange。
@@ -523,6 +525,24 @@ struct SettingsView: View {
                 }
             }
 
+            // 轻量那颗按钮放在前面，因为它才是日常该用的：
+            // 后台进不去十次有九次只是 relay.py 卡了，重启服务 1 秒就好，
+            // 重启整台路由器会把全家的网断 40 秒，那是最后手段。
+            Button {
+                Task { await doRestartRelay() }
+            } label: {
+                HStack {
+                    if restartingRelay {
+                        ProgressView().scaleEffect(0.8)
+                    } else {
+                        Image(systemName: "arrow.triangle.2.circlepath")
+                    }
+                    Text(restartingRelay ? "正在重启中转站…" : "重启中转站（不断网）")
+                    Spacer()
+                }
+            }
+            .disabled(restartingRelay || rebooting || waitingBack)
+
             Button(role: .destructive) {
                 confirmReboot = true
             } label: {
@@ -603,6 +623,55 @@ struct SettingsView: View {
         } catch {
             devMsg = authHint(error)
         }
+    }
+
+    /// 只重启中转站服务（`/etc/init.d/airelay restart`），路由器本身不动。
+    ///
+    /// 为什么需要它：用户在外面发现后台进不去时，第一反应是重启路由器 ——
+    /// 但那会把家里所有人的网断 40 秒，代价太大。而实测过的那次故障
+    /// （后台 9.86 秒才出、/health 卡死、负载 14）根因是 relay.py 自己
+    /// 内存被换到 swap 上，重启服务 1 秒就恢复了，路由器根本不用动。
+    ///
+    /// 走的是同一条不经过中转站的通道，所以中转站卡死时它照样能用。
+    private func doRestartRelay() async {
+        guard !settings.accessKey.isEmpty else {
+            devMsg = "还差后台密钥，填了才能操作"
+            return
+        }
+        restartingRelay = true
+        defer { restartingRelay = false }
+
+        devMsg = "正在找路由器…"
+        guard let host = await findBootHost() else {
+            devMsg = "找不到路由器：在家请确认连着 WiFi，在外面请先打开 ZeroTier"
+            return
+        }
+        do {
+            try await BootChannel.restartRelay(host: host, key: settings.accessKey)
+            devMsg = "已通知路由器重启中转站，等它起来…"
+            // 实测（2026-10-31，设备实测）：重启后 9 秒内才稳定应答，
+            // 前 6 秒是 000（连不上）。所以这里等 10 秒再刷，等太短会误报失败。
+            try? await Task.sleep(nanoseconds: 10_000_000_000)
+            await store.bootstrap()
+            await loadDevice()
+            devMsg = devStatus == nil
+                ? "重启指令已发出，但中转站还没应答，稍后再下拉刷新看看"
+                : "中转站已重启完成"
+        } catch let e as BootError {
+            devMsg = e.errorDescription ?? "重启中转站失败"
+        } catch {
+            devMsg = "重启中转站失败：\(error.localizedDescription)"
+        }
+    }
+
+    /// 找一台认 airboot 的路由器：先内网（含 ZeroTier 固定地址），再公网域名。
+    /// 两条都不经过中转站。
+    private func findBootHost() async -> String? {
+        var hosts = settings.lanCandidates
+        if !settings.bootHost.isEmpty { hosts.insert(settings.bootHost, at: 0) }
+        if let h = await BootChannel.discover(candidates: hosts) { return h }
+        guard let pub = publicBootHost() else { return nil }
+        return await BootChannel.discover(candidates: [pub], timeout: 6)
     }
 
     private func doReboot() async {

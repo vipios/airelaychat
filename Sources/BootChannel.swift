@@ -90,9 +90,22 @@ enum BootChannel {
     /// 服务端**先回 200 再真重启**（延迟 2 秒），所以拿到响应只代表
     /// 「指令已受理」，不代表已经重启完 —— 界面要自己提示"约 40 秒后恢复"。
     static func reboot(host: String, key: String, timeout: TimeInterval = 8) async throws {
+        try await send(action: "reboot", host: host, key: key, timeout: timeout)
+    }
+
+    /// 只重启中转站服务，路由器本身不动（别人的网不会断）。
+    ///
+    /// 大部分「后台进不去 / 一直转圈」其实是 relay.py 自己卡了，
+    /// 用这个 1 秒就好；重启整台路由器是最后手段（全家断网 40 秒）。
+    static func restartRelay(host: String, key: String, timeout: TimeInterval = 8) async throws {
+        try await send(action: "relay", host: host, key: key, timeout: timeout)
+    }
+
+    private static func send(action: String, host: String, key: String,
+                             timeout: TimeInterval) async throws {
         guard !key.isEmpty else { throw BootError.noKey }
         guard let u = url(host: host,
-                          query: "action=reboot&k=" + escaped(key)) else {
+                          query: "action=" + action + "&k=" + escaped(key)) else {
             throw BootError.badHost
         }
         var req = URLRequest(url: u)
