@@ -373,7 +373,8 @@ final class ChatStore: ObservableObject {
         toast = "交接说明已放进输入框，确认后直接发送"
     }
 
-    func renameSession(_ id: String, to title: String) {        let t = title.trimmingCharacters(in: .whitespacesAndNewlines)
+    func renameSession(_ id: String, to title: String) {
+        let t = title.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !t.isEmpty, let i = sessions.firstIndex(where: { $0.id == id }) else { return }
         sessions[i].title = t
         SessionStore.save(sessions)
@@ -923,7 +924,10 @@ final class ChatStore: ObservableObject {
         if let cutoff = autoHandoffCutoff {
             autoHandoffCutoff = nil        // 只交接一次，别每条都带
             needsHandoffHint = false
-            if let brief = buildHandoff(upTo: cutoff), !brief.isEmpty {
+            // buildHandoff 返回的是非可选 String（空串表示没内容可交接），
+            // 所以这里不能写 `if let brief = ...`，直接判空。
+            let brief = buildHandoff(upTo: cutoff)
+            if !brief.isEmpty {
                 history.insert(("system", brief, []), at: 0)
             }
         }
