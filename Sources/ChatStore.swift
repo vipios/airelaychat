@@ -709,7 +709,7 @@ final class ChatStore: ObservableObject {
         }
 
         // 挂到输入框附件区，只替换上一次的交接包
-        let added = made.compactMap { Attachment.file(from: $0.url).0 }
+        let added = made.compactMap { AttachmentMaker.file(from: $0.url).0 }
         pending = pending.filter {
             !($0.name.hasPrefix("交接-") || $0.name.hasPrefix("源码-"))
         } + added
@@ -727,25 +727,29 @@ final class ChatStore: ObservableObject {
     ///
     /// 模型不老实、标记缺一个的时候也要能认出另一半，
     /// 所以不是"两个都有才解析"那种硬匹配。
-    private static func splitHandoffPack(_ s: String) -> (handoff: String?, sources: String?) {
+    private static func splitHandoffPack(_ text: String) -> (handoff: String?, sources: String?) {
         let hTag = "===HANDOFF==="
         let sTag = "===SOURCES==="
-        let h = s.range(of: hTag, options: .caseInsensitive)
-        let src = s.range(of: sTag, options: .caseInsensitive)
+        let h = text.range(of: hTag, options: .caseInsensitive)
+        let src = text.range(of: sTag, options: .caseInsensitive)
 
+        // ⚠️ 参数不能叫 `s`：下面的 `case let (_, s?)` 会把 `s` 重新绑定成
+        // 一个 Range，于是 `s[...]` 变成「对 Range 取下标」，编译器报
+        // "requires that 'String.Index' conform to 'Strideable'"。
+        // 2026-10-31 CI 就是这么挂的，别改回去。
         switch (h, src) {
         case let (h?, s?):
             if h.upperBound <= s.lowerBound {
-                return (String(s[h.upperBound..<s.lowerBound]), String(s[s.upperBound...]))
+                return (String(text[h.upperBound..<s.lowerBound]), String(text[s.upperBound...]))
             }
             // 两段顺序反了：按标记各自切，别丢内容
-            return (String(s[s.upperBound..<h.lowerBound]), String(s[h.upperBound...]))
+            return (String(text[s.upperBound..<h.lowerBound]), String(text[h.upperBound...]))
         case let (h?, nil):
-            return (String(s[h.upperBound...]), nil)
+            return (String(text[h.upperBound...]), nil)
         case let (nil, s?):
-            return (String(s[..<s.lowerBound]), String(s[s.upperBound...]))
+            return (String(text[..<s.lowerBound]), String(text[s.upperBound...]))
         case (nil, nil):
-            return (s, nil)
+            return (text, nil)
         }
     }
 
@@ -820,7 +824,7 @@ final class ChatStore: ObservableObject {
         // 只替换上一次生成的交接包（按文件名前缀认："交接-" / "源码-"），
         // 不一把清空：用户手上可能还挂着别的附件（截图之类），
         // 点一下交接就把它们弄没了会很恼火。
-        let added = made.compactMap { Attachment.file(from: $0.url).0 }
+        let added = made.compactMap { AttachmentMaker.file(from: $0.url).0 }
         pending = pending.filter {
             !($0.name.hasPrefix("交接-") || $0.name.hasPrefix("源码-"))
         } + added
@@ -844,7 +848,7 @@ final class ChatStore: ObservableObject {
     /// 所以必须**先切对话、再挂附件**，反过来的话刚挂上的会被清掉。
     func attach(file: AIFile, to targetSessionId: String) {
         guard sessions.contains(where: { $0.id == targetSessionId }) else { return }
-        guard let a = Attachment.file(from: file.url).0 else {
+        guard let a = AttachmentMaker.file(from: file.url).0 else {
             toast = "这个文件读不出来，没法添加"
             return
         }

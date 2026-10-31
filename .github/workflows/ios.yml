@@ -10,6 +10,10 @@ on:
 
 jobs:
   build:
+    # 2026-10-31：macos-14 的 job 一起就被取消（started 和 completed 同一秒，
+    # 一个 step 都没跑，没有任何 annotation）。同仓库的 ubuntu-latest 秒过，
+    # 换成 macos-15 后正常跑起来了 —— 是那个 runner 镜像的问题，不是代码问题。
+    # 所以这里固定用 macos-15，别再改回 14。
     runs-on: macos-15
     timeout-minutes: 30
 

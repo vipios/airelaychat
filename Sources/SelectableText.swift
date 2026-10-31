@@ -94,9 +94,11 @@ struct SelectableText: UIViewRepresentable {
         tv.allowRecallMenu = allowRecall
         tv.onRecall = onRecall
         tv.onRecallAndEdit = onRecallAndEdit
+        // delegate 里的菜单要用到 allowRecall，也得跟着刷新
+        context.coordinator.parent = self
     }
 
-    func makeCoordinator() -> Coordinator { Coordinator() }
+    func makeCoordinator() -> Coordinator { Coordinator(parent: self) }
 
     /// 让气泡宽度贴合文字（2026-10-31 用户：「气泡样式发送指令的时候要自动对齐会话长度」）。
     ///
@@ -127,14 +129,19 @@ struct SelectableText: UIViewRepresentable {
         var result: CGSize
         if fillsWidth {
             // AI 大段正文：直接铺满，不做"贴合文字"那种收缩
-            let h = uiView.sizeThatFits(CGSize(width: maxW, height: .greatestFiniteMagnitude)).height
+            let h = uiView.sizeThatFits(CGSize(width: maxW,
+                                               height: CGFloat.greatestFiniteMagnitude)).height
             result = CGSize(width: maxW, height: ceil(h))
         } else {
-            let unbounded = uiView.sizeThatFits(CGSize(width: .greatestFiniteMagnitude,
-                                                      height: .greatestFiniteMagnitude))
+            // 这里必须写全 `CGFloat.greatestFiniteMagnitude`：
+            // 直接写 `.greatestFiniteMagnitude` 时编译器在 CGFloat / Double / Int 之间
+            // 无法决定（CI 报 "ambiguous use of"），一个都推断不出来。
+            let unbounded = uiView.sizeThatFits(CGSize(width: CGFloat.greatestFiniteMagnitude,
+                                                      height: CGFloat.greatestFiniteMagnitude))
             guard unbounded.width > 0 else { return nil }
             let w = min(ceil(unbounded.width), maxW)
-            let h = uiView.sizeThatFits(CGSize(width: w, height: .greatestFiniteMagnitude)).height
+            let h = uiView.sizeThatFits(CGSize(width: w,
+                                               height: CGFloat.greatestFiniteMagnitude)).height
             result = CGSize(width: w, height: ceil(h))
         }
 
@@ -146,8 +153,56 @@ struct SelectableText: UIViewRepresentable {
     }
 
     final class Coordinator: NSObject, UITextViewDelegate {
+        /// 当前这一帧的配置。菜单里要不要「撤回」由它决定，
+        /// 每次 updateUIView 都会刷新，不能只在 init 时拿一次。
+        var parent: SelectableText
+
+        init(parent: SelectableText) { self.parent = parent }
+
         /// 点气泡空白处时别把键盘弹出来 —— 这里只需要"选"，不需要"编"。
         func textViewShouldBeginEditing(_ textView: UITextView) -> Bool { false }
+
+        /// 接管长按弹出的那个菜单（iOS 16.0+）。
+        ///
+        /// 系统在简体中文里把这项叫「拷贝」，改不了本地化，只能整块换掉菜单。
+        /// 返回自己的 `UIMenu` 就完全替换系统那版；返回 nil 则退回系统菜单。
+        ///
+        /// `.displayInline` 让它横排成一条（和原版截图一致），
+        /// 不加会是竖排二级菜单。
+        func textView(_ textView: UITextView,
+                      editMenuForTextIn range: NSRange,
+                      suggestedActions: [UIMenuElement]) -> UIMenu? {
+            // 只是点了下文字、没选中任何东西时（range 长度为 0）不接管，
+            // 交给系统出「粘贴/查询」那套，免得点一下也弹四个纵向项。
+            guard range.length > 0 else { return nil }
+
+            var actions: [UIAction] = []
+
+            // 「复制」= 系统 copy:，只拿走当前选中的那一段
+            actions.append(UIAction(title: "复制",
+                                    image: UIImage(systemName: "doc.on.doc")) { [weak textView] _ in
+                textView?.copy(nil)
+            })
+
+            actions.append(UIAction(title: "全选") { [weak textView] _ in
+                textView?.selectAll(nil)
+            })
+
+            if parent.allowRecall {
+                actions.append(UIAction(title: "撤回",
+                                        image: UIImage(systemName: "arrow.uturn.backward")) { [weak self] _ in
+                    // 菜单收起后再执行，否则弹窗和状态变更抢同一帧，会闪一下
+                    DispatchQueue.main.async { self?.parent.onRecall() }
+                })
+                // 只改菜单上显示的字，动作还是原来那个（撤回 + 把原文填回输入框）
+                actions.append(UIAction(title: "重新编辑",
+                                        image: UIImage(systemName: "square.and.pencil")) { [weak self] _ in
+                    DispatchQueue.main.async { self?.parent.onRecallAndEdit() }
+                })
+            }
+
+            return UIMenu(options: .displayInline, children: actions)
+        }
     }
 }
 
@@ -185,42 +240,14 @@ final class PasteTextView: UITextView {
 
     /// 长按 / 拖选后弹出的那个菜单。
     ///
-    /// 2026-10-31 用户拿原版截图要求：「拷贝换成复制，拖动的样式和图中一样」。
-    /// 系统给的标准项在简体中文里叫「拷贝」，这个名字没法通过本地化改，
-    /// 只能整块接管菜单 —— iOS 16 起 `UITextView` 提供 `editMenu(for:in:)`，
-    /// 返回自己的 `UIMenu` 就完全替换掉系统那一版。
+    /// 2026-10-31 CI 撞墙记录：这里本来写的是
+    /// `override func editMenu(for:in:)`，编译直接报
+    /// "method does not override any method from its superclass" ——
+    /// 那个方法在 SDK 里不是 open 的，子类没法 override。
     ///
-    /// `.displayInline` 让它横着排（和截图里一样是一条白色胶囊），
-    /// 不加这个会是竖排的二级菜单。
-    override func editMenu(for textRange: UITextRange, in rect: CGRect) -> UIMenu? {
-        var actions: [UIAction] = []
-
-        // 「复制」= 系统 copy:，只拿走当前选中的那一段
-        actions.append(UIAction(title: "复制",
-                                image: UIImage(systemName: "doc.on.doc")) { [weak self] _ in
-            self?.copy(nil)
-        })
-
-        actions.append(UIAction(title: "全选") { [weak self] _ in
-            self?.selectAll(nil)
-        })
-
-        if allowRecallMenu {
-            actions.append(UIAction(title: "撤回",
-                                    image: UIImage(systemName: "arrow.uturn.backward")) { [weak self] _ in
-                // 菜单收起后再执行，否则弹窗和状态变更抢同一帧，会闪一下
-                DispatchQueue.main.async { self?.onRecall?() }
-            })
-            // 只改菜单上显示的字，动作还是原来那个（撤回 + 把原文填回输入框）
-            actions.append(UIAction(title: "重新编辑",
-                                    image: UIImage(systemName: "square.and.pencil")) { [weak self] _ in
-                DispatchQueue.main.async { self?.onRecallAndEdit?() }
-            })
-        }
-
-        return UIMenu(options: .displayInline, children: actions)
-    }
-
+    /// 现在改成走 `UITextViewDelegate` 的
+    /// `textView(_:editMenuForTextIn:suggestedActions:)`，见下面 Coordinator。
+    /// 那是官方留给调用方的入口，同样能整块替换菜单。
     override func canPerformAction(_ action: Selector, withSender sender: Any?) -> Bool {
         if action == #selector(menuRecall) || action == #selector(menuRecallAndEdit) {
             // AI 回复不给撤回项：撤了它也没用，而且会让菜单变长挡住「拷贝」
