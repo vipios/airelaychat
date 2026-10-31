@@ -576,6 +576,10 @@ struct ChatView: View {
             }
             .scrollDismissesKeyboard(.interactively)
             .onTapGesture { inputFocused = false }
+            // 下拉刷新（iOS 16 起 ScrollView 原生支持）：
+            // 重新探测地址 + 拉一遍模型清单。断网回来、路由器换网段、
+            // 或者「一直显示未连接」时，往下拉一把比来回切页面快得多。
+            .refreshable { await store.bootstrap() }
         }
     }
 

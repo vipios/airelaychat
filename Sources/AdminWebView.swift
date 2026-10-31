@@ -120,6 +120,15 @@ struct AdminWebView: UIViewRepresentable {
         // 后台页面是给手机浏览器做的，但有些输入框字号偏小，允许缩放更稳
         wv.allowsBackForwardNavigationGestures = false
         wv.scrollView.contentInsetAdjustmentBehavior = .never
+        // 下拉刷新（2026-10-31）：WKWebView 内部本来就是个 UIScrollView，
+        // 直接挂系统的 UIRefreshControl 最稳 —— 不套 SwiftUI 容器，
+        // 免得把网页自己的滚动、缩放、橡皮筋效果搞乱。
+        let rc = UIRefreshControl()
+        rc.tintColor = .secondaryLabel
+        rc.addTarget(context.coordinator, action: #selector(Coordinator.onPull(_:)), for: .valueChanged)
+        wv.scrollView.refreshControl = rc
+        context.coordinator.webView = wv
+        context.coordinator.refreshControl = rc
         wv.isOpaque = false
         wv.backgroundColor = UIColor(red: 0.973, green: 0.973, blue: 0.973, alpha: 1)
         context.coordinator.loadingBinding = $loading
@@ -148,6 +157,24 @@ struct AdminWebView: UIViewRepresentable {
         private var loadedKey: String = ""
         /// 由 makeUIView 塞进来，用来把加载状态回传给 SwiftUI
         var loadingBinding: Binding<Bool>?
+        /// 下拉刷新用：刷新控件和它所属的 WebView
+        weak var refreshControl: UIRefreshControl?
+        weak var webView: WKWebView?
+
+        /// 下拉刷新：重新加载当前页。
+        ///
+        /// 只 reload 当前页，不重走 load()：load() 会按 tick 拼 /admin 地址，
+        /// 用户可能正停在某个子页面（账号详情之类），reload 才符合直觉。
+        /// 结束转圈交给 didFinish / didFail，别用固定延时 —— 后台页 500 多 KB，
+        /// 慢的时候转圈早就没了、页面还在转。
+        @objc func onPull(_ sender: UIRefreshControl) {
+            guard let wv = webView else { sender.endRefreshing(); return }
+            if wv.url == nil {
+                sender.endRefreshing()
+                return
+            }
+            wv.reload()
+        }
 
         private func setLoading(_ v: Bool) {
             Task { @MainActor in self.loadingBinding?.wrappedValue = v }
@@ -190,10 +217,12 @@ struct AdminWebView: UIViewRepresentable {
 
         func webView(_ webView: WKWebView, didFail navigation: WKNavigation!, withError error: Error) {
             setLoading(false)
+            refreshControl?.endRefreshing()
         }
 
         func webView(_ webView: WKWebView, didFailProvisionalNavigation navigation: WKNavigation!, withError error: Error) {
             setLoading(false)
+            refreshControl?.endRefreshing()
         }
 
         /// 后台有可能弹出 target=_blank 的链接（比如复制 Key 的说明页），
@@ -219,6 +248,7 @@ struct AdminWebView: UIViewRepresentable {
         /// 就把整页替换成一句人话，并把原始内容折叠在下面备查。
         func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
             setLoading(false)
+            refreshControl?.endRefreshing()
             let js = """
             (function(){
               try {

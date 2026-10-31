@@ -61,6 +61,13 @@ struct SettingsView: View {
                     publicSection
                     aboutSection
                 }
+                // 下拉刷新：重新探测连接 + 刷新模型清单 + 更新设备状态。
+                // 设置页里看到的值（连的是哪个地址、模型有没有变、内存多少）
+                // 全是从服务端现拉的，下拉一把就全刷新，不用退出去重进。
+                .refreshable {
+                    await store.bootstrap()
+                    await loadDevice()
+                }
                 // Form 自带一层不透明底色，会把 Theme.page 盖掉，
                 // 表现为"上半截灰、下半截白"的断层。
                 .scrollContentBackground(.hidden)
