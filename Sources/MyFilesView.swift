@@ -428,7 +428,11 @@ struct MyFilesView: View {
                 .buttonStyle(PressableStyle(scale: 0.97, dim: 0.72))
 
                 Button {
-                    withAnimation(.easeOut(duration: 0.18)) { expanded.remove(f.id) }
+                    // `Set.remove` 返回被删掉的元素（Optional），
+                    // 直接写会让闭包返回 String? 和 Void 冲突（CI 报
+                    // "conflicting arguments to generic parameter 'Result'"），
+                    // 所以显式丢掉返回值。
+                    withAnimation(.easeOut(duration: 0.18)) { _ = expanded.remove(f.id) }
                 } label: {
                     Text("收起")
                         .font(.system(size: 12))

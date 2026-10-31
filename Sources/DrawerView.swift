@@ -62,6 +62,8 @@ struct DrawerView: View {
     @State private var filesOpen = false
     /// 抽屉里展开正文的那个产物 id
     @State private var expandedFile: String?
+    /// 读过的产物正文（key = 文件 id），避免每次重绘都读盘
+    @State private var fileTextCache: [String: String] = [:]
 
     /// 抽屉里列出来的产物，新→旧
     private var drawerFiles: [AIFile] {
@@ -384,12 +386,26 @@ struct DrawerView: View {
 
     /// 抽屉里的正文预览：只取前 400 字。300pt 宽塞不下更多，
     /// 真要读全文就去「打开」。
+    ///
+    /// 带缓存的原因：这个函数在 body 里，滚动抽屉时会被反复调用，
+    /// 每次都去整份读盘（产物可能是几十万字符的源码）会把抽屉拖卡。
     private func drawerFileText(_ f: AIFile) -> String {
-        guard let s = try? String(contentsOf: f.url, encoding: .utf8) else {
-            return "（这个格式不能在这里预览，长按选「打开」）"
+        if let hit = fileTextCache[f.id] { return hit }
+        var out: String
+        if let s = try? String(contentsOf: f.url, encoding: .utf8) {
+            if s.isEmpty {
+                out = "（空文件）"
+            } else {
+                out = s.count > 400 ? String(s.prefix(400)) + "\n…" : s
+            }
+        } else {
+            out = "（这个格式不能在这里预览，长按选「打开」）"
         }
-        if s.isEmpty { return "（空文件）" }
-        return s.count > 400 ? String(s.prefix(400)) + "\n…" : s
+        let key = f.id, value = out
+        DispatchQueue.main.async {
+            if fileTextCache[key] == nil { fileTextCache[key] = value }
+        }
+        return out
     }
 
     // MARK: 新建任务
