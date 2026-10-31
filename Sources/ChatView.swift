@@ -28,11 +28,18 @@ struct ChatView: View {
     @State private var healthTimer: Timer?
 
     @State private var drawerOpen = false
-    /// 顶栏右侧「⋯」那一块有没有被按住。
+    /// 顶栏右侧「⋯」的菜单开没开。
     ///
-    /// 它是个 `Menu`，不是 Button —— `Menu` 不认 `buttonStyle`，
-    /// 所以拿不到 PressableStyle 的 isPressed，只能自己用 0 秒长按手势盯。
-    @GestureState private var morePressed = false
+    /// 2026-11-01 修闪退：这里原来是个 `Menu` + `LongPressGesture(minimumDuration: 0)`
+    /// 配 `@GestureState` 来盯按下态。`minimumDuration: 0` 在 iOS 16 上会**立即识别**，
+    /// 而 `.onChange(of: morePressed)` 又读了这个状态 —— 于是形成
+    /// 「手势识别 → 写状态 → body 重建 → 手势重挂 → 再立即识别」的自激循环。
+    /// 「⋯」在首帧就要渲染，App 一启动就 100% CPU 空转，被系统看门狗杀掉，
+    /// 用户看到的就是「点开闪退」。
+    ///
+    /// 现在换成普通 Button + 底部弹窗：按下直接吃 `PressableStyle(fills:)`，
+    /// 一样反成纯黑，再也不用手势去猜按下态。
+    @State private var showMoreMenu = false
     /// 去过哪些 Tab。
     ///
     /// 2026-10-31 为了让后台面板"进去就显示"改了 Tab 的承载方式：
@@ -573,46 +580,35 @@ struct ChatView: View {
                 // 不缩放：整条胶囊是两段拼的，缩放会在接缝处露出一道底色缝
                 .buttonStyle(PressableStyle(scale: 1.0, fills: true))
 
-                Menu {
-                    Button { store.syncCurrentSession() } label: {
-                        Label("保存会话", systemImage: "tray.and.arrow.down")
-                    }
-                    Divider()
-                    Button(role: .destructive) {
-                        store.reset()
-                        store.syncCurrentSession()
-                    } label: {
-                        Label("清空会话", systemImage: "trash")
-                    }
-                    Divider()
-                    // 2026-10-31 用户要求：文案从「生成交接说明（换账号续聊）」
-                    // 缩成「生成交接」，位置挪到「清空会话」下面。
-                    //
-                    // 点它会**替用户发一条格式指令**给当前 AI（不用自己打字），
-                    // 拿到回复后拆成交接文档 + 源码两个文件，挂到输入框附件区。
-                    // 因为要花一次对话，先弹确认：也能选不花积分的本地摘要。
-                    Button {
-                        confirmHandoff = true
-                    } label: {
-                        Label("生成交接", systemImage: "arrow.triangle.swap")
-                    }
-                } label: {
-                    // Menu 不吃 `buttonStyle`，按下态只能自己盯：
-                    // 挂一个 0 秒的长按手势（simultaneous 不抢 Menu 的点击），
-                    // 手指一落下就为真、抬起为假，用它换底色和图标色。
+                Button { showMoreMenu = true } label: {
+                    // 改成 Button 之后按下直接吃 PressableStyle 的 `colorInvert()`，
+                    // 白底一次性反成纯黑 —— 不用再自己盯按下态。
                     Image(systemName: "ellipsis")
                         .font(.system(size: 15, weight: .medium))
-                        .foregroundStyle(morePressed ? Theme.card : Color.primary)
+                        .foregroundStyle(.primary)
                         .frame(width: 41, height: 38)
-                        .background(morePressed ? Theme.press : Theme.card)
+                        .background(Theme.card)
                         .contentShape(Rectangle())
                 }
-                .simultaneousGesture(
-                    LongPressGesture(minimumDuration: 0)
-                        .updating($morePressed) { value, state, _ in state = value }
-                )
-                .onChange(of: morePressed) { now in
-                    if now { Haptic.tap() }
+                .buttonStyle(PressableStyle(scale: 1.0, fills: true))
+                // 菜单挂在这个按钮自己身上，不挂根层 ——
+                // 根层已经有一个「生成交接」的 confirmationDialog，
+                // 同层叠两个弹窗 iOS 16 会互相顶掉，挂内层才互不干扰。
+                // 条目和顺序跟原来的 Menu 一致：保存会话 → 清空会话 → 生成交接。
+                .confirmationDialog("更多", isPresented: $showMoreMenu, titleVisibility: .hidden) {
+                    Button("保存会话") { store.syncCurrentSession() }
+                    Button("清空会话", role: .destructive) {
+                        store.reset()
+                        store.syncCurrentSession()
+                    }
+                    Button("生成交接") {
+                        // 连着弹两个弹窗 iOS 会吞掉后一个（前一个还在收动画），
+                        // 等这一层收干净再开「生成交接」的确认。
+                        DispatchQueue.main.asyncAfter(deadline: .now() + 0.35) {
+                            confirmHandoff = true
+                        }
+                    }
+                    Button("取消", role: .cancel) {}
                 }
             }
             .clipShape(Capsule())
