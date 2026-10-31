@@ -74,15 +74,19 @@ enum Theme {
     /// 所以干脆收到一处，以后只改这一个数。
     static let bodySize: CGFloat = 16
 
-    /// 选中 / 按下的底色：深灰。
+    /// 选中 / 按下的底色：**纯黑**。
     ///
-    /// 2026-11-01 用户：「在所有的界面都添加一个选中的状态…选中状态改为深灰色也行你自己定」。
-    /// 之前选中态用的是 `Color.primary`（纯黑），在白底上对比太硬，
-    /// 一排按钮里只要有一个黑的，整屏视线全被它抢走；深灰既明确又不刺眼。
+    /// 2026-11-01 用户：「不能改成按下去是黑色吗，你现在这个深色改的，
+    /// 有的是黑色有的是深灰，不统一」。
+    ///
+    /// 之前这里是 #3C3C3F（深灰），而别处按下走的是"切深色环境"，
+    /// 白底翻成 #2C2C2E —— 两个值都在"深"的区间里但肉眼能分出来：
+    /// 后台那两个胶囊偏灰、聊天里的卡片偏另一个灰，整机看下来就是不统一。
+    /// 现在统一压到纯黑，和按压缩放样式里 `colorInvert` 翻出来的黑**完全同值**。
     static let press = Color(uiColor: UIColor { t in
         t.userInterfaceStyle == .dark
-            ? UIColor(red: 0.780, green: 0.780, blue: 0.800, alpha: 1)   // 深色模式下反过来用浅灰
-            : UIColor(red: 0.235, green: 0.235, blue: 0.247, alpha: 1)   // #3C3C3F
+            ? UIColor(white: 1.0, alpha: 1)   // 深色模式下反过来用纯白
+            : UIColor(white: 0.0, alpha: 1)   // 纯黑
     })
 
     /// 选中行/选中块的浅底（列表里那种"我在这一行"的提示，不能太重）
@@ -186,13 +190,29 @@ enum Haptic {
     }
 }
 
+/// 按下时把整块颜色反过来（白↔黑）。
+///
+/// SwiftUI 的 `.colorInvert()` 没有开关参数，只能靠一个两分支的 modifier 包一层。
+/// 切换分支会让这块 label 重建 —— 里面全是纯展示内容（图标、文字、底色），
+/// 没有 @State，重建对视觉和状态都没有副作用。
+private struct InvertWhen: ViewModifier {
+    let active: Bool
+
+    @ViewBuilder
+    func body(content: Content) -> some View {
+        if active {
+            content.colorInvert()
+        } else {
+            content
+        }
+    }
+}
+
 /// 通用按压反馈：按下去缩一点、暗一点，同时震一下。
 ///
 /// 2026-10-31 用户反馈「按键有明显的视觉感，不要和没反应一样」。
 /// iOS 默认的 `.plain` 样式在自定义视图上完全不显示按下态 ——
 /// 点下去屏幕上一动不动，人就会以为卡了、再点第二下。
-/// 这层缩放（0.94）+ 变淡（0.72）足够让人确认"收到了"，
-/// 又不至于像系统高亮那样闪一片灰。
 struct PressableStyle: ButtonStyle {
     var scale: CGFloat = 0.94
     /// 按下时的轻微变淡。**只用来补一点点"软"的感觉**，不再是主要反馈 ——
@@ -213,29 +233,30 @@ struct PressableStyle: ButtonStyle {
     /// 由白变黑的点击效果，你把所有的都改成和他们一样」。
     ///
     /// 做法不是手写"按下变白字" —— 内层 `.foregroundStyle(.primary)` 写死了，
-    /// 外层改不动。改用**环境色板反色**：Theme 里的颜色全是动态色（UIColor 的
-    /// light/dark 两套），把 colorScheme 切成 .dark 之后，白底自己变成 #2C2C2E、
-    /// `.primary` 文字自己变白、`.secondary` 变亮灰 —— 一步到位，不用逐处改颜色。
+    /// 外层改不动。改成**像素级反色** `colorInvert()`：
+    /// 白底(#FFFFFF) → 纯黑(#000000)，黑字 → 纯白，一步到位。
     ///
-    /// 只在有实心底的按钮上用。没有底的（纯图标、透明行）切了色板会白字白底看不见。
+    /// 为什么不继续用"切深色环境色板"（上一版的做法）：
+    /// 色板翻转把白翻成 #2C2C2E 这种深灰，不是黑；而后台那两颗胶囊走的是
+    /// `Theme.press`，两个深色对不上，整机看着"有的黑有的灰"。用户原话：
+    /// 「不能改成按下去是黑色吗…不统一」。反色是同一个输入必得同一个输出，
+    /// 不管按钮本来是白、是浅灰还是淡彩，压出来的都是同一种黑。
     var fills: Bool = false
 
     func makeBody(configuration: Configuration) -> some View {
         let pressed = configuration.isPressed
-        // 系统当前是不是深色模式。反色对它无效（本来就是 dark），
-        // 所以深色模式下改用"提亮一点"当反馈。
+        // 系统当前是不是深色模式。无底按钮在暗底上"变暗"等于消失，改成提亮。
         let isDark = UITraitCollection.current.userInterfaceStyle == .dark
         let flipping = pressed && fills
 
+        // 有底的走反色，不再叠亮度；反色已经足够黑，再压会把白字也吃掉。
         var boost: Double = 0
-        if pressed {
-            boost = fills ? (isDark ? 0.12 : 0) : -darken
+        if pressed && !fills {
+            boost = isDark ? 0.12 : -darken
         }
 
         return configuration.label
-            // 2026-11-01：有底的按钮按下 = 整块换成深色版，
-            // 和后台面板那三个胶囊（白底→深灰字反白）完全一致。
-            .environment(\.colorScheme, flipping ? .dark : (isDark ? .dark : .light))
+            .modifier(InvertWhen(active: flipping))
             // 没有底的元素（纯图标、纯文字）变暗不可见，靠下面这层淡灰补。
             .brightness(boost)
             .scaleEffect(pressed ? scale : 1)

@@ -385,20 +385,39 @@ struct ChatView: View {
                     //   抽屉开着        → 右滑关抽屉（回到聊天页本体）
                     //   后台面板/我的   → 左右滑都回聊天页
                     //   聊天页原点      → 只在左缘右滑才出抽屉（防误触）
+                    //
+                    // 2026-11-01 用户：「左右滑动返回让他从边缘往中间滑动才能返回」。
+                    // 上一版只要横向位移过 70pt 就算数，导致在页面正中间随便拨一下
+                    // 也会跳页 —— 网页里横滑一张宽表格、在消息列表上左右拖，
+                    // 都会莫名其妙退回聊天页。现在两向都要求**起手贴边**
+                    // （离屏幕边 30pt 以内，和系统返回手势同一档距），
+                    // 页面中部的横向拖动还给页面自己。
+                    let screenW = UIScreen.main.bounds.width
+                    let fromLeftEdge = g.startLocation.x < 30
+                    let fromRightEdge = g.startLocation.x > screenW - 30
 
                     if drawerOpen {
                         // 抽屉铺在聊天页上面，它的"上一页"就是聊天页。
                         // 这里只听右滑：抽屉本体里还有列表要上下滚，
                         // 左滑留着不抢，避免和列表滑动打架。
-                        if g.translation.width > 70 { closeDrawer() }
+                        if fromLeftEdge, g.translation.width > 70 {
+                            // 震动放在手势里而不是 closeDrawer() 里：
+                            // 抽屉左上角那个按钮自己已经带一档震动（PressableStyle 里），
+                            // 两个入口共用函数的话，点按钮会连震两下。
+                            Haptic.tap()
+                            closeDrawer()
+                        }
                         return
                     }
 
                     if store.tab != .tasks {
-                        // 后台面板 / 我的：左右都能回聊天页
-                        // （左滑是原有行为，右滑是这次新增的）
-                        if g.translation.width < -70 || g.translation.width > 70 {
+                        // 后台面板 / 我的：从左边往中间拨（右滑）或
+                        // 从右边往中间拨（左滑）都回聊天页，但都必须贴边起手。
+                        let backRight = fromLeftEdge && g.translation.width > 70
+                        let backLeft  = fromRightEdge && g.translation.width < -70
+                        if backRight || backLeft {
                             inputFocused = false
+                            Haptic.tap()
                             withAnimation(.easeInOut(duration: 0.2)) {
                                 store.tab = .tasks
                             }
@@ -407,9 +426,9 @@ struct ChatView: View {
                     }
 
                     // 聊天页：左缘右滑 → 出抽屉。
-                    // 保持 x < 30 的边缘判定，否则在消息列表中间随手一划就弹抽屉。
                     // 非左缘的右滑在聊天页不做事 —— 聊天页已经是根，没有"上一页"。
-                    if g.startLocation.x < 30, g.translation.width > 70 {
+                    if fromLeftEdge, g.translation.width > 70 {
+                        Haptic.tap()
                         openDrawer()
                     }
                 }

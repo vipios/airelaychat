@@ -114,6 +114,73 @@ struct AdminWebView: UIViewRepresentable {
             cfg.userContentController.addUserScript(script)
         }
 
+        // 表格横向滑动（2026-11-01 用户：「这个后台面板无法左滑看到账号的所有信息」）。
+        //
+        // 后台是给宽屏做的，账号表有 10 列（顺序/账号/代理/连接数/状态/有效期/余额/
+        // 今日已用/模型/最近签到/操作），手机宽度装不下。页面的移动端样式里有
+        // `html,body{max-width:100vw;overflow-x:hidden}`，横向溢出直接被裁掉，
+        // 所以右半边列（余额后面那些）连滑都滑不出来。
+        //
+        // 处理方式是在客户端注入一小段 CSS + JS，把"宽表格"的父容器变成可横滑：
+        //   · 不改服务端页面 —— 那是全家共用的生产页面，为了手机观感去动它风险太大，
+        //     而且改完还得重启服务才能生效。
+        //   · 用 MutationObserver 盯着，后台是单页应用，切 tab 时表格是新建的，
+        //     只跑一次 querySelectorAll 会漏掉后面渲染出来的那张表。
+        let wideTableJS = """
+        (function(){
+          if (window.__relayWideTable) return;
+          window.__relayWideTable = true;
+
+          var st = document.createElement('style');
+          st.textContent = [
+            '.card-b{overflow-x:auto !important;-webkit-overflow-scrolling:touch}',
+            'table.acct{min-width:720px !important}'
+          ].join('');
+          (document.head || document.documentElement).appendChild(st);
+
+          function fix(){
+            var ts = document.querySelectorAll('table');
+            for (var i = 0; i < ts.length; i++) {
+              var t = ts[i], p = t.parentElement;
+              if (!p) continue;
+              if (t.scrollWidth > p.clientWidth + 2) {
+                p.style.overflowX = 'auto';
+                p.style.webkitOverflowScrolling = 'touch';
+                // table-layout:fixed + width:100% 会把列压扁成省略号，
+                // 换成按内容自然撑开，宁可宽一点也要让每列的字看得全。
+                t.style.tableLayout = 'auto';
+                t.style.width = 'max-content';
+                t.style.minWidth = '100%';
+              }
+            }
+          }
+
+          var timer = null;
+          function later(){
+            if (timer) clearTimeout(timer);
+            timer = setTimeout(fix, 200);
+          }
+
+          function boot(){
+            fix();
+            try {
+              new MutationObserver(later).observe(document.body, { childList: true, subtree: true });
+            } catch(e) {}
+          }
+
+          if (document.readyState === 'loading') {
+            document.addEventListener('DOMContentLoaded', boot);
+          } else {
+            boot();
+          }
+        })();
+        """
+        cfg.userContentController.addUserScript(
+            WKUserScript(source: wideTableJS,
+                         injectionTime: .atDocumentEnd,
+                         forMainFrameOnly: true)
+        )
+
         let wv = WKWebView(frame: .zero, configuration: cfg)
         wv.navigationDelegate = context.coordinator
         wv.uiDelegate = context.coordinator
