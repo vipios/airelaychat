@@ -112,6 +112,14 @@ final class Settings: ObservableObject {
     @Published var publicAddrs: [String] { didSet { store() } }
     /// 上次「在家」成功用过的内网地址（含端口），冷启动时直接拿来用，不等探测。
     @Published var lastLanBase: String { didSet { store() } }
+    /// 历史连通过的内网 IP 池（最近成功的排前面，最多 8 个）。
+    ///
+    /// 2026-10-31 用户要求「在外面无忧无虑地用，彻底解决连不上的问题」。
+    /// 原来只记一个 `lanHost`，路由器一换网段（192.168.2.x → 192.168.1.x）
+    /// 那个地址就永久失效，App 只能靠"猜常见尾巴"，猜不到就彻底连不上。
+    /// 现在改成记一池：每次真正连通都把地址学进来，换网段后旧地址失效，
+    /// 新地址还能从池子里命中，不必重新猜。
+    @Published var lanPool: [String] { didSet { store() } }
     /// 上次「在外」成功用过的公网地址（域名或裸 IPv6），同样用于冷启动秒连。
     @Published var lastPubBase: String { didSet { store() } }
     @Published var gatewayKey: String { didSet { store() } }
@@ -133,6 +141,13 @@ final class Settings: ObservableObject {
         var publicAddrs: [String]
         var lastLanBase: String?
         var lastPubBase: String?
+        /// 学到的内网地址池。
+        ///
+        /// ⚠️ 必须写成可选类型：这个字段是后加的，老版本存下来的 JSON 里没有它。
+        /// 如果声明成非可选的 `[String]`，JSONDecoder 会因为缺 key 直接抛错，
+        /// 导致**整个设置解码失败** —— 用户的 API Key、模型选择、来源配置全丢，
+        /// App 会像刚装一样要重新配一遍。可选类型缺 key 时自动变 nil，旧数据安全。
+        var lanPool: [String]?
         var gatewayKey: String
         var homeModel: String
         var awayModel: String
@@ -163,7 +178,7 @@ final class Settings: ObservableObject {
         if s == nil, let old = UserDefaults.standard.data(forKey: oldKey),
            let v1 = try? JSONDecoder().decode(StoredV1.self, from: old) {
             s = Stored(lanHost: v1.lanHost, publicDomain: nil, publicAddrs: v1.publicAddrs,
-                       lastLanBase: nil, lastPubBase: nil,
+                       lastLanBase: nil, lastPubBase: nil, lanPool: nil,
                        gatewayKey: v1.gatewayKey, homeModel: v1.homeModel,
                        awayModel: v1.awayModel, port: v1.port, gistId: v1.gistId,
                        gistOwner: v1.gistOwner, providers: nil, activeProvider: nil)
@@ -181,6 +196,15 @@ final class Settings: ObservableObject {
         publicAddrs = s?.publicAddrs ?? []
         lastLanBase = s?.lastLanBase ?? ""
         lastPubBase = s?.lastPubBase ?? ""
+        // 老数据没有这个字段（nil）：用上次成功的内网地址给它"种"一颗种子，
+        // 这样升级上来的用户第一轮探测就有可用的历史地址，不用从零猜。
+        if let pool = s?.lanPool, !pool.isEmpty {
+            lanPool = pool
+        } else if let seed = s?.lastLanBase, let h = URL(string: seed)?.host, !h.isEmpty {
+            lanPool = [h]
+        } else {
+            lanPool = []
+        }
         gatewayKey = s?.gatewayKey ?? ""
         homeModel = s?.homeModel ?? ""
         awayModel = s?.awayModel ?? ""
@@ -202,6 +226,7 @@ final class Settings: ObservableObject {
     private func store() {
         let s = Stored(lanHost: lanHost, publicDomain: publicDomain, publicAddrs: publicAddrs,
                        lastLanBase: lastLanBase, lastPubBase: lastPubBase,
+                       lanPool: lanPool,
                        gatewayKey: gatewayKey,
                        homeModel: homeModel, awayModel: awayModel, port: port,
                        gistId: gistId, gistOwner: gistOwner,
@@ -227,28 +252,63 @@ final class Settings: ObservableObject {
     /// 每次冷启动都要在这个死地址上空等两秒 —— 这就是"未连接"的直接原因。
     var lanCandidates: [String] {
         var list: [String] = []
+        func add(_ h: String) {
+            let t = h.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !t.isEmpty, !list.contains(t) else { return }
+            list.append(t)
+        }
 
-        // 1) 用户手动填的，最可信
-        if !lanHost.isEmpty { list.append(lanHost) }
+        // 1) 用户手动填的，最可信（他填了就是他知道）
+        add(lanHost)
 
-        // 2) 手机当前 WiFi 网段推导（最能反映"现在这个 WiFi 是哪一段"）
-        //    家用路由器管理地址绝大多数落在这几个尾巴上
+        // 2) 学到过的地址池：这些**真的连通过**，比任何猜测都可靠。
+        //    路由器换网段时，旧地址会在这里被跳过，新学到的地址排最前面。
+        for h in lanPool { add(h) }
+
+        // 3) 手机当前 WiFi 网段推导（最能反映"现在这个 WiFi 是哪一段"）
+        //
+        //    2026-10-31 扩充：原来只试 88/250/1 三个尾巴，只覆盖了很小一部分路由器。
+        //    现在补上家用设备常见的其它尾巴（2/254/100/10/8/18/3），
+        //    并且这些都只是并发候选，多一个不增加总耗时（最坏也就等一个 0.9 秒）。
         if let myIP = NetInfo.wifiIPv4() {
             let parts = myIP.split(separator: ".")
             if parts.count == 4 {
                 let seg = "\(parts[0]).\(parts[1]).\(parts[2])"
-                for tail in ["88", "250", "1"] {
-                    let h = "\(seg).\(tail)"
-                    if !list.contains(h) { list.append(h) }
+                for tail in ["88", "250", "1", "2", "254", "100", "10", "8", "18", "3"] {
+                    add("\(seg).\(tail)")
                 }
             }
         }
 
-        // 3) 历史已知地址兜底（手机没拿到 WiFi IP 时才会用到）
-        for h in ["192.168.1.88", "192.168.1.250", "192.168.2.1"] where !list.contains(h) {
-            list.append(h)
+        // 4) 历史已知地址 + ZeroTier 固定地址兜底。
+        //
+        //    `10.47.67.100` 是路由器上 ZeroTier 的固定 IP：手机装了 ZeroTier 的话，
+        //    在外面用流量也能走这条（实测 DIRECT 59ms，比域名快一个数量级）。
+        //    没装的时候它会超时，但因为候选是并发探测的，不会拖慢别人。
+        for h in ["192.168.1.88", "10.47.67.100", "192.168.1.250", "192.168.2.1"] {
+            add(h)
         }
         return list
+    }
+
+    /// 记下一个「真的连通过」的内网地址。
+    ///
+    /// 调用时机：任何一次 /health 探测成功。学到的地址会一直带着，
+    /// 下次换到同一个网段时直接命中，不用再从一堆猜测里挨个试。
+    ///
+    /// 只学 IPv4 字面量：`lanHost` 这个字段是被当作 `http://<host>:<port>`
+    /// 拼接的，塞进去一个域名或 IPv6 会把地址拼坏。
+    func learnLan(_ host: String) {
+        let h = host.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !h.isEmpty, !h.contains(":"), h.contains(".") else { return }
+        // 回环 / 自分配地址没有任何意义，别污染池子
+        guard !h.hasPrefix("127."), !h.hasPrefix("169.254.") else { return }
+
+        var next = lanPool.filter { $0 != h }
+        next.insert(h, at: 0)
+        if next.count > 8 { next = Array(next.prefix(8)) }
+        if next != lanPool { lanPool = next }
+        if lanHost != h { lanHost = h }
     }
 
     // MARK: 来源

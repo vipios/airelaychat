@@ -121,6 +121,12 @@ final class ChatStore: ObservableObject {
             base = cached.base
             place = cached.place
         }
+
+        // 顺手把公网域名的连接预热掉。
+        // 用户在外面用流量时域名是唯一通路，而它冷启动要 2.7~4.3 秒。
+        // 改成"一打开就开始握手"，等用户真正发消息时连接已经热了。
+        // 不阻塞任何东西，失败也无声无息。
+        client.prewarm()
     }
 
     // MARK: 连接灯

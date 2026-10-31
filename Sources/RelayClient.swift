@@ -14,7 +14,15 @@ struct ModelList: Decodable {
 struct HealthInfo: Decodable {
     let status: String?
     let build: String?
+    /// 公网 IPv6 列表（只在内网来源时返回）
     let addrs: [String]?
+    /// 中转站自己的局域网 IPv4 列表（只在内网来源时返回）。
+    ///
+    /// 2026-10-31 新增，为了解决「路由器换网段 App 就连不上」这个老问题。
+    /// 有了这个字段，App 只要在某一次连上时（哪怕走的是公网域名）读到它，
+    /// 就等于**从中转站嘴里问到了它现在的内网地址**，直接存进地址池，
+    /// 下次在家打开就能秒连，不用再靠猜网段。
+    let lan: [String]?
 }
 
 /// Gist 里 relay-addr.json 的结构（路由器每 5 分钟自动写一次）
@@ -179,16 +187,142 @@ final class RelayClient {
         let bases = hosts.map { "http://\($0):\(port)" }
         guard let hit = await firstAlive(bases, timeout: 0.9, session: lanSession) else { return nil }
         let host = hosts[hit.index]
-        // 记住这次能通的地址，下次优先试它（只有真的变了才写，避免反复落盘）
+
+        // 记住这次能通的地址，并且在池子里把它提到最前面 —— 下次优先试它。
+        // 2026-10-31：同时把中转站自己上报的内网地址也一并学进来，
+        // 这样换网段后 App 不需要靠猜也能知道设备在哪。
+        let reported = hit.health.lan ?? []
         await MainActor.run {
-            if settings.lanHost != host { settings.lanHost = host }
+            settings.learnLan(host)
+            for h in reported { settings.learnLan(h) }
             if settings.lastLanBase != hit.base { settings.lastLanBase = hit.base }
         }
         return (hit.base, hit.health)
     }
 
-    // MARK: - 在外判定（先试域名，再试缓存 IPv6）
+    // MARK: - 预热
 
+    /// 提前把公网域名的连接热起来（DNS 解析 + TCP + TLS + Cloudflare 隧道）。
+    ///
+    /// 实测数据：域名冷启动第一次 4.3 秒，紧接着第二次 2.7 秒 —— 差的这 1.6 秒
+    /// 全是握手开销。App 一启动就在后台打这一枪，等用户真正敲完字发消息时，
+    /// 连接已经热的，首字能明显快一截。
+    ///
+    /// 打失败完全无所谓：这里只是热身，不写任何状态、不影响任何判定逻辑。
+    /// 用 detached + utility 优先级，不跟界面抢资源。
+    func prewarm() {
+        let s = session
+        Task.detached(priority: .utility) {
+            let base: String? = await MainActor.run { Settings.shared.domainBase }
+            guard let base = base else { return }
+            _ = await probeHealth(base, timeout: 9.0, session: s)
+        }
+    }
+
+    // MARK: - 全段扫描（最后的兜底）
+
+    /// 扫描手机当前 /24 网段的全部 254 个地址，找出中转站在哪。
+    ///
+    /// 2026-10-31 用户要求：「让我在外面无忧无虑地用，彻底解决连不上的问题」。
+    ///
+    /// 前两层（地址池 + 网段推导）都是"猜"，路由器只要落到从没见过的地址上
+    /// 就猜不中。这一层不猜 —— 直接把整个网段扫一遍，一定能找到。
+    ///
+    /// 为什么成本可以接受：
+    ///   - 只看当前 /24，一共 254 个地址，不是整个内网
+    ///   - 单个超时 0.35 秒（同网段设备实测 20~50ms 就回，0.35 秒绰绰有余）
+    ///   - 每批 64 个并发（iOS 对单机并发连接有上限，64 是安全值）
+    ///   - 找到第一个立刻返回，后续全部取消
+    /// 最坏情况（网段里真没有）约 254/64 × 0.35 ≈ 1.4 秒。
+    ///
+    /// 而且它只在「地址池和推导地址全都失败」之后才跑，正常在家时永远不会触发。
+    func scanSubnet() async -> (base: String, health: HealthInfo)? {
+        guard let myIP = NetInfo.wifiIPv4() else { return nil }
+        let parts = myIP.split(separator: ".")
+        guard parts.count == 4 else { return nil }
+        let seg = "\(parts[0]).\(parts[1]).\(parts[2])"
+
+        let port = await MainActor.run { settings.port }
+        // 已经试过的地址不重复扫（省掉几十个必然失败的目标）
+        let known = await MainActor.run { Set(settings.lanCandidates) }
+
+        var bases: [String] = []
+        for i in 1...254 {
+            let h = "\(seg).\(i)"
+            if h == myIP || known.contains(h) { continue }
+            bases.append("http://\(h):\(port)")
+        }
+        guard !bases.isEmpty else { return nil }
+
+        let s = lanSession
+        var i = 0
+        while i < bases.count {
+            let end = min(i + 64, bases.count)
+            let chunk = Array(bases[i..<end])
+            if let hit = await firstAlive(chunk, timeout: 0.35, session: s) {
+                let host = URL(string: hit.base)?.host ?? ""
+                await MainActor.run {
+                    if !host.isEmpty { settings.learnLan(host) }
+                    for h in (hit.health.lan ?? []) { settings.learnLan(h) }
+                    if settings.lastLanBase != hit.base { settings.lastLanBase = hit.base }
+                }
+                return (hit.base, hit.health)
+            }
+            i = end
+        }
+        return nil
+    }
+
+    /// 最后的兜底：ZeroTier 固定地址 +（连着 WiFi 时）整个网段扫描。
+    ///
+    /// 走到这里说明域名、裸 IPv6、缓存地址、网段推导**全都失败了**。
+    /// 这两条路是最后的希望：
+    ///   - **ZeroTier** `10.47.67.100:8080`：手机装了 ZeroTier 客户端并加入
+    ///     家里那个网络就能用。实测 DIRECT 59ms，比域名快一个数量级，
+    ///     而且完全不依赖 Cloudflare 隧道是否活着。
+    ///   - **全段扫描**：连着 WiFi 但网段陌生时，把 254 个地址扫一遍找设备。
+    ///
+    /// 两者并发，谁先通用谁。只有这样，才能说「不管什么情况都能连上」——
+    /// 域名挂了还有 ZeroTier，ZeroTier 没装还有内网扫描，内网换了网段也能扫出来。
+    private func lastResort() async -> (base: String, place: NetPlace)? {
+        let port = await MainActor.run { settings.port }
+        let zt = "http://10.47.67.100:\(port)"
+        let onWiFi = NetInfo.hasUsableWiFi()
+        let s = session
+
+        // 元素用 (地址, 是不是内网) 而不是带 NetPlace 的元组：
+        // 基础类型在并发闭包之间传递更安全，不会被 Sendable 检查挑刺。
+        let hit = await withTaskGroup(of: (String, Bool)?.self) { group -> (String, Bool)? in
+            group.addTask {
+                // 没装 ZeroTier 时这里会超时，但因为和扫描是并发的，不额外拖时间
+                await probeHealth(zt, timeout: 4.0, session: s) != nil ? (zt, false) : nil
+            }
+            if onWiFi {
+                group.addTask { [weak self] in
+                    guard let self = self else { return nil }
+                    if let r = await self.scanSubnet() { return (r.base, true) }
+                    return nil
+                }
+            }
+            var first: (String, Bool)?
+            for await r in group {
+                if let r = r { first = r; break }
+            }
+            group.cancelAll()
+            return first
+        }
+
+        guard let h = hit else { return nil }
+        if h.1 {
+            return (h.0, .home)
+        }
+        await MainActor.run {
+            if settings.lastPubBase != h.0 { settings.lastPubBase = h.0 }
+        }
+        return (h.0, .away)
+    }
+
+    // MARK: - 在外判定（先试域名，再试缓存 IPv6）
     /// 探测固定域名（Cloudflare 隧道）。
     ///
     /// 单独一个方法而不是塞进 probePublic(addrs:)：那条走的是
@@ -204,6 +338,10 @@ final class RelayClient {
         if let h = await probeHealth(base, timeout: 8.0, session: session) {
             await MainActor.run {
                 if settings.lastPubBase != base { settings.lastPubBase = base }
+                // 2026-10-31：如果中转站上报了自己的内网地址，就学进来。
+                // 这意味着「在外面用流量走域名连过一次，回家就能直接命中内网」，
+                // 不需要再猜网段。
+                for ip in (h.lan ?? []) { settings.learnLan(ip) }
             }
             return (base, h)
         }
@@ -244,6 +382,18 @@ final class RelayClient {
     /// 为什么两条缓存分开存：在家用 `http://192.168.1.88:8080`，
     /// 在外用 `https://域名`，二者不能互相替代。合并成一个的话，
     /// 出门第一次打开会先拿内网地址去撞墙，反而更慢。
+    /// 用上次成功的地址快速验证一次。
+    ///
+    /// ⚠️ 2026-10-31 重写（这是「连不上」的核心 bug）：
+    ///
+    /// 原实现有两个致命问题：
+    ///   1. **串行**：先探内网 0.8 秒，失败了再探公网 2.5 秒，最坏 3.3 秒才出结果；
+    ///   2. **公网超时给太短**：域名走 Cloudflare 隧道，实测首包 2.7~4.3 秒，
+    ///      而这里只等 2.5 秒 —— 等于**每次都必然判失败**，然后清空缓存、
+    ///      退回去做全套探测，再等一轮。用户看到的就是「一直连不上」。
+    ///
+    /// 现在：两路并发、公网按域名/裸 IP 分别给 8 秒 / 4 秒、失败也不清缓存
+    /// （并发下坏缓存等于零成本，好缓存价值极大，清掉只会让下次更慢）。
     private func cachedCandidate() async -> (place: NetPlace, base: String)? {
         let lan = await MainActor.run { settings.lastLanBase }
         let pub = await MainActor.run { settings.lastPubBase }
@@ -251,26 +401,50 @@ final class RelayClient {
         // 内网缓存只在手机确实连着 WiFi 时才试：没连 WiFi 还拿内网地址去连，
         // 必定超时，纯粹浪费用户时间。
         let onWiFi = NetInfo.hasUsableWiFi()
+        let tryLan = onWiFi && !lan.isEmpty
+        let tryPub = !pub.isEmpty
+        guard tryLan || tryPub else { return nil }
 
-        if onWiFi, !lan.isEmpty,
-           await probeHealth(lan, timeout: 0.8, session: lanSession) != nil {
-            // 顺手把内网 host 同步回设置，设置页显示的就是"现在真正在用的地址"
-            if let h = URL(string: lan)?.host, !h.isEmpty {
-                await MainActor.run {
-                    if settings.lanHost != h { settings.lanHost = h }
+        // 先取到局部常量再进 TaskGroup：闭包不捕获 self，避免并发告警
+        let lanS = lanSession
+        let pubS = session
+
+        let hit = await withTaskGroup(of: (Int, String)?.self) { group -> (Int, String)? in
+            if tryLan {
+                group.addTask {
+                    await probeHealth(lan, timeout: 0.9, session: lanS) != nil ? (0, lan) : nil
                 }
             }
-            return (.home, lan)
+            if tryPub {
+                group.addTask {
+                    // 域名（https）给 8 秒：隧道冷启动实测 2.7~4.3 秒，
+                    // 给 4 秒都不够稳。裸 IPv6 直连给 4 秒。
+                    let t: TimeInterval = pub.hasPrefix("https://") ? 8.0 : 4.0
+                    await probeHealth(pub, timeout: t, session: pubS) != nil ? (1, pub) : nil
+                }
+            }
+            var lanHit: (Int, String)?
+            var pubHit: (Int, String)?
+            for await r in group {
+                guard let r = r else { continue }
+                // 内网通了就立刻收工（它比域名快一个数量级）
+                if r.0 == 0 { lanHit = r; break }
+                // 公网先到也先记着，继续等内网那一秒
+                if pubHit == nil { pubHit = r }
+            }
+            group.cancelAll()
+            return lanHit ?? pubHit
         }
-        if !pub.isEmpty, await probeHealth(pub, timeout: 2.5, session: session) != nil {
-            return (.away, pub)
+
+        guard let h = hit else { return nil }
+        if h.0 == 0 {
+            // 顺手把这个地址学进池子，并同步到设置页显示
+            if let host = URL(string: h.1)?.host, !host.isEmpty {
+                await MainActor.run { settings.learnLan(host) }
+            }
+            return (.home, h.1)
         }
-        // 缓存都不通：清掉，避免下次继续拿死地址试
-        await MainActor.run {
-            if !lan.isEmpty { settings.lastLanBase = "" }
-            if !pub.isEmpty { settings.lastPubBase = "" }
-        }
-        return nil
+        return (.away, h.1)
     }
 
     // MARK: - Gist 读地址（三路降级）
@@ -376,10 +550,21 @@ final class RelayClient {
                 if let addrs = health.addrs, !addrs.isEmpty {
                     await MainActor.run { settings.publicAddrs = addrs }
                 }
+                // 顺手把中转站上报的内网地址学进池子（换网段后靠它秒连）
+                if let lans = health.lan, !lans.isEmpty {
+                    await MainActor.run { for h in lans { settings.learnLan(h) } }
+                }
                 return (.home, base, health)
             case .pub(let pub):
                 return (.away, pub, nil)
             case .none:
+                // 上面两条路都不通 —— 进最后的兜底。
+                // 走到这里说明地址池和网段推导都没命中（典型场景：路由器换到了
+                // 一个从没见过的网段），ZeroTier 和全段扫描是唯一剩下的办法。
+                // 只要命中，地址就进了池子，下次打开直接秒连。
+                if let r = await lastResort() {
+                    return (r.place, r.base, nil)
+                }
                 return (.unknown, nil, nil)
             }
         }
@@ -387,6 +572,12 @@ final class RelayClient {
         // 没连 WiFi（流量）：直接走公网，一步到位
         if let pub = await publicCandidate() {
             return (.away, pub, nil)
+        }
+        // 域名和裸 IPv6 都不行 —— 试 ZeroTier。
+        // 这是「在外面」的最后一道保险：域名要依赖 Cloudflare 隧道活着，
+        // ZeroTier 不需要，只要手机装了客户端并加入网络就能直连。
+        if let r = await lastResort() {
+            return (r.place, r.base, nil)
         }
         return (.unknown, nil, nil)
     }

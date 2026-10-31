@@ -327,10 +327,38 @@ struct SettingsView: View {
                         AdminKey.save(v)
                     }
             }
+
+            // 已记住的内网地址。
+            //
+            // 2026-10-31 用户要求「彻底解决连不上」：把 App 学到的东西摊开给用户看。
+            // 出问题时一眼能知道它记住了哪些地址、是不是记了个已经作废的，
+            // 而不是只能干等着看「连接中…」。
+            if !settings.lanPool.isEmpty {
+                HStack(alignment: .top) {
+                    Text("已记住")
+                    Spacer()
+                    VStack(alignment: .trailing, spacing: 3) {
+                        ForEach(settings.lanPool, id: \.self) { ip in
+                            Text(ip)
+                                .font(.system(size: 12, design: .monospaced))
+                                .foregroundStyle(.secondary)
+                        }
+                    }
+                }
+                Button(role: .destructive) {
+                    // 万一记了一堆作废地址（比如搬了家、换了路由器），
+                    // 给一个一键清空的出口，让 App 从干净状态重新学。
+                    settings.lanPool = []
+                    settings.lastLanBase = ""
+                } label: {
+                    Text("清空记住的地址")
+                        .font(.system(size: 14))
+                }
+            }
         } header: {
             Text("家里中转站")
         } footer: {
-            Text("地址留空会自动试常见网段，哪个通用哪个并记住。\n\n固定域名填中转站的公网域名（如 your.domain.com）。填了之后在外面优先走它，不依赖手机有没有 IPv6。\n\n「访问密钥」是给聊天用的网关 Key（sk-…）；「后台密钥」是打开网页后台时输的密码，重启路由器要用它，两个不一样。")
+            Text("地址留空会自动找：先试记住过的地址，再按当前 WiFi 网段推，最后把整个网段扫一遍，哪个通用哪个并记住。\n\n固定域名填中转站的公网域名（如 your.domain.com）。填了之后在外面优先走它，不依赖手机有没有 IPv6。\n\n「访问密钥」是给聊天用的网关 Key（sk-…）；「后台密钥」是打开网页后台时输的密码，重启路由器要用它，两个不一样。")
         }
     }
 
@@ -410,18 +438,27 @@ struct SettingsView: View {
                 }
             }
             Button {
-                // 清掉"上次成功地址"缓存，逼它重新探一遍。
-                // 换了 WiFi、光猫改了网段、或者出门很久再回来时会用得上。
+                // 清掉所有缓存，逼它从零开始找一遍。
+                //
+                // 2026-10-31：现在这条路会一路退到底 ——
+                //   记住的地址 → 当前网段推导 → **整个网段扫 254 个地址**。
+                // 所以这个按钮就是「不管路由器换成什么网段都给我找出来」的开关。
+                // 换了 WiFi、光猫改了网段、搬了家、或者出门很久再回来都用它。
                 settings.lastLanBase = ""
                 settings.lastPubBase = ""
                 Task { await store.bootstrap() }
             } label: {
-                Label("重新判定在家/在外", systemImage: "arrow.triangle.2.circlepath")
+                HStack {
+                    Label("彻底重查连接", systemImage: "arrow.triangle.2.circlepath")
+                    Spacer()
+                    if store.detecting { ProgressView().scaleEffect(0.8) }
+                }
             }
+            .disabled(store.detecting)
         } header: {
             Text("当前连接")
         } footer: {
-            Text("打开软件时会自动判断：连家里 WiFi 走内网直连，否则走固定域名。切网络时会自动重新判断，一般不用管这里。")
+            Text("打开软件时会自动判断：连家里 WiFi 走内网直连，否则走固定域名。\n\n点了没反应或一直「连接中」的时候按上面那个按钮 —— 它会清掉旧地址，把整个网段扫一遍重新找，一般十几秒内就有结果。")
         }
     }
 
