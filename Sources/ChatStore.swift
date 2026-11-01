@@ -1585,11 +1585,15 @@ final class ChatStore: ObservableObject {
         // 把回复拆成「正文」和「代码块」两部分
         let parts = Self.splitCodeBlocks(body)
 
-        // 判定标准（2026-11-02 第三次收紧，见 isRealDeliverable 里的详细说明）：
+        // 判定标准（2026-11-02 第四次收紧，见 isRealDeliverable 里的详细说明）：
         //   只有「点了名的文件名」或「成规模的代码块」才算交付物。
         //   聊天过程里的解释、步骤、`dpkg -l` 这种行内引用、一两行示例命令，
         //   一律不算 —— 用户明确说过「我们聊天的途中所有的对话不是产物」。
-        guard Self.isRealDeliverable(body, parts: parts) else { return }
+        //
+        // ⚠️ 2026-11-02 再修：这里原本传的是 `body`（含代码块），
+        // 于是代码里出现的 `Path("artifact.txt")` 也被当成"正文点名了产物"。
+        // 现在只把**正文部分**交给判定，代码块按自己的规模单独算。
+        guard Self.isRealDeliverable(prose: parts.prose, blocks: parts.blocks) else { return }
 
         // 找这条回复对应的那个问题，做成文件标题
         var question = ""
@@ -1632,39 +1636,84 @@ final class ChatStore: ObservableObject {
             return
         }
 
-        // 正文里点名过的文件名，按出现顺序取出来给代码块用 ——
-        // 「生成三个文件：a.sh / b.py / c.json」这种写法很常见，
-        // 用真名比 「产出-1.sh」「产出-2.py」可读得多。
+        // 正文里点名过的文件名，按**扩展名**分组，等会儿给对应的代码块认领。
+        //
+        // ⚠️ 2026-11-02 修（用户给的完整截图，5 个产物 3 个是垃圾）。
+        //
+        // 上一版是**按下标硬配**：`named[n]` 配第 n 个代码块。
+        // 而那条回复里正文只点了 3 个名字（make_bundle.py / artifact.txt /
+        // artifact.md），代码块却有 5 个（多出 `python make_bundle.py` 和
+        // `unzip -l bundle_v2.zip` 两条示例命令）。于是：
+        //   · 第 2 个名字 artifact.txt 被配给了一条 bash → 生成 artifact-sh.sh（22 B）
+        //   · 第 3 个名字 artifact.md 也被配给 bash → 又一个 artifact-sh.sh（23 B）
+        //   · 真正的 txt / md 块没名字了，只能用提问当标题
+        // 用户看到的就是"名字不对劲 + 一堆几十字节的垃圾 + 两个重名"。
+        //
+        // 现在改成**按扩展名配对**：py 块去拿 .py 的名字、txt 块去拿 .txt 的名字，
+        // 配不上就用提问兜底。示例命令（bash 短块）根本进不了这一步，
+        // 因为它们过不了下面的规模判定。
         let named = Self.namedFileNames(in: body)
+        var namePool: [String: [String]] = [:]      // ext -> [完整文件名]
+        for f in named {
+            let e = (f as NSString).pathExtension.lowercased()
+            namePool[e, default: []].append(f)
+        }
 
-        for (n, block) in parts.blocks.enumerated() {
+        // 已经用掉的标题，用来判断要不要补扩展名区分
+        var usedTitles = Set<String>()
+
+        for block in parts.blocks {
             // 太短的代码块当"示例命令"，不单独存。
-            // 和 isRealDeliverable 里 ≥8 行的口径一致，避免一份产物被拆成一堆碎片。
+            //
+            // ⚠️ 这里**必须只看这一个块自己的行数**。
+            // 上一版写的是 `lines.count >= 8 || parts.blocks.count >= 2` ——
+            // 后半句意味着"只要回复里有两个以上代码块，所有块都算产物"，
+            // 那两条一行的 bash 示例命令就是靠这个混进来的（22 B / 23 B）。
+            // 用户要的是"生成的产物"，不是"回复里出现过的每一段代码"。
             let lines = block.code.split(separator: "\n", omittingEmptySubsequences: false)
-            let ext = Self.extForBlock(lang: block.lang, code: block.code)
-            let isDeliverable = lines.count >= 8 || parts.blocks.count >= 2
-            guard isDeliverable else { continue }
+            guard lines.count >= 8 else { continue }
 
-            // 标题优先级：正文点名的文件名 > 「提问-序号」
-            // 注意 named 里存的是完整文件名（含扩展名），写文件时要剥掉扩展名，
-            // 否则会变成 "deploy.sh-20261102-041500.sh" 这种重名。
+            // 只有空行/几行 echo 的块也不要：那是演示，不是文件。
+            //
+            // 判据是"有实质内容的行至少 3 行"。`#` 开头的算注释不算内容，
+            // 纯 echo / print 一句话的也不算 —— 用户截图里那两个 22/23 字节的
+            // `artifact-sh.sh` 就是这种东西，它是"我要怎么运行"的示例，
+            // 不是"我产出的文件"。
+            let meaningful = lines.filter { line in
+                let t = line.trimmingCharacters(in: .whitespaces)
+                guard t.count >= 2, !t.hasPrefix("#") else { return false }
+                // 去掉 shell 里最典型的"只打印"语句
+                let low = t.lowercased()
+                if low.hasPrefix("echo ") || low.hasPrefix("print(") { return false }
+                return true
+            }
+            guard meaningful.count >= 3 else { continue }
+
+            let ext = Self.extForBlock(lang: block.lang, code: block.code)
+
+            // 标题优先级：正文里同扩展名的文件名 > 提问
             var title = baseTitle
-            if n < named.count {
-                let full = named[n]
+            if var pool = namePool[ext], !pool.isEmpty {
+                let full = pool.removeFirst()
+                namePool[ext] = pool
                 let stem = (full as NSString).deletingPathExtension
                 if !stem.isEmpty { title = stem }
-            } else if parts.blocks.count > 1 {
-                title = "\(baseTitle)-\(n + 1)"
             }
 
-            // ⚠️ 同一条回复里出现同名不同格式（server.sh + server.py）时，
-            // 光靠标题分不开 —— 两个文件都叫 server-<时间戳>.{sh,py}，
-            // 在「我的文件」里并排两条一样的名字，用户看不出区别。
-            // 所以多产物的情况下统一把扩展名缀到标题后面。
-            // 单产物不缀（叫什么由提问决定了，多挂个 .sh 反而啰嗦）。
-            if parts.blocks.count > 1 {
-                title = "\(title)-\(ext)"
+            // 同名不同格式（server.sh + server.py）要区分开，否则文件库里
+            // 两条一样的名字。只有在**真的撞名**时才补后缀 ——
+            // 一律补会得到 `make_bundle-py.py` 这种把扩展名写了两遍的怪名字
+            // （用户截图里那个就是）。
+            //
+            // 补的是 `-2`、`-3` 这样的序号，不是扩展名：
+            // 文件本身已经带 .sh / .py 了，标题再挂一遍「-py」是重复信息，
+            // 用户一眼看不出这是第二个还是不同类型的同一个。
+            if usedTitles.contains(title) {
+                var k = 2
+                while usedTitles.contains("\(title)-\(k)") { k += 1 }
+                title = "\(title)-\(k)"
             }
+            usedTitles.insert(title)
 
             var doc = ""
             if !question.isEmpty, parts.blocks.count == 1 {
@@ -1838,13 +1887,18 @@ final class ChatStore: ObservableObject {
     ///   3. **多段代码块**：≥ 2 个代码块（说明在给一整份实现，不是贴个片段）。
     ///
     /// 只要都不满足 → 这就是聊天记录，不生成任何产物文件。
-    private static func isRealDeliverable(_ body: String,
-                                          parts: (prose: String, blocks: [(lang: String, code: String)])) -> Bool {
+    ///
+    /// ⚠️ 2026-11-02 再改一处：条件 1 原来扫的是**整条回复**（含代码块），
+    /// 于是代码里写着 `Path("artifact.txt")`、`z.write("artifact.md")`
+    /// 也被当成"正文点名了产物"，判定被代码内容带着跑。
+    /// 现在严格只看代码块之外的正文。
+    private static func isRealDeliverable(prose: String,
+                                          blocks: [(lang: String, code: String)]) -> Bool {
         // 条件 1：正文里点名了具体文件名（带这些扩展名）
         let fileExts = [".deb", ".md", ".swift", ".py", ".sh", ".json", ".zip",
                         ".tar", ".gz", ".plist", ".m", ".h", ".js", ".html",
                         ".css", ".yml", ".yaml", ".toml", ".txt", ".ps1", ".bat"]
-        let lower = body.lowercased()
+        let lower = prose.lowercased()
         for ext in fileExts {
             // 形如 `名字.ext`：扩展名前面必须跟着字母/数字/下划线，
             // 避免把 ".sh" 这种纯后缀词（"the .sh file"）误判；
@@ -1865,7 +1919,11 @@ final class ChatStore: ObservableObject {
         }
 
         // 条件 2 / 3：代码块要成规模
-        let blocks = parts.blocks
+        //
+        // 这里仍然保留 "≥2 个块" 这条 —— 它的含义是"这条回复在交付一整份东西"
+        // （比如 sh + py + json 三件套）。但**每个块还要自己再过一遍规模判定**
+        // 才能落盘（见 archiveReply 里的 `lines.count >= 8`），
+        // 所以"两个块里有一个是 1 行示例命令"不会导致那条命令也被存下来。
         if blocks.count >= 2 { return true }
         for b in blocks {
             let lines = b.code.split(separator: "\n", omittingEmptySubsequences: false)
