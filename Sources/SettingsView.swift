@@ -28,6 +28,16 @@ struct SettingsView: View {
     @State private var waitingBack = false
     /// 后台密钥（access_key）的输入草稿。落盘走钥匙串，见 body 里的 onChange。
     @State private var adminKeyDraft = AdminKey.load()
+    /// 刚验证通过的一次性提示（2026-11-02）。
+    ///
+    /// 用户原话：「aa926453 我已经填进去了，你让他有一个刷新啊，填完了他什么反应都没有」。
+    /// 密钥本来就是对的（实测这个 access_key 调 /admin/api/device 返回 200），
+    /// 问题纯粹是**填完之后界面没有任何变化**：底部那条红字还是上一次的残留，
+    /// 设备信息也不刷新，用户只能靠猜。
+    ///
+    /// 现在填完会自动验证一次，通过了就把这句话显示在「后台密钥」下面，
+    /// 2 秒后自己消失（不用用户手动关，也不占地方）。
+    @State private var adminKeyOK = false
 
     /// 长按某个来源 → 改名。用 alert 是因为 iOS 的 contextMenu 里
     /// 不能内嵌输入框，改名只能另开一层。
@@ -335,11 +345,56 @@ struct SettingsView: View {
                     .multilineTextAlignment(.trailing)
                     .autocorrectionDisabled()
                     .textInputAutocapitalization(.never)
+                    // 2026-11-02 用户：「aa926453 我已经填进去了，你让他有一个刷新啊，
+                    // 填完了他什么反应都没有」。
+                    //
+                    // 原来的 `onChange` 只做了一件事：存钥匙串。存完界面毫无反应 ——
+                    // 底部那条「后台密钥不对或没填」的红字**还是照旧挂着**
+                    //（它是上一次 devMsg 的残留），用户当然会以为没生效、
+                    // 甚至以为填了没用，然后反复重填。
+                    //
+                    // 现在改成分两步：
+                    //   · 边输边存（`onChange` 每次按键都会来，所以只存不发请求）；
+                    //   · 停止输入 0.8 秒后再去验证一次（`.task(id:)` 做防抖），
+                    //     验证成功就把红字清掉、把设备状态显示出来；
+                    //     失败就换成"密钥不对"的提示，而不是一直挂着旧的。
+                    //
+                    // 为什么不在 onChange 里直接发请求：SecureField 是逐字触发的，
+                    // 输 8 位密码会发 8 次 /health，弱 CPU 的路由器直接被刷爆。
                     .onChange(of: adminKeyDraft) { v in
                         // 存钥匙串，和「后台面板」共用同一条记录 ——
                         // 在哪边填过，另一边就自动能用，不用填两次。
                         AdminKey.save(v)
+                        // 换密钥了，之前的报错立刻清掉，别让用户看着旧红字犹豫。
+                        // 这个清空是"乐观"的：真的不对，0.8 秒后会被重新写上。
+                        if !v.isEmpty { devMsg = nil }
                     }
+                    .task(id: adminKeyDraft) {
+                        // `task(id:)` 在 id 变化时会取消上一轮、重新起一个 Task，
+                        // 正好当防抖用：连续输入 8 个字符，前面 7 轮全被取消，
+                        // 只有停下来之后那一轮能跑到 `sleep` 结束。
+                        guard !adminKeyDraft.trimmingCharacters(in: .whitespaces).isEmpty else { return }
+                        // 0.8 秒：比一般人打字的间隔长一点，又短到不会让人等。
+                        try? await Task.sleep(nanoseconds: 800_000_000)
+                        // 被取消说明用户还在打字，直接退出（取消的 Task 走不到这里，
+                        // 但保险起见还是判一下）。
+                        guard !Task.isCancelled else { return }
+                        await loadDevice()
+                    }
+            }
+            // 「密钥已生效」的回执。放在这一行下面而不是弹窗：
+            // 弹窗要手动点掉，而用户此刻想知道的只是"我刚才那次输入算数吗"。
+            if adminKeyOK {
+                HStack(spacing: 5) {
+                    Image(systemName: "checkmark.circle.fill")
+                        .font(.system(size: 12))
+                        .foregroundStyle(.green)
+                    Text("密钥已生效，后台能进了")
+                        .font(.system(size: 12))
+                        .foregroundStyle(.green)
+                    Spacer()
+                }
+                .transition(.opacity)
             }
 
             // 已记住的内网地址。
@@ -625,7 +680,16 @@ struct SettingsView: View {
         do {
             devStatus = try await RelayClient.shared.deviceStatus(base: b, key: settings.accessKey)
             devMsg = nil
+            // 2026-11-02：验证通过就给一个 2 秒的绿字回执。
+            // 只在「用户刚改过密钥」之后有意义，但多亮一次也不碍事 ——
+            // 下拉刷新时同样会亮，等于顺手告诉用户"现在连接是好的"。
+            withAnimation(.easeOut(duration: 0.2)) { adminKeyOK = true }
+            Task {
+                try? await Task.sleep(nanoseconds: 2_000_000_000)
+                withAnimation(.easeOut(duration: 0.3)) { adminKeyOK = false }
+            }
         } catch {
+            withAnimation(.easeOut(duration: 0.2)) { adminKeyOK = false }
             devMsg = authHint(error)
         }
     }

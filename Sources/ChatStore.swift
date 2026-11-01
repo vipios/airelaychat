@@ -1,5 +1,8 @@
 import SwiftUI
 import UIKit
+// 2026-11-02 加：流式节流用 CFAbsoluteTimeGetCurrent() 取时间戳，
+// 它属于 CoreFoundation，显式 import 一下比靠 SwiftUI 间接引入可靠。
+import Foundation
 
 // MARK: - 主界面状态
 
@@ -31,6 +34,41 @@ final class ChatStore: ObservableObject {
     /// 起手看门狗：万一模型/连接有问题根本没发出去，几秒后把标记复位，
     /// 否则按钮会一直卡在"整理中"。
     private var handoffWatch: Task<Void, Never>?
+
+    // MARK: - 流式输出的节流缓冲（2026-11-02 修「上滑到底字体一直跳」，第四次）
+
+    /// 还没写进界面的流式文字。
+    ///
+    /// ⚠️ 这是「滑到底以后文字一秒抖几十下」的**真正病根**，前面三版都改错地方了。
+    ///
+    /// 原来每个 SSE delta 都这么写：
+    /// ```swift
+    /// client.stream(...) { delta in
+    ///     Task { @MainActor in self.messages[idx].text += delta }
+    /// }
+    /// ```
+    /// 上游是按 token 推的，一秒能来几十个 delta，于是**一秒创建几十个 Task**，
+    /// 全部排到主线程上逐个执行。每执行一次 `messages[idx].text` 就变一次，
+    /// SwiftUI 就重算一次 `body`、重排一次列表 —— 这就是"一秒抖几十下"。
+    ///
+    /// 为什么偏偏"上滑到底"最明显：滑到底时整屏消息都在可视范围里，
+    /// 每次重排都要重新布局**整屏文字**；往上翻时视口里消息少，重排便宜，
+    /// 所以肉眼看不出。用户说"正常情况下上滑到底以后整个界面都是静止的"，
+    /// 正是这个意思 —— 界面停住了，但后台还在以帧率级别的频率改数据。
+    ///
+    /// 现在改成：delta 先攒进这个缓冲，由 `flushStream` 按固定节拍（约 20Hz）写入。
+    /// 从 60Hz 降到 20Hz，肉眼完全看不出延迟，但重排次数少了一个数量级。
+    private var streamBuf: String = ""
+    private var streamIdx: Int = -1
+    /// 把缓冲刷进界面的定时器。`sending` 结束时必须停掉。
+    private var streamFlush: Timer?
+    /// 上一次刷入的时间戳（用 CFAbsoluteTimeGetCurrent，跨平台且便宜）。
+    private var streamLastFlush: CFTimeInterval = 0
+    /// 两次刷入的最小间隔。0.05 秒 = 20Hz。
+    ///
+    /// 为什么是 20Hz 而不是更低：再低（比如 10Hz）能明显看出字是"一段一段蹦出来"的，
+    /// 流式的顺滑感就没了。20Hz 是"看不出延迟"和"重排次数够少"的平衡点。
+    private static let streamFlushInterval: CFTimeInterval = 0.05
     /// 刚换过来源/账号，界面提示「要不要把上一个 AI 的进度交接过来」。
     ///
     /// 2026-10-31 用户要求「换另一个账号的 AI 继续，别断开记忆」：
@@ -1422,12 +1460,23 @@ final class ChatStore: ObservableObject {
         }
 
         let key = settings.key(for: p)
+        // 2026-11-02：开流前把节流状态复位。
+        // 这一步必须在 `client.stream` 之前 —— 否则上一轮的残余缓冲
+        // 会被写进这一轮的新消息里（表现是"刚发的消息里夹着上次的尾巴"）。
+        beginStreamThrottle(idx: idx)
+        // ⚠️ 2026-11-02：收尾必须无条件执行，否则缓冲里没刷的字全丢，
+        // 而且 20Hz 定时器会在后台一直空转（费电、还会偶尔写已删除的消息）。
+        //
+        // 用 defer 而不是在每个 return 前手写一遍：下面 catch 分支里有三处
+        // 提前 return（撤回、Task 取消、以及正常路径），手动加必然漏。
+        defer { endStreamThrottle() }
         do {
             try await client.stream(base: b, key: key, model: model, messages: history) { delta in
-                Task { @MainActor in
-                    guard idx < self.messages.count else { return }
-                    self.messages[idx].text += delta
-                }
+                // 2026-11-02 修抖动：原来这里是
+                //   Task { @MainActor in self.messages[idx].text += delta }
+                // 一秒几十个 delta 就建几十个 Task，主线程被塞满、body 连续重算 ——
+                // 滑到底时整屏文字跟着抖。改成进节流缓冲，由定时器按 20Hz 统一写入。
+                Task { @MainActor in self.feedStream(delta, idx: idx) }
             }
         } catch is CancellationError {
             // 用户撤回导致的中断：不是错误，什么都不用提示。
@@ -1469,6 +1518,14 @@ final class ChatStore: ObservableObject {
                 await bootstrap(loadModels: false)
             }
         }
+        // ⚠️ 2026-11-02：这里必须先强制刷一次缓冲，再往下走。
+        //
+        // 为什么不能只靠上面的 defer：defer 是在**整个函数返回时**才执行的，
+        // 而下面 `syncCurrentSession()` 会立刻把 `messages[idx].text` 存进历史
+        // 并归档产物。如果那时缓冲里还有几个字没刷出来，存进去的就是残缺的回答
+        //（表现：界面上是全的，切走再回来少一截）。所以真正的收尾要在这里做，
+        // defer 只是兜底（防止上面某个提前 return 漏掉）。
+        endStreamThrottle()
         sending = false
         // 撤回场景下 messages 已经被改过了（占位气泡被删），
         // 这时候再 sync / archive 会写进一条已撤回的内容，必须挡掉。
@@ -1667,17 +1724,90 @@ final class ChatStore: ObservableObject {
         return f.string(from: Date())
     }
 
+    // MARK: - 流式输出的节流写入（2026-11-02）
+
+    /// 收到一段流式文字。**不直接写界面**，先攒进缓冲，到点再刷。
+    ///
+    /// 注意这里不是 `async`，也不建 Task —— 调用方在高频的 SSE 循环里，
+    /// 每来一个 delta 就建一个 Task 正是上一版抖动的原因。
+    /// `ChatStore` 已经是 `@MainActor`，直接从流回调里调这个方法就是安全的。
+    func feedStream(_ delta: String, idx: Int) {
+        // 换了消息（正常情况下不会，但撤回/重发时 idx 会变），
+        // 先把上一条没刷完的吐出去，别把两条的内容混在一起。
+        if streamIdx != idx {
+            flushStream(force: true)
+            streamIdx = idx
+        }
+        streamBuf += delta
+
+        // 距上次刷入还不到一个间隔：先攒着。
+        // 这里不排定时器，靠 `flushStream` 里那个 20Hz 定时器统一驱动 ——
+        // 每个 delta 都排一个定时器等于把 Task 堆积换成 Timer 堆积，一样抖。
+        let now = CFAbsoluteTimeGetCurrent()
+        if now - streamLastFlush >= Self.streamFlushInterval {
+            flushStream()
+        }
+    }
+
+    /// 把缓冲里的字一次性写进界面。
+    ///
+    /// `force: true` 用于收尾（流结束、撤回、换消息），保证不丢字。
+    func flushStream(force: Bool = false) {
+        guard !streamBuf.isEmpty, streamIdx >= 0 else { return }
+        guard streamIdx < messages.count else {
+            // 那条消息已经被删了（撤回），缓冲直接丢掉，别写坏数组
+            streamBuf = ""
+            streamIdx = -1
+            return
+        }
+        if !force {
+            let now = CFAbsoluteTimeGetCurrent()
+            if now - streamLastFlush < Self.streamFlushInterval { return }
+            streamLastFlush = now
+        }
+        messages[streamIdx].text += streamBuf
+        streamBuf = ""
+    }
+
+    /// 开始一轮发送时把节流状态复位。`runSend` 的收尾也要调 `endStreamThrottle`。
+    private func beginStreamThrottle(idx: Int) {
+        streamFlush?.invalidate()
+        streamBuf = ""
+        streamIdx = idx
+        streamLastFlush = 0
+        // 兜底节拍：就算 delta 来得零零散散，也保证攒下的字能按时出去。
+        // 0.05 秒一拍，和 `feedStream` 里的阈值一致。
+        streamFlush = Timer.scheduledTimer(withTimeInterval: Self.streamFlushInterval,
+                                          repeats: true) { [weak self] _ in
+            Task { @MainActor in self?.flushStream(force: true) }
+        }
+    }
+
+    /// 收尾：把剩下的一次性刷完，停掉定时器。
+    ///
+    /// **必须每次都调**：不调的话最后几个字会丢（缓冲里还没刷），
+    /// 而且定时器会一直在后台空转。
+    private func endStreamThrottle() {
+        flushStream(force: true)
+        streamFlush?.invalidate()
+        streamFlush = nil
+        streamBuf = ""
+        streamIdx = -1
+        streamLastFlush = 0
+    }
+
     /// 换地址后重发一次。成功返回 true（已有内容流进来）。
     private func retryStream(base nb: String, key: String, model: String,
                              history: [(role: String, text: String, attachments: [Attachment])],
                              idx: Int) async -> Bool {
         do {
             try await client.stream(base: nb, key: key, model: model, messages: history) { delta in
-                Task { @MainActor in
-                    guard idx < self.messages.count else { return }
-                    self.messages[idx].text += delta
-                }
+                // 2026-11-02：走节流，别再每个 delta 建一个 Task（那是抖动的根因）
+                Task { @MainActor in self.feedStream(delta, idx: idx) }
             }
+            // 刷一次再判断：不刷的话缓冲里还压着刚收到的字，
+            // 下面这行会读到空字符串，误判成"重试也没收到内容"。
+            flushStream(force: true)
             return !((idx < messages.count) && messages[idx].text.isEmpty)
         } catch {
             return false
