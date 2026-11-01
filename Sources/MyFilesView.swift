@@ -29,6 +29,10 @@ struct MyFilesView: View {
     @State private var exportRequest: ExportRequest?
     /// 长按「添加到对话」：先挂起，等用户在会话列表里选一个
     @State private var attachFile: AIFile?
+    /// 预览页点了分享 → 先选导出格式
+    @State private var exportTarget: AIFile?
+    /// 转好格式、等着走系统分享的那个文件
+    @State private var shareURL: URL?
     /// 多选模式
     @State private var picking = false
     @State private var picked: Set<String> = []
@@ -114,13 +118,14 @@ struct MyFilesView: View {
                         .navigationTitle(f.displayName)
                         .navigationBarTitleDisplayMode(.inline)
                         .toolbar {
+                            // 2026-11-02：这颗「分享」改成对齐官方 ——
+                            // 官方是「点预览页右上角的分享按钮 → 可以把产物导出为
+                            // PDF、DOCX、Markdown」。原来直接扔出原始 .md/.py，
+                            // 手机上既看不了、也没法发给别人。
+                            // 现在先弹格式选择，选完再走系统分享。
                             ToolbarItem(placement: .navigationBarTrailing) {
                                 Button {
-                                    preview = nil
-                                    // 等预览关掉再弹分享，两个 sheet 同时开会互相吞
-                                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.35) {
-                                        sharing = [f]
-                                    }
+                                    exportTarget = f
                                 } label: {
                                     Image(systemName: "square.and.arrow.up")
                                 }
@@ -131,6 +136,26 @@ struct MyFilesView: View {
                         }
                 }
                 .roundSheet(28)
+            }
+            // 导出格式选择（PDF / Word / Markdown）
+            .sheet(item: $exportTarget) { f in
+                ExportFormatSheet(file: f) { url in
+                    // 转换出来的是临时文件，直接走系统分享（存到"文件"/发微信/发邮件）。
+                    // 不塞进产物库：那是"我生成的交付物"，导出件是副本，
+                    // 混进去会让「全部产物」越用越多、还都是重复内容。
+                    shareURL = url
+                }
+                .roundSheet(28)
+            }
+            // 导出件的系统分享
+            .sheet(isPresented: Binding(
+                get: { shareURL != nil },
+                set: { if !$0 { shareURL = nil } }
+            )) {
+                if let u = shareURL {
+                    ShareSheet(items: [u])
+                        .presentationDetents([.medium, .large])
+                }
             }
             .sheet(isPresented: Binding(
                 get: { !sharing.isEmpty },

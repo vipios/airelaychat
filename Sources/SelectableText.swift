@@ -40,6 +40,12 @@ struct SelectableText: UIViewRepresentable {
     let onRecall: () -> Void
     /// 长按菜单里点「撤回并重新编辑」
     let onRecallAndEdit: () -> Void
+    /// 长按菜单里点「重新生成」（只给 AI 回复）。
+    ///
+    /// 2026-11-02 加，对齐官方：「长按某条 AI 回复，弹出操作菜单 →「重新生成」」。
+    /// 官方把这个动作放在**长按菜单**里，而不是塞在气泡下面那排小按钮。
+    /// 两处都留着：长按是主路径（不占地方），下面那排是给"不知道要长按"的人。
+    var onRegenerate: (() -> Void)? = nil
 
     func makeUIView(context: Context) -> PasteTextView {
         let tv = PasteTextView()
@@ -70,6 +76,7 @@ struct SelectableText: UIViewRepresentable {
         tv.allowRecallMenu = allowRecall
         tv.onRecall = onRecall
         tv.onRecallAndEdit = onRecallAndEdit
+        tv.onRegenerate = onRegenerate
         tv.attributedText = Self.styled(text)
         tv.appliedText = text
         return tv
@@ -111,6 +118,7 @@ struct SelectableText: UIViewRepresentable {
         tv.allowRecallMenu = allowRecall
         tv.onRecall = onRecall
         tv.onRecallAndEdit = onRecallAndEdit
+        tv.onRegenerate = onRegenerate
         // delegate 里的菜单要用到 allowRecall，也得跟着刷新
         context.coordinator.parent = self
     }
@@ -340,6 +348,15 @@ struct SelectableText: UIViewRepresentable {
                 })
             }
 
+            // 「重新生成」：官方把它放在长按菜单里（只对 AI 回复出现）。
+            if let regen = parent.onRegenerate {
+                actions.append(UIAction(title: "重新生成",
+                                        image: UIImage(systemName: "arrow.clockwise")) { _ in
+                    Haptic.press()
+                    DispatchQueue.main.async { regen() }
+                })
+            }
+
             return UIMenu(options: .displayInline, children: actions)
         }
 
@@ -374,6 +391,8 @@ final class PasteTextView: UITextView {
 
     var onRecall: (() -> Void)?
     var onRecallAndEdit: (() -> Void)?
+    /// 长按菜单里的「重新生成」。为 nil 就不显示这一项（用户消息传 nil）。
+    var onRegenerate: (() -> Void)?
     /// false 时菜单里只有系统的「拷贝 / 全选 / 查询」（AI 消息用这个）
     var allowRecallMenu: Bool = true
 

@@ -65,6 +65,26 @@ struct ChatView: View {
 
     @FocusState private var inputFocused: Bool
 
+    /// 用户是不是正贴在列表底部。
+    ///
+    /// 2026-11-02 加：流式跟随必须知道这件事。
+    /// 用户在往上翻历史时，新内容继续涌进来不能把他拽回底部 ——
+    /// 那正是之前「一往上翻就被拉回去」的老毛病。
+    ///
+    /// 由底部锚点的 GeometryReader 报上来的 y 判断，见 messagesArea。
+    @State private var atBottom = true
+
+    /// 「回到底部」的触发计数。
+    /// 加一 → 里层 ScrollViewReader 收到变化就滚到底。
+    /// 用计数而不是 Bool：连点两下也要每次都生效。
+    @State private var scrollTick = 0
+
+    /// 这一轮从什么时候开始等的。
+    ///
+    /// 只是给「正在回答」那张卡片显示已等秒数用 —— 用户最想知道的是
+    /// "它到底卡了还是只是慢"，一个在跳的秒数比一个转圈更让人放心。
+    @State private var thinkingSince = Date()
+
     var body: some View {
         ZStack(alignment: .topLeading) {
             mainColumn
@@ -283,10 +303,49 @@ struct ChatView: View {
             // 用户换完来源根本不会想起来去点菜单，得主动递到眼前。
             if store.needsHandoffHint { handoffBanner }
             messagesArea
+            // 「回到底部」浮钮。用户往上翻历史时不打扰他；
+            // 一旦他离开底部、又有新内容在长，右下角出现一个小圆钮。
+            // 这是官方那套滚动行为的另一半 —— 只做"不跟随"而不给回去的路，
+            // 用户就得自己滑半天。放在 messagesArea 之上、输入栏之下，
+            // 用 overlay 挂，不占布局高度（占高度会让消息区在出现/消失时抖一下）。
             if let err = store.errorText { errorBanner(err) }
             if !store.pending.isEmpty { pendingStrip }
+            // 队列：官方是「输入框上方的队列」，位置就摆在这里。
+            if !store.queued.isEmpty { queueStrip }
             inputBar
         }
+        .overlay(alignment: .bottomTrailing) { scrollToBottomButton }
+    }
+
+    /// 回到底部。离开底部且正在输出时才出现。
+    private var scrollToBottomButton: some View {
+        Group {
+            if !atBottom, !store.messages.isEmpty {
+                Button {
+                    atBottom = true
+                    // 用一个计数器通知里层的 ScrollViewReader 滚到底。
+                    // 为什么不用 NotificationCenter：滚动是纯视图行为，
+                    // 走全局通知会跨页面误触发（另一个会话页也在听）。
+                    scrollTick += 1
+                    Haptic.press()
+                } label: {
+                    Image(systemName: "chevron.down")
+                        .font(.system(size: 13, weight: .semibold))
+                        .foregroundStyle(Theme.sub)
+                        .frame(width: 34, height: 34)
+                        .background(Theme.card)
+                        .clipShape(Circle())
+                        .overlay(Circle().strokeBorder(Color.primary.opacity(0.10), lineWidth: 1))
+                        .shadow(color: .black.opacity(0.10), radius: 6, y: 2)
+                }
+                .buttonStyle(PressableStyle(scale: 0.9))
+                // 抬到输入栏上面一点，别压住最后一行字
+                .padding(.trailing, 18)
+                .padding(.bottom, 14)
+                .transition(.scale(scale: 0.7).combined(with: .opacity))
+            }
+        }
+        .animation(.easeOut(duration: 0.16), value: atBottom)
     }
 
     /// 「换个 AI 接着聊」提示条。点右边按钮 → 摘要进输入框。
@@ -655,72 +714,126 @@ struct ChatView: View {
     // MARK: - 消息区
 
     private var messagesArea: some View {
-        ScrollViewReader { proxy in
-            ScrollView {
-                LazyVStack(alignment: .leading, spacing: 20) {
-                    if store.messages.isEmpty { emptyHint }
-                    ForEach(store.messages) { msg in
-                        bubble(msg).id(msg.id)
-                    }
-                    if store.sending {
-                        HStack(spacing: 6) {
-                            ProgressView().scaleEffect(0.7)
-                            Text("正在回答…")
-                                .font(.system(size: 12))
-                                .foregroundStyle(.secondary)
+        // 外层量一下视口高度，用来判断「底部锚点是不是已经落在屏幕里」。
+        GeometryReader { vp in
+            ScrollViewReader { proxy in
+                ScrollView {
+                    LazyVStack(alignment: .leading, spacing: 20) {
+                        if store.messages.isEmpty { emptyHint }
+                        ForEach(store.messages) { msg in
+                            bubble(msg).id(msg.id)
                         }
-                        .padding(.top, 2)
-                        .id("thinking")
+                        if store.sending && streamingText.isEmpty {
+                            // 2026-11-02 按官方重做这段：
+                            // 官方文档「任务被自动拆分为多个阶段，每个阶段以卡片形式展示：
+                            //   「拆解为 N 个步骤」（显示子步骤数量）、「已完成」（绿色标签）、
+                            //   点击卡片右侧 > 可展开查看详细过程」。
+                            //
+                            // 我们不是多步 Agent，没有真实的工具调用阶段，
+                            // 所以不能假装有"N 个步骤"然后编内容 —— 那比不做更糟。
+                            // 折中：做成一张**如实反映状态**的卡片，
+                            // 展开后显示这一轮实际在干什么（连到哪、用的什么模型、等了多久）。
+                            // 结构（可展开卡片）照官方，内容只写真有的。
+                            ThinkingCard(store: store, startedAt: thinkingSince)
+                                .id("thinking")
+                                .padding(.top, 2)
+                        }
+                        // 底部锚点：一个零高度的稳定 id。
+                        //
+                        // ⚠️ 2026-11-02：自动滚到底部一律滚到这个固定锚点，
+                        // 而不是滚到「最后一条消息的 id」。
+                        // 为什么：滚到 `last.id` 时，那条消息的高度还在随流式输出变化，
+                        // 每次 scrollTo 的目标位置都在动 —— 和内容变高互相拉扯，
+                        // 就是用户看到的「到底以后一直在抖」。
+                        // 滚到一个恒定的尾部锚点，目标位置不随内容变化，循环就断了。
+                        //
+                        // 2026-11-02 再加：挂一个 GeometryReader 把它的位置报上来，
+                        // 用来判断"用户现在是不是贴在底部"。这是流式跟随的前提 ——
+                        // 不判断的话，用户往上翻历史会被一直拽回去（老毛病）。
+                        Color.clear
+                            .frame(height: 1)
+                            .id("bottomAnchor")
+                            .background(
+                                GeometryReader { g in
+                                    Color.clear.preference(
+                                        key: BottomAnchorY.self,
+                                        value: g.frame(in: .named("chatViewport")).maxY
+                                    )
+                                }
+                            )
                     }
-                    // 底部锚点：一个零高度的稳定 id。
-                    //
-                    // ⚠️ 2026-11-02：自动滚到底部一律滚到这个固定锚点，
-                    // 而不是滚到「最后一条消息的 id」。
-                    // 为什么：滚到 `last.id` 时，那条消息的高度还在随流式输出变化，
-                    // 每次 scrollTo 的目标位置都在动 —— 和内容变高互相拉扯，
-                    // 就是用户看到的「到底以后一直在抖」。
-                    // 滚到一个恒定的尾部锚点，目标位置不随内容变化，循环就断了。
-                    Color.clear.frame(height: 1).id("bottomAnchor")
+                    .padding(.horizontal, 20)
+                    .padding(.top, 16)
+                    .padding(.bottom, 10)
                 }
-                .padding(.horizontal, 20)
-                .padding(.top, 16)
-                .padding(.bottom, 10)
-            }
-            // ⚠️ 2026-11-02 抖动修复（用户：「到底以后他给我回复的会话会一秒抖好几十下」）。
-            //
-            // 真正的病根不在滚动，而在 SelectableText 的 sizeThatFits：
-            // 它量出来的高度会在 748 / 749 之间飘，每飘一次 SwiftUI 就重排一遍列表，
-            // 整屏消息跟着抖一下，一秒钟几十遍。那部分在 SelectableText.swift 里修
-            // （宽度就近量化 + 高度 stableHeight 死区）。
-            //
-            // 这里只做配套的两条：
-            //   1. 滚到恒定锚点「bottomAnchor」，不滚到最后一条消息 ——
-            //      后者的位置随流式内容一直在变，每次 scrollTo 的目标都在动，
-            //      和"内容变高"互相拉扯，是抖动的第二来源；
-            //   2. 只在「新消息进来」和「开始发送」这两个时刻滚，不做逐帧跟随 ——
-            //      逐帧跟随必然和用户的滑动打架。动画 0.15s 是为了让连续触发时
-            //      上一段动画尽快结束，不让多段动画叠在一起。
-            //
-            // 注意：这里**没有**做「只在接近底部时才滚」的判定。用户往上翻历史时
-            // 仍会被拉回底部，那是另一个待办，不要以为已经做了。
-            .onChange(of: store.messages.count) { _ in
-                withAnimation(.easeOut(duration: 0.15)) {
+                // 这个名字挂了 ScrollView 上，里面 frame(in:) 拿到的 y 会随滚动变化，
+                // 所以「锚点 y ≤ 视口高 + 一点余量」就等于「已经在底部附近」。
+                .coordinateSpace(name: "chatViewport")
+                .onPreferenceChange(BottomAnchorY.self) { y in
+                    guard y.isFinite, vp.size.height > 0 else { return }
+                    let near = y <= vp.size.height + 72
+                    if near != atBottom {
+                        atBottom = near
+                    }
+                }
+                // ⚠️ 2026-11-02 修（用户：「我给他发完消息全屏看不到字，
+                // 我还要往上滑动才能看见」）。
+                //
+                // 病根：滚动只在「消息数变化」和「开始发送」这两个时刻触发，
+                // **回复流式变长时完全没有跟随**。于是回复越写越长、内容一路往下长，
+                // 视口却钉在原地不动 —— 用户只能看到开头一句，
+                // 下面是整片空白，必须手动往上滑才追得上。
+                //
+                // 现在补一条：只要「用户贴在底部」，正文一有变化就跟着走。
+                // 用 length 而不是全文做 key：字符串比较几 KB 也费，
+                // 而流式只会在末尾追加，长度变了就是有新内容。
+                .onChange(of: streamingText.count) { _ in
+                    guard atBottom else { return }
+                    // **不加动画**。这是关键：流式每 0.05 秒来一次，
+                    // 每次都起一段 0.15 秒动画，动画永远播不完、互相打断，
+                    // 屏幕上就是一顿一顿地抽。直接跳到底反而看起来是连续上滚的。
                     proxy.scrollTo("bottomAnchor", anchor: .bottom)
                 }
-            }
-            .onChange(of: store.sending) { v in
-                guard v else { return }
-                withAnimation(.easeOut(duration: 0.15)) {
-                    proxy.scrollTo("bottomAnchor", anchor: .bottom)
+                // 新消息进来 / 开始发送：这两下必须滚，而且要带动画 ——
+                // 这是"我发了消息，请把镜头带过去"的语义，没有动画会觉得突兀。
+                .onChange(of: store.messages.count) { _ in
+                    atBottom = true
+                    withAnimation(.easeOut(duration: 0.15)) {
+                        proxy.scrollTo("bottomAnchor", anchor: .bottom)
+                    }
                 }
+                .onChange(of: store.sending) { v in
+                    if v { thinkingSince = Date() }
+                    guard v else { return }
+                    atBottom = true
+                    withAnimation(.easeOut(duration: 0.15)) {
+                        proxy.scrollTo("bottomAnchor", anchor: .bottom)
+                    }
+                }
+                // 「回到底部」浮钮点了一下（见 scrollToBottomButton）
+                .onChange(of: scrollTick) { _ in
+                    withAnimation(.easeOut(duration: 0.22)) {
+                        proxy.scrollTo("bottomAnchor", anchor: .bottom)
+                    }
+                }
+                .scrollDismissesKeyboard(.interactively)
+                .onTapGesture { inputFocused = false }
+                // 下拉刷新（iOS 16 起 ScrollView 原生支持）：
+                // 重新探测地址 + 拉一遍模型清单。断网回来、路由器换网段、
+                // 或者「一直显示未连接」时，往下拉一把比来回切页面快得多。
+                .refreshable { await store.bootstrap() }
             }
-            .scrollDismissesKeyboard(.interactively)
-            .onTapGesture { inputFocused = false }
-            // 下拉刷新（iOS 16 起 ScrollView 原生支持）：
-            // 重新探测地址 + 拉一遍模型清单。断网回来、路由器换网段、
-            // 或者「一直显示未连接」时，往下拉一把比来回切页面快得多。
-            .refreshable { await store.bootstrap() }
         }
+    }
+
+    /// 正在流式输出的那条回复的全文。
+    ///
+    /// 单独抽出来是为了给 `onChange` 一个稳定的观察目标：
+    /// 直接写 `store.messages.last?.text` 在 LazyVStack 里每次 body 重算都会变引用，
+    /// 容易漏掉或重复触发。空串表示当前没有在流。
+    private var streamingText: String {
+        guard store.sending, let m = store.messages.last, m.role == "assistant" else { return "" }
+        return m.text
     }
 
     private var emptyHint: some View {
@@ -809,9 +922,18 @@ struct ChatView: View {
                         HStack(spacing: 6) {
                             bubbleAction("复制", icon: "doc.on.doc") {
                                 UIPasteboard.general.string = msg.text
+                                Haptic.press()
                             }
                             bubbleAction("撤回", icon: "arrow.uturn.backward") {
                                 store.recall(msg)
+                            }
+                            // 发送时间：官方要求消息显示时间，用户侧也需要 ——
+                            // 否则"这句话是几点说的"只有 AI 侧有，看着不齐。
+                            if let t = msgTimeText(msg) {
+                                Text(t)
+                                    .font(.system(size: 10))
+                                    .foregroundStyle(.quaternary)
+                                    .padding(.leading, 1)
                             }
                         }
                         .padding(.top, 1)
@@ -859,7 +981,8 @@ struct ChatView: View {
                         // 现在纯正文段仍是 SelectableText（选词/长按复制不变），
                         // 代码块单独成卡片：左上角语言、右上角两本书图标一键复制、
                         // 代码带语法配色、长命令横向滚动不换行。
-                        AssistantBody(text: msg.text.isEmpty ? " " : msg.text)
+                        AssistantBody(text: msg.text.isEmpty ? " " : msg.text,
+                                      onRegenerate: { store.regenerate(msg) })
                             .frame(maxWidth: .infinity, alignment: .leading)
                     }
                 }
@@ -891,15 +1014,45 @@ struct ChatView: View {
                     .padding(.top, 2)
                 }
 
-                // 底部一行：复制（一键全文）+ 模型名。
-                // 复制按钮放在这而不是气泡右上角，是因为 AI 回复很长，
-                // 悬浮按钮会一直压在字上面挡视线。
+                // 底部一行：复制 + 重新生成 + 时间 + 模型名。
+                //
+                // 2026-11-02 按官方补了三样（用户：「官方点击按钮的方式和效果
+                // 都搬过来」「对话的形式和滚动方式」）：
+                //   · 发送时间 —— 官方：「已经进入对话流的消息会显示发送时间，并支持复制」
+                //   · 重新生成 —— 官方：「长按某条 AI 回复，弹出操作菜单 →「重新生成」」
+                //   · 已停止标记 —— 用户点了■之后，明确标出下面是断的
+                //
+                // 为什么「重新生成」只在非流式、非最后一条也显示：
+                // 官方是任取一条都能重答。我们这条路径会把后面的对话暂存再挂回，
+                // 所以不是最后一条也能用，不用特意限制。
                 if !msg.model.isEmpty || !msg.text.isEmpty {
-                    HStack(spacing: 10) {
+                    HStack(spacing: 8) {
                         if !msg.text.isEmpty {
                             bubbleAction("复制", icon: "doc.on.doc") {
                                 UIPasteboard.general.string = msg.text
+                                Haptic.press()
                             }
+                            // 正在出的这条不给「重新生成」——它还没说完，
+                            // 点了会同时停流 + 重开，动作叠加容易错乱
+                            if !(store.sending && msg.id == store.messages.last?.id) {
+                                bubbleAction("重新生成", icon: "arrow.clockwise") {
+                                    store.regenerate(msg)
+                                }
+                            }
+                        }
+                        if msg.stopped {
+                            Text("已停止")
+                                .font(.system(size: 11))
+                                .foregroundStyle(Theme.sub)
+                                .padding(.horizontal, 7)
+                                .padding(.vertical, 3)
+                                .background(Theme.tile)
+                                .clipShape(Capsule())
+                        }
+                        if let t = msgTimeText(msg) {
+                            Text(t)
+                                .font(.system(size: 10))
+                                .foregroundStyle(.quaternary)
                         }
                         if !msg.model.isEmpty {
                             Text(shortName(msg.model))
@@ -921,6 +1074,31 @@ struct ChatView: View {
             }
             .frame(maxWidth: .infinity, alignment: .leading)
         }
+    }
+
+    /// 消息时间的显示文案。
+    ///
+    /// 2026-11-02 加（对齐官方：消息显示发送时间）。
+    /// 分三档，避免每行都拖一个"2026-11-02 04:53"这种长串：
+    ///   · 今天  → 04:53
+    ///   · 昨天  → 昨天 21:10
+    ///   · 更早  → 11-01 21:10
+    /// 老数据的时间是 1970（见 StoredMessage.toChatMessage），返回 nil 直接不显示 ——
+    /// 显示"70-01-01"比不显示更糟。
+    private func msgTimeText(_ msg: ChatMessage) -> String? {
+        let d = msg.at
+        guard d.timeIntervalSince1970 > 0 else { return nil }
+        let cal = Calendar.current
+        let f = DateFormatter()
+        f.locale = Locale(identifier: "zh_CN")
+        if cal.isDateInToday(d) {
+            f.dateFormat = "HH:mm"
+        } else if cal.isDateInYesterday(d) {
+            f.dateFormat = "'昨天' HH:mm"
+        } else {
+            f.dateFormat = "MM-dd HH:mm"
+        }
+        return f.string(from: d)
     }
 
     /// 用户气泡下面那排小操作（复制 / 撤回）。
@@ -1125,6 +1303,81 @@ struct ChatView: View {
 
     // MARK: - 待发附件条
 
+    // MARK: - 发送队列（2026-11-02，对齐 WorkBuddy 手机端）
+
+    /// 输入框上方的队列条。
+    ///
+    /// 官方文档原文：「模型正在执行任务时，您可以继续发送消息，无需等待上一轮回复结束。
+    /// 新消息会进入**输入框上方的队列**，等待当前一轮输出结束后依次处理。
+    /// 队列中的消息支持**编辑、删除和拖动排序**。」
+    ///
+    /// 为什么必须给它一个可见的位置，而不是静默排队：
+    /// 用户点了发送，如果界面上什么都没发生，他会以为没发出去，然后反复点。
+    /// 摆出来之后"我这句已经在排队了"是看得见的，也知道什么时候轮到它。
+    private var queueStrip: some View {
+        VStack(spacing: 6) {
+            HStack(spacing: 5) {
+                Image(systemName: "text.line.last.and.arrowtriangle.forward")
+                    .font(.system(size: 10, weight: .semibold))
+                Text("排队 \(store.queued.count) 条，这一轮说完就发")
+                    .font(.system(size: 11))
+                Spacer(minLength: 0)
+                Button("清空") {
+                    store.queued.removeAll()
+                }
+                .font(.system(size: 11, weight: .medium))
+                .foregroundStyle(Theme.sub)
+            }
+            .foregroundStyle(Theme.sub)
+            .padding(.horizontal, 16)
+
+            ScrollView(.horizontal, showsIndicators: false) {
+                HStack(spacing: 8) {
+                    ForEach(store.queued) { q in
+                        queueChip(q)
+                    }
+                }
+                .padding(.horizontal, 16)
+            }
+        }
+        .padding(.bottom, 6)
+    }
+
+    /// 队列里的一条。点一下编辑，长按/点叉删除。
+    private func queueChip(_ q: ChatStore.QueuedMessage) -> some View {
+        HStack(spacing: 6) {
+            Text(q.text.isEmpty ? "（附件）" : q.text)
+                .font(.system(size: 12.5))
+                .foregroundStyle(.primary)
+                .lineLimit(1)
+            Button {
+                store.removeQueued(q.id)
+                Haptic.press()
+            } label: {
+                Image(systemName: "xmark")
+                    .font(.system(size: 9, weight: .bold))
+                    .foregroundStyle(Theme.sub)
+                    .frame(width: 18, height: 18)
+                    .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+        }
+        .padding(.leading, 11)
+        .padding(.trailing, 5)
+        .padding(.vertical, 7)
+        .background(Theme.tile)
+        .clipShape(Capsule())
+        // 编辑：官方允许改队列里的内容。点开把文字填回输入框，
+        // 同时把这条从队列里摘掉 —— 用户改完按发送自然就重新排队了，
+        // 比做一个行内编辑器简单得多，也不会和键盘抢焦点。
+        .onTapGesture {
+            store.input = q.text
+            store.pending = q.attachments
+            store.removeQueued(q.id)
+            inputFocused = true
+        }
+    }
+
     private var pendingStrip: some View {
         VStack(spacing: 0) {
             if let conflict = store.capConflict {
@@ -1255,22 +1508,30 @@ struct ChatView: View {
                     .buttonStyle(PressableStyle(scale: 0.86, tint: 0.10, tintRadius: 999, darken: 0))
                     .disabled(store.sending)
 
-                    // 圆形发送钮。
-                    // 2026-11-01：改成**常驻**（不能发的时候是灰底灰箭头），
-                    // 之前是"有内容才出现"，一出现整行往左挤 30pt，
-                    // 打第一个字时输入栏会跳一下。
-                    Button { sendIfPossible() } label: {
-                        Image(systemName: voice.recording ? "stop.fill" : "arrow.up")
+                    // 圆形主按钮。三种状态，对齐 WorkBuddy 手机端：
+                    //
+                    //   ① 正在输出 + 输入框是空的 → **停止键（■）**
+                    //      官方：「任务进行中时，输入栏会显示停止按钮（■），
+                    //      点击可随时中断当前执行。」这是最要紧的一个 ——
+                    //      发现它答偏了，能立刻叫停，不用干等烧完积分。
+                    //   ② 正在输出 + 输入框有内容 → **排队键**
+                    //      官方：「新消息会进入输入框上方的队列」。
+                    //   ③ 空闲 → 发送（↑）
+                    //
+                    // 2026-11-01 保留的规矩：按钮**常驻**，不做"有内容才出现"，
+                    // 否则打第一个字时整行往左挤 30pt，输入栏会跳一下。
+                    Button { primaryAction() } label: {
+                        Image(systemName: primaryIcon)
                             .font(.system(size: 14, weight: .bold))
-                            .foregroundStyle(canTapSend ? Theme.card : Theme.sub)
+                            .foregroundStyle(primaryEnabled ? Theme.card : Theme.sub)
                             .frame(width: 30, height: 30)
-                            // 可发送 = 深灰实心（和底栏选中块同色），
-                            // 不可发送 = 系统三级填充灰。全站统一这一个"重"色。
-                            .background(canTapSend ? Theme.press : Color(.tertiarySystemFill))
+                            // 可点 = 深灰实心（和底栏选中块同色），
+                            // 不可点 = 系统三级填充灰。全站统一这一个"重"色。
+                            .background(primaryEnabled ? Theme.press : Color(.tertiarySystemFill))
                             .clipShape(Circle())
                     }
                     .buttonStyle(PressableStyle(scale: 0.88))
-                    .disabled(!canTapSend)
+                    .disabled(!primaryEnabled)
                 }
             }
             .padding(.horizontal, 14)
@@ -1317,21 +1578,51 @@ struct ChatView: View {
         // 挂在这里时 overlay 只有输入栏那么大，遮罩盖不满屏幕，点空白关不掉。
     }
 
-    /// 发送键能不能点。录音中允许点（用来「停止」），有内容才允许发。
-    private var canTapSend: Bool {
+    /// 主按钮当前该显示什么图标。
+    private var primaryIcon: String {
+        if voice.recording { return "stop.fill" }
+        // 正在输出：有内容 → 排队；没内容 → 停止
+        if store.willQueue {
+            return store.canSend ? "text.line.last.and.arrowtriangle.forward" : "stop.fill"
+        }
+        return "arrow.up"
+    }
+
+    /// 主按钮能不能点。
+    private var primaryEnabled: Bool {
         if voice.recording { return true }
+        // 正在输出时永远可点：输入框有内容就排队，空的就停止。
+        if store.willQueue { return store.canSend || streamRunning }
         return store.canSend
     }
 
-    private func sendIfPossible() {
-        // 录音中点发送 = 先停止；停完用户自己再点一次发送
+    /// 当前是不是真的有一轮在跑（用来区分"能停止"和"只能排队"）。
+    private var streamRunning: Bool { store.sending }
+
+    /// 主按钮动作：录音 / 停止 / 排队 / 发送，四选一。
+    private func primaryAction() {
+        // ① 录音中点 = 先停止，停完用户自己再点一次
         if voice.recording {
             voice.stop()
             return
         }
+        // ② 正在输出 + 输入框有内容 = 排进队列（不打断当前这轮）
+        if store.willQueue {
+            if store.canSend {
+                store.enqueueCurrentInput()
+                Haptic.press()
+                inputFocused = false
+            } else {
+                // ③ 正在输出 + 输入框空的 = 停止
+                store.stopStreaming()
+                Haptic.press()
+            }
+            return
+        }
+        // ④ 空闲 = 正常发送
         guard store.canSend else { return }
         inputFocused = false
-        // send() 现在自己建 Task（为了撤回能掐断），所以这里不再包 Task。
+        // send() 自己建 Task（为了撤回能掐断），所以这里不再包 Task。
         store.send()
         Task {
             // 发完立刻探一次灯，让用户马上看到通没通
@@ -1628,6 +1919,130 @@ private struct AdminTabPage: View {
         return f.string(from: d)
     }
 }
+
+// MARK: - 底部锚点的位置上报
+
+/// 把「底部锚点在视口坐标系里的纵坐标」往上送一层。
+///
+/// 2026-11-02：流式跟随要靠它判断用户有没有贴在底部。
+/// 用一个专门的 PreferenceKey 而不是 `@State` + `onAppear`：
+/// 滚动过程中这个值一直在变，只有 preference 能跟着滚动实时刷新。
+private struct BottomAnchorY: PreferenceKey {
+    static var defaultValue: CGFloat = 0
+    static func reduce(value: inout CGFloat, nextValue: () -> CGFloat) {
+        value = nextValue()
+    }
+}
+
+// MARK: - 「正在执行」卡片
+
+/// 等回复期间显示在对话流里的一张可展开卡片。
+///
+/// 2026-11-02 建，对齐 WorkBuddy 手机端「步骤拆解」的形态：
+/// 官方是「拆解为 N 个步骤」+「已完成」标签 + 点右侧 > 展开看详细过程。
+///
+/// 我们和官方最大的区别必须说清楚：**我们不是多步 Agent**，
+/// 这一轮就是一次流式请求，没有工具调用、没有子步骤。
+/// 所以不能照着编一个"N 个步骤、全部已完成"——那是假的。
+/// 这里只如实报三个真实信息：连的哪、用的什么模型、等了多久。
+/// 卡片形态（灰底、可展开、右侧箭头）照官方，内容只写真有的。
+private struct ThinkingCard: View {
+    @ObservedObject var store: ChatStore
+    let startedAt: Date
+
+    @State private var expanded = false
+    /// 每秒跳一次的秒数。用 Timer 而不是 TimelineView：
+    /// 卡片只在等回复时存在（几秒到几十秒），一个 1Hz 的 Timer 开销可以忽略，
+    /// 而且 TimelineView 会让这张卡片在滚动时也持续重绘。
+    @State private var seconds = 0
+    @State private var timer: Timer?
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            Button {
+                withAnimation(.easeOut(duration: 0.16)) { expanded.toggle() }
+                Haptic.tap()
+            } label: {
+                HStack(spacing: 8) {
+                    ProgressView().scaleEffect(0.65)
+                        .frame(width: 14, height: 14)
+
+                    Text(headline)
+                        .font(.system(size: 13))
+                        .foregroundStyle(.primary)
+                        .lineLimit(1)
+
+                    Spacer(minLength: 0)
+
+                    if seconds >= 3 {
+                        Text("\(seconds)s")
+                            .font(.system(size: 11).monospacedDigit())
+                            .foregroundStyle(.tertiary)
+                    }
+
+                    Image(systemName: "chevron.right")
+                        .font(.system(size: 10, weight: .semibold))
+                        .foregroundStyle(.tertiary)
+                        .rotationEffect(.degrees(expanded ? 90 : 0))
+                }
+                .padding(.horizontal, 13)
+                .padding(.vertical, 10)
+                .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+
+            if expanded {
+                VStack(alignment: .leading, spacing: 7) {
+                    detailRow("状态", "正在等上游返回")
+                    detailRow("地址", store.base ?? "—")
+                    detailRow("模型", store.effectiveModel.isEmpty ? "—" : store.effectiveModel)
+                    detailRow("已等待", "\(seconds) 秒")
+                    if store.retrying {
+                        detailRow("重试", "断线了，正在换地址重发")
+                    }
+                }
+                .padding(.horizontal, 13)
+                .padding(.bottom, 11)
+                .transition(.opacity.combined(with: .move(edge: .top)))
+            }
+        }
+        .background(Theme.tile)
+        .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
+        .onAppear { startTick() }
+        .onDisappear { timer?.invalidate(); timer = nil }
+    }
+
+    private var headline: String {
+        if store.retrying { return "正在换地址重试…" }
+        if seconds < 2 { return "正在连接…" }
+        return "正在回答…"
+    }
+
+    private func detailRow(_ k: String, _ v: String) -> some View {
+        HStack(alignment: .top, spacing: 8) {
+            Text(k)
+                .font(.system(size: 11.5))
+                .foregroundStyle(.tertiary)
+                .frame(width: 44, alignment: .leading)
+            Text(v)
+                .font(.system(size: 11.5))
+                .foregroundStyle(.secondary)
+                .lineLimit(2)
+            Spacer(minLength: 0)
+        }
+    }
+
+    private func startTick() {
+        seconds = Int(Date().timeIntervalSince(startedAt))
+        timer?.invalidate()
+        timer = Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { _ in
+            Task { @MainActor in
+                seconds = Int(Date().timeIntervalSince(startedAt))
+            }
+        }
+    }
+}
+
 
 // MARK: - 我的（直接显示设置页）
 

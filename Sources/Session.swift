@@ -62,13 +62,26 @@ struct StoredMessage: Codable, Hashable {
     /// Codable 解码时会用默认值补上，不会因为缺 key 而整份历史解析失败。
     var recalled: Bool = false
 
+    /// 发送时间。
+    ///
+    /// 2026-11-02 加（对齐 WorkBuddy 手机端：消息显示发送时间）。
+    /// **必须可选**：老 sessions.json 里没有这个键，
+    /// 非可选的话整份历史会解码失败 —— 那等于用户所有对话记录一次全丢。
+    /// 用可选 + 兜底成现在，最坏情况只是老消息显示的是"刚刚"。
+    var at: Date?
+
+    /// 用户点停止键中断的那条回复（下面已经断了）。
+    var stopped: Bool?
+
     init(role: String, text: String, model: String = "", failed: Bool = false,
-         recalled: Bool = false) {
+         recalled: Bool = false, at: Date? = nil, stopped: Bool? = nil) {
         self.role = role
         self.text = text
         self.model = model
         self.failed = failed
         self.recalled = recalled
+        self.at = at
+        self.stopped = stopped
     }
 
     init(_ m: ChatMessage) {
@@ -77,6 +90,8 @@ struct StoredMessage: Codable, Hashable {
         model = m.model
         failed = m.failed
         recalled = m.recalled
+        at = m.at
+        stopped = m.stopped
     }
 
     /// 还原成界面用的消息。附件不再保留，但给个可见的痕迹，
@@ -85,6 +100,10 @@ struct StoredMessage: Codable, Hashable {
         var msg = ChatMessage(role: role, text: text, model: model)
         msg.failed = failed
         msg.recalled = recalled
+        // 老数据没有时间：给个"很久以前"的锚点，别用 now()。
+        // 用 now() 会让整个旧对话看起来全是刚发的，反而更误导。
+        msg.at = at ?? Date(timeIntervalSince1970: 0)
+        msg.stopped = stopped ?? false
         return msg
     }
 }

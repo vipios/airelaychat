@@ -16,6 +16,13 @@ final class ChatStore: ObservableObject {
     /// 待发送的附件
     @Published var pending: [Attachment] = []
     @Published var sending = false
+
+    /// 正在"换地址重发"那一下。
+    ///
+    /// 2026-11-02 加：出门/回家导致缓存地址失效时，runSend 会自动重新探测并发一遍。
+    /// 这个过程要几秒，界面上原来什么都不显示（用户以为卡死了）。
+    /// 有了这个标记，等待卡片能如实说"正在换地址重试"。
+    @Published var retrying = false
     @Published var detecting = false
     @Published var models: [ModelItem] = []
     @Published var currentModel: String = ""
@@ -144,6 +151,113 @@ final class ChatStore: ObservableObject {
     /// 如果不区分是谁的收尾，就会把**新任务**的句柄误清掉，
     /// 导致下一次撤回又掐不断。用序号只让"最新那个"清自己。
     private var sendSeq = 0
+
+    // MARK: - 发送队列（2026-11-02 加，对齐 WorkBuddy 手机端）
+
+    /// 正在等当前这轮跑完后依次发出的消息。
+    ///
+    /// 为什么要有这个：官方文档写得很明确 ——
+    /// 「模型正在执行任务时，您可以继续发送消息，无需等待上一轮回复结束。
+    ///   新消息会进入输入框上方的队列，等待当前一轮输出结束后依次处理。
+    ///   队列中的消息支持编辑、删除和拖动排序。」
+    ///
+    /// 我们原来的 `canSend` 里有 `!sending`，等于**回复期间根本发不出第二句**。
+    /// 用起来的体感是：它答到一半我想补一句"顺便把字体调大"，
+    /// 只能干等着，等完还得记得再发一次 —— 中间想到的东西就丢了。
+    ///
+    /// 队列里的每一条都只是「文字 + 附件」，还没有进 messages，
+    /// 所以用户可以随时编辑/删除/调序，都不会污染对话历史。
+    @Published var queued: [QueuedMessage] = []
+
+    /// 用户点了停止键，且这一轮还没收尾。
+    ///
+    /// 为什么要一个显式标记，而不是直接看 `Task.isCancelled`：
+    /// 取消有两种来源 —— **撤回**（连提问一起作废）和**停止**（保住已收到的字）。
+    /// 两者的收尾动作完全相反，光看 isCancelled 分不出来是谁触发的。
+    /// 这个标记就是"是我自己点的停止"，收尾时据此走保留分支。
+    private var stopRequested = false
+
+    /// 点停止键：掐断上游流，但**保留已收到的内容**。
+    ///
+    /// 2026-11-02 加，对齐 WorkBuddy 手机端：
+    /// 官方文档写「任务进行中时，输入栏会显示停止按钮（■），点击可随时中断当前执行。
+    /// 中断后仍可继续补充说明或调整需求」，以及
+    /// 「电脑端立刻终止，已完成的步骤结果保留在对话里，不影响」。
+    ///
+    /// 和 `recall()` 的区别（这两件事别再混）：
+    ///   · recall   = 撤回**我的提问** → 整条链路作废，提问和回答都不参与后续历史
+    ///   · stop     = 叫停**它的输出** → 提问留着、已说的留着，只是不再往下说
+    func stopStreaming() {
+        guard sending || sendTask != nil else { return }
+        stopRequested = true
+        sendTask?.cancel()
+        // 注意这里**不能**把 sendTask 置 nil、也不能立刻置 sending = false：
+        // 收尾要等 runSend 的 catch 分支走完（那里才刷缓冲、存档）。
+        // 提前置 nil 会让 runSend 里的序号判断错乱，也会让界面过早变成"可发送"，
+        // 用户就会在旧内容还在落盘时发下一条，导致队列和流交叉。
+    }
+
+    /// 队列里的一条。带 id 是为了 SwiftUI 列表能稳定标识（拖动排序要用）。
+    struct QueuedMessage: Identifiable, Equatable {
+        let id = UUID()
+        var text: String
+        var attachments: [Attachment] = []
+        /// 原样存用户这句话，附件另存（附件本体是 Data，别重复引用）
+        init(text: String, attachments: [Attachment] = []) {
+            self.text = text
+            self.attachments = attachments
+        }
+    }
+
+    /// 把当前输入框的内容塞进队列（而不是直接发）。
+    func enqueueCurrentInput() {
+        let t = input.trimmingCharacters(in: .whitespacesAndNewlines)
+        let a = pending
+        guard !t.isEmpty || !a.isEmpty else { return }
+        queued.append(QueuedMessage(text: t, attachments: a))
+        input = ""
+        pending = []
+    }
+
+    /// 队列里删一条。
+    func removeQueued(_ id: UUID) {
+        queued.removeAll { $0.id == id }
+    }
+
+    /// 拖动排序：把 `from` 挪到 `to` 前面。
+    func moveQueued(from: IndexSet, to: Int) {
+        queued.move(fromOffsets: from, toOffset: to)
+    }
+
+    /// 编辑队列里某一条的文字。
+    func updateQueued(_ id: UUID, text: String) {
+        guard let i = queued.firstIndex(where: { $0.id == id }) else { return }
+        queued[i].text = text
+    }
+
+    /// 本轮结束后，把队首那条发出去。
+    ///
+    /// 由 runSend 的收尾调用（**必须在 sending = false 之后**，
+    /// 否则 send() 里的 `guard !sending` 会把它挡掉）。
+    ///
+    /// ⚠️ 2026-11-02 修一个会让队列**永远卡住**的坑：
+    /// runSend 是在 `sendTask` 那个 Task 里跑的，收尾时 `sendTask` 还没被清空
+    ///（清空发生在 send() 里那句 `sendTask = nil`，是 Task **结束后**才执行的）。
+    /// 所以这里必须先把 `sendTask`/`sendStarting` 清掉再调 send()，
+    /// 否则 send() 的 `guard !sendStarting, !sending` 会直接返回，
+    /// 队列第一条被 removeFirst 吃掉却没人发出去 —— 消息凭空消失。
+    fileprivate func pumpQueue() {
+        guard !queued.isEmpty else { return }
+        guard base != nil else { return }
+        // 上一轮的句柄先作废，让 send() 能进得去
+        sendTask = nil
+        sendStarting = false
+        sending = false
+        let next = queued.removeFirst()
+        input = next.text
+        pending = next.attachments
+        send()
+    }
 
     private let client = RelayClient.shared
     private let settings = Settings.shared
@@ -1117,8 +1231,19 @@ final class ChatStore: ObservableObject {
 
     var canSend: Bool {
         let hasText = !input.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-        return !sending && base != nil && (hasText || !pending.isEmpty)
+        // ⚠️ 2026-11-02 改：去掉了 `!sending`。
+        //
+        // 原来这里是 `!sending && base != nil && …`，等于回复期间**完全发不出话**。
+        // 官方手机端不是这样：执行中照样能发，新消息进队列，等这一轮说完接着处理。
+        // 去掉之后，发送键在回复期间仍然可点，点下去走 enqueueCurrentInput()。
+        return base != nil && (hasText || !pending.isEmpty)
     }
+
+    /// 现在点发送键，是「直接发」还是「进队列」。
+    ///
+    /// 界面用这个决定按钮的图标和文案（发送 ↑ / 排队 ↵）。
+    /// 用户得看得见区别，否则点了没反应会以为卡了。
+    var willQueue: Bool { sending || sendStarting || sendTask != nil }
 
     // MARK: - 启动 / 重新检测
 
@@ -1332,6 +1457,35 @@ final class ChatStore: ObservableObject {
         toast = "已撤回"
     }
 
+    /// 停止键中断后的收尾：**保住已经收到的内容**，然后把队列往下推。
+    ///
+    /// 抽成一个函数，因为取消可能从两条路径抛上来
+    ///（`CancellationError` 或者 `URLError(.cancelled)`），
+    /// 两处各写一遍必然会改一处漏一处 —— 这里只写一遍。
+    private func finishStoppedStream(idx: Int) {
+        stopRequested = false
+        retrying = false
+        // 先把缓冲里还没上屏的字刷出去，否则用户看到的比他实际收到的少一截
+        endStreamThrottle()
+        if idx < messages.count {
+            messages[idx].stopped = true
+            messages[idx].at = Date()
+            // 一个字都没收到就停了：删掉空气泡，别留一条空白在那儿
+            if messages[idx].text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                messages.remove(at: idx)
+            }
+        }
+        sending = false
+        sendStarting = false
+        errorText = nil
+        syncCurrentSession()
+        // 收到内容了才归档（半截代码也算产物，官方语义是"已完成的保留"）
+        if idx < messages.count, messages[idx].stopped {
+            archiveReply(at: idx)
+        }
+        pumpQueue()
+    }
+
     /// 把一条已撤回消息的原文填回输入框，等于「反悔，我想重发」。
     ///
     /// 2026-10-31 改成气泡下方小图标后，这个动作挂在「点那条灰掉的消息」上。
@@ -1430,6 +1584,9 @@ final class ChatStore: ObservableObject {
         messages.append(ChatMessage(role: "user", text: text, attachments: attach))
         messages.append(ChatMessage(role: "assistant", text: "", model: model))
         let idx = messages.count - 1
+        // 发送时间打在用户那条上（助手那条等它说完再补，否则显示的是开始时间，
+        // 长回复会看起来"我们俩说话只差 0 秒"）
+        messages[idx - 1].at = Date()
         sending = true
 
         // 历史里只带「有文字或附件」的，跳过占位的空助手消息。
@@ -1491,6 +1648,19 @@ final class ChatStore: ObservableObject {
                 Task { @MainActor in self.feedStream(delta, idx: idx) }
             }
         } catch is CancellationError {
+            // 这里有两种完全不同的"取消"，必须分开处理：
+            //
+            //   ① 用户撤回那条提问 → recall() 已经把它和助手的空气泡都处理过了，
+            //      这里什么都不该做，尤其**不能**再去 sync/archive，
+            //      否则会把已撤回的内容写进历史。
+            //
+            //   ② 用户点了停止键（stopStreaming）→ 反过来：**必须保住已经收到的字**。
+            //      官方文档写「远程叫停…已完成的步骤结果保留在对话里，不影响」。
+            //      所以要把缓冲刷干净、打上 stopped 标记、存档，然后接着跑队列。
+            if stopRequested {
+                finishStoppedStream(idx: idx)
+                return
+            }
             // 用户撤回导致的中断：不是错误，什么都不用提示。
             // 那条助手占位消息已经由 recall() 删掉了，这里别再去动 messages。
             sending = false
@@ -1500,6 +1670,13 @@ final class ChatStore: ObservableObject {
             // 撤回后不需要把错误甩给用户，也不该继续走"自动重连再发一遍"那套
             // ——用户就是要它停，别自作主张重发。
             if Task.isCancelled {
+                // 停止键引发的取消，也可能以普通 URLError(.cancelled) 的形式抛上来
+                //（取决于 URLSession 在哪一层断的）。所以这里也要判一次 stopRequested，
+                // 否则用户点停止会看到一句莫名其妙的报错、而且已经收到的字被丢掉。
+                if stopRequested {
+                    finishStoppedStream(idx: idx)
+                    return
+                }
                 sending = false
                 sendStarting = false
                 return
@@ -1516,8 +1693,10 @@ final class ChatStore: ObservableObject {
                 await bootstrap(loadModels: false)
                 if Task.isCancelled { sending = false; sendStarting = false; return }
                 if let nb = base, nb != b {
+                    retrying = true
                     recovered = await retryStream(base: nb, key: key, model: model,
                                                   history: history, idx: idx)
+                    retrying = false
                 }
             }
             if !recovered {
@@ -1539,6 +1718,8 @@ final class ChatStore: ObservableObject {
         // defer 只是兜底（防止上面某个提前 return 漏掉）。
         endStreamThrottle()
         sending = false
+        // 回复说完了，补上完成时间（用户那条在发送时就打过，这里只补助手）
+        if idx < messages.count { messages[idx].at = Date() }
         // 撤回场景下 messages 已经被改过了（占位气泡被删），
         // 这时候再 sync / archive 会写进一条已撤回的内容，必须挡掉。
         if Task.isCancelled { return }
@@ -1557,6 +1738,13 @@ final class ChatStore: ObservableObject {
         // 放在 syncCurrentSession 之后：那时标题已经从首条用户消息补齐，
         // 文件名才能是「中转站搭建」而不是「新对话」。
         archiveReply(at: idx)
+
+        // 如果这一轮是「重新生成」，把当初摘下来的后续对话挂回去
+        restoreRegenerateTail()
+
+        // 本轮说完了，看看队列里还有没有排队的 —— 有就接着发下一条。
+        // 官方文档：「当前一轮输出结束后，队列里的消息会按顺序依次交给模型接着处理」。
+        pumpQueue()
     }
 
     /// 把一条 AI 回复里**真正值得留存的产物**存成文件，放进「我的文件」。
@@ -1663,41 +1851,63 @@ final class ChatStore: ObservableObject {
         var usedTitles = Set<String>()
 
         for block in parts.blocks {
-            // 太短的代码块当"示例命令"，不单独存。
-            //
-            // ⚠️ 这里**必须只看这一个块自己的行数**。
-            // 上一版写的是 `lines.count >= 8 || parts.blocks.count >= 2` ——
-            // 后半句意味着"只要回复里有两个以上代码块，所有块都算产物"，
-            // 那两条一行的 bash 示例命令就是靠这个混进来的（22 B / 23 B）。
-            // 用户要的是"生成的产物"，不是"回复里出现过的每一段代码"。
             let lines = block.code.split(separator: "\n", omittingEmptySubsequences: false)
-            guard lines.count >= 8 else { continue }
-
-            // 只有空行/几行 echo 的块也不要：那是演示，不是文件。
-            //
-            // 判据是"有实质内容的行至少 3 行"。`#` 开头的算注释不算内容，
-            // 纯 echo / print 一句话的也不算 —— 用户截图里那两个 22/23 字节的
-            // `artifact-sh.sh` 就是这种东西，它是"我要怎么运行"的示例，
-            // 不是"我产出的文件"。
-            let meaningful = lines.filter { line in
-                let t = line.trimmingCharacters(in: .whitespaces)
-                guard t.count >= 2, !t.hasPrefix("#") else { return false }
-                // 去掉 shell 里最典型的"只打印"语句
-                let low = t.lowercased()
-                if low.hasPrefix("echo ") || low.hasPrefix("print(") { return false }
-                return true
-            }
-            guard meaningful.count >= 3 else { continue }
-
             let ext = Self.extForBlock(lang: block.lang, code: block.code)
 
             // 标题优先级：正文里同扩展名的文件名 > 提问
             var title = baseTitle
+            var named = false
             if var pool = namePool[ext], !pool.isEmpty {
                 let full = pool.removeFirst()
                 namePool[ext] = pool
                 let stem = (full as NSString).deletingPathExtension
-                if !stem.isEmpty { title = stem }
+                if !stem.isEmpty {
+                    title = stem
+                    named = true
+                }
+            }
+
+            // ⚠️ 2026-11-02 第四次修正（用户：「给我生成 20 个不一样的产物」，
+            // 那 20 段每段只有 2~4 行）。
+            //
+            // 上一版我自己刚加的规矩是「每块 ≥8 行且 ≥3 行实质内容」，
+            // 那是为了挡掉 22 字节的示例命令。但它挡错了人：
+            // **正文明确点了名的文件，哪怕只有两行也是真产物** ——
+            // `test.py` 两行、`message_test.json` 一行，用户要的就是这些。
+            //
+            // 所以分成两条完全不同的判定：
+            //   · 点过名的 → 只挡「纯调用命令」，不看长度
+            //   · 没点名的 → 才用规模兜底（说明它在交付一整份代码）
+            if named {
+                // 防「正文提到 deploy.sh，旁边那段就是 `./deploy.sh`」：
+                // 只有一行、又短、又正好是"运行它自己"的，不算产物。
+                let oneLiner = lines.count <= 1
+                let tooShort = block.code.count < 40
+                if oneLiner && tooShort { continue }
+            } else {
+                // 没点名：必须成规模。
+                //
+                // ⚠️ 这里**只看这一个块自己的行数**。
+                // 上一版写的是 `lines.count >= 8 || parts.blocks.count >= 2` ——
+                // 后半句意味着"只要回复里有两个以上代码块，所有块都算产物"，
+                // 那两条一行的 bash 示例命令就是靠这个混进来的（22 B / 23 B）。
+                // 用户要的是"生成的产物"，不是"回复里出现过的每一段代码"。
+                guard lines.count >= 8 else { continue }
+
+                // 只有空行/几行 echo 的块也不要：那是演示，不是文件。
+                //
+                // 判据是"有实质内容的行至少 3 行"。`#` 开头的算注释不算内容，
+                // 纯 echo / print 一句话的也不算 —— 用户截图里那两个 22/23 字节的
+                // `artifact-sh.sh` 就是这种东西，它是"我要怎么运行"的示例，
+                // 不是"我产出的文件"。
+                let meaningful = lines.filter { line in
+                    let t = line.trimmingCharacters(in: .whitespaces)
+                    guard t.count >= 2, !t.hasPrefix("#") else { return false }
+                    let low = t.lowercased()
+                    if low.hasPrefix("echo ") || low.hasPrefix("print(") { return false }
+                    return true
+                }
+                guard meaningful.count >= 3 else { continue }
             }
 
             // 同名不同格式（server.sh + server.py）要区分开，否则文件库里
@@ -1739,10 +1949,16 @@ final class ChatStore: ObservableObject {
     ///
     /// 只认白名单里的扩展名：正文里随手出现的 `1.5`、`v2.0` 不能被当成文件名。
     private static func namedFileNames(in s: String) -> [String] {
+        // ⚠️ 2026-11-02：补上 csv / graphql / proto / dockerfile 这些。
+        // 用户让 AI「生成 20 个不一样格式的产物」，里面就有 csv，
+        // 不在白名单里会让那个块配不到名字、退化成用提问当标题。
         let exts = ["sh", "py", "js", "ts", "json", "yaml", "yml", "toml", "xml",
                     "html", "css", "md", "txt", "swift", "m", "h", "c", "cpp",
                     "java", "kt", "go", "rs", "rb", "php", "sql", "deb", "conf",
-                    "ini", "plist", "service", "lua", "ps1", "bat", "cmd"]
+                    "ini", "plist", "service", "lua", "ps1", "bat", "cmd",
+                    "csv", "tsv", "graphql", "gql", "proto", "dockerfile",
+                    "jsx", "tsx", "scss", "sass", "less", "vue", "kt",
+                    "gradle", "properties", "env", "lock", "log", "dat", "bin"]
         var out: [String] = []
         var seen = Set<String>()
         let chars = Array(s)
@@ -1812,6 +2028,18 @@ final class ChatStore: ObservableObject {
             "sql": "sql", "lua": "lua", "powershell": "ps1", "ps1": "ps1",
             "bat": "bat", "cmd": "bat", "ini": "ini", "conf": "conf",
             "plist": "plist", "service": "service", "dockerfile": "dockerfile",
+            // 2026-11-02 补：用户要「20 个不一样格式」，这些都在里面。
+            // 漏一个的后果不是报错，是那个块被当成 txt 存下来，
+            // 用户拿到一个后缀不对的文件。
+            "csv": "csv", "tsv": "tsv", "graphql": "graphql", "gql": "graphql",
+            "proto": "proto", "protobuf": "proto", "diff": "diff", "patch": "diff",
+            "makefile": "makefile", "cmake": "cmake", "gradle": "gradle",
+            "jsx": "jsx", "tsx": "tsx", "scss": "scss", "sass": "scss",
+            "less": "less", "vue": "vue", "svelte": "svelte", "dart": "dart",
+            "scala": "scala", "r": "r", "matlab": "m", "perl": "pl",
+            "nginx": "conf", "apache": "conf", "http": "http", "log": "log",
+            "env": "env", "dotenv": "env", "properties": "properties",
+            "toml": "toml", "jsonc": "json", "json5": "json",
         ]
         if let e = map[l], !e.isEmpty { return e }
         // 没标记：看内容猜
@@ -2027,6 +2255,60 @@ final class ChatStore: ObservableObject {
         } catch {
             return false
         }
+    }
+
+    /// 重新生成某一条 AI 回复。
+    ///
+    /// 2026-11-02 加，对齐 WorkBuddy 手机端：
+    /// 官方文档写「如果对执行结果不满意，可以：长按某条 AI 回复，弹出操作菜单 →
+    /// 点击「重新生成」→ WorkBuddy 会基于相同输入重新执行」。
+    ///
+    /// 和 `retryLast()` 的区别：
+    ///   · retryLast 只处理"最后一条"，是失败兜底
+    ///   · 这个是**任取一条**历史回复重来，用于"这条答得不好，重答"，
+    ///     而且重答的是同一条位置，不能把后面的对话也一起删掉
+    ///
+    /// 实现要点：把这条 AI 回复清空、保留它上面那条提问，
+    /// 后面的消息（更晚的对话）**先摘下来存着**，等重答完再挂回去。
+    /// 不这么做的话，中途 append 会让后面几条的顺序乱掉。
+    func regenerate(_ msg: ChatMessage) {
+        guard !sending, !sendStarting else { return }
+        guard let i = messages.firstIndex(where: { $0.id == msg.id }) else { return }
+        guard messages[i].role == "assistant" else { return }
+        // 必须能找到它对应的那条提问，否则没有输入可重发
+        var q = i - 1
+        while q >= 0, messages[q].role != "user" { q -= 1 }
+        guard q >= 0 else { return }
+
+        let question = messages[q]
+        let model = messages[i].model.isEmpty ? effectiveModel : messages[i].model
+
+        // 把「提问 + 回答」之后的所有消息摘下来
+        let tail = Array(messages[(i + 1)...])
+        messages.removeSubrange((q + 1)...)      // 只留到提问为止
+
+        // 提问也摘掉：send() 会把 input 里的内容重新 append 成新消息，
+        // 留着会变成"问了两遍"。
+        input = question.text
+        pending = question.attachments
+        messages.removeSubrange(q...)
+        // 模型沿用这条回复当时用的那个（用户重答多半是想同样的模型再试一次，
+        // 而不是换成当前选中的另一个）
+        if !model.isEmpty { currentModel = model }
+
+        // 尾段暂存，等这一轮说完再挂回去
+        regenerateTail = tail
+        send()
+    }
+
+    /// `regenerate` 摘下来、待恢复的后续消息。
+    private var regenerateTail: [ChatMessage] = []
+
+    /// 重答结束后把后面的对话挂回去。由 runSend 收尾调用。
+    fileprivate func restoreRegenerateTail() {
+        guard !regenerateTail.isEmpty else { return }
+        messages.append(contentsOf: regenerateTail)
+        regenerateTail = []
     }
 
     /// 重发最后一条用户消息

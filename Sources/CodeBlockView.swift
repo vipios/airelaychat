@@ -512,6 +512,11 @@ enum SyntaxHighlight {
 /// 网址在正文里仍然是普通文字，要打开就复制出去。别以为这里已经支持点按。
 struct ProseText: View {
     let text: String
+    /// 长按菜单里的「重新生成」（只给 AI 回复）。
+    ///
+    /// 2026-11-02 加：官方把「重新生成」放在长按菜单里。
+    /// 传 nil 就不显示该项（用户消息走这个分支时不用管）。
+    var onRegenerate: (() -> Void)? = nil
 
     var body: some View {
         SelectableText(
@@ -519,7 +524,8 @@ struct ProseText: View {
             allowRecall: false,
             fillsWidth: true,
             onRecall: {},
-            onRecallAndEdit: {}
+            onRecallAndEdit: {},
+            onRegenerate: onRegenerate
         )
         .frame(maxWidth: .infinity, alignment: .leading)
     }
@@ -534,6 +540,8 @@ struct ProseText: View {
 /// 会重新引入卡顿和抖动，那是前面费了三版才压下去的东西。
 struct AssistantBody: View {
     let text: String
+    /// 长按正文时的「重新生成」（透传给 ProseText）。
+    var onRegenerate: (() -> Void)? = nil
 
     var body: some View {
         let parts = RichCache.blocks(text)
@@ -541,7 +549,7 @@ struct AssistantBody: View {
             ForEach(parts) { b in
                 switch b.kind {
                 case .prose(let p):
-                    ProseText(text: p)
+                    ProseText(text: p, onRegenerate: onRegenerate)
                 case .code(let lang, let code):
                     CodeBlockView(lang: lang, code: code)
                 }
