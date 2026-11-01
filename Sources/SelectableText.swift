@@ -160,9 +160,28 @@ struct SelectableText: UIViewRepresentable {
             cacheable = false
         }
 
-        // 量化到 0.5pt：SwiftUI 传下来的宽度常在 353.0 / 352.98 之间来回，
-        // 这点差值不足以改变排版，却足以让缓存失效、让一屏消息重排一遍。
-        let maxW = (rawWidth * 2).rounded(.down) / 2
+        // ⚠️ 2026-11-02 修「到底后一秒抖几十下」（用户第三次反馈抖动）。
+        //
+        // 上一版用的是 `(rawWidth * 2).rounded(.down) / 2`（向下取整到 0.5 栅格）。
+        // 向下取整有**断点**：SwiftUI 传下来的宽度在 352.98 ↔ 353.00 之间浮动时，
+        //   352.98 → 量化成 352
+        //   353.00 → 量化成 353
+        // 同一段文字按 352 排和按 353 排，折行位置可能不同、高度差几 pt。
+        // 于是形成闭环：
+        //   按 352 量出高度 A → 布局按 352 摆放 → SwiftUI 报告可用宽度 353
+        //   → 按 353 量出高度 B → 布局变高 → SwiftUI 又报告 352.98 → 回到 352 …
+        // 每一圈都触发一次列表重排，滑到底时整屏消息一起抖，一秒钟几十遍。
+        //
+        // 现在两条硬规矩：
+        //   1. **就近取整**（rounded to nearest）而不是向下取整 —— 取整中心
+        //      两侧对称，353.01 和 352.99 都落到 353，不会跨到相邻格；
+        //   2. **死区**：和上次量的宽度差不到半个栅格（< 0.5pt）时，直接沿用
+        //      上次的量化宽度，彻底断掉「来回跨格」这条环。
+        var maxW = (rawWidth * 2).rounded() / 2
+        if uiView.measureMaxWidth > 0, abs(maxW - uiView.measureMaxWidth) < 0.5 {
+            // 贴在上次那个格子里：保留上次的值，不要再切到相邻格
+            maxW = uiView.measureMaxWidth
+        }
         guard maxW > 0 else { return nil }
 
         let key = uiView.text ?? ""
@@ -177,7 +196,7 @@ struct SelectableText: UIViewRepresentable {
             // AI 大段正文：直接铺满，不做"贴合文字"那种收缩
             let h = uiView.sizeThatFits(CGSize(width: maxW,
                                                height: CGFloat.greatestFiniteMagnitude)).height
-            result = CGSize(width: maxW, height: ceil(h))
+            result = CGSize(width: maxW, height: Self.stableHeight(h, last: uiView.measureSize.height))
         } else {
             // 这里必须写全 `CGFloat.greatestFiniteMagnitude`：
             // 直接写 `.greatestFiniteMagnitude` 时编译器在 CGFloat / Double / Int 之间
@@ -188,7 +207,7 @@ struct SelectableText: UIViewRepresentable {
             let w = min(ceil(unbounded.width), maxW)
             let h = uiView.sizeThatFits(CGSize(width: w,
                                                height: CGFloat.greatestFiniteMagnitude)).height
-            result = CGSize(width: w, height: ceil(h))
+            result = CGSize(width: w, height: Self.stableHeight(h, last: uiView.measureSize.height))
         }
 
         if cacheable {
@@ -198,6 +217,25 @@ struct SelectableText: UIViewRepresentable {
             uiView.measureSize = result
         }
         return result
+    }
+
+    /// 把量出来的高度「稳定」成不会自己跳的值。
+    ///
+    /// ⚠️ 2026-11-02 修「到底后一秒抖几十下」的第二个来源。
+    /// 上一版直接 `ceil(h)`：UITextView 的 `sizeThatFits` 高度常带浮点误差，
+    /// 同样一屏字会在 747.9999 / 748.0001 之间飘，`ceil` 分别给出 748 / 749 —
+    /// **1pt 的高度差**，足以让 SwiftUI 认为列表布局变了、重新排一遍。
+    ///
+    /// 现在两条规矩：
+    ///   1. 量化到 0.5pt 栅格（就近取整），浮点误差被吃掉；
+    ///   2. 和上次结果差不到 0.5pt 就**沿用上次的值** —— 死区，彻底断掉来回跳。
+    private static func stableHeight(_ h: CGFloat, last: CGFloat) -> CGFloat {
+        guard h.isFinite, h > 0 else { return last > 0 ? last : 1 }
+        var v = (h * 2).rounded() / 2
+        if last > 0, abs(v - last) < 0.5 {
+            v = last
+        }
+        return v
     }
 
     final class Coordinator: NSObject, UITextViewDelegate, UIEditMenuInteractionDelegate {

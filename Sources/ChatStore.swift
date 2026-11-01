@@ -1515,17 +1515,12 @@ final class ChatStore: ObservableObject {
 
         // 把回复拆成「正文」和「代码块」两部分（正文现在不写进文件，只用来判断）
         let parts = Self.splitCodeBlocks(body)
-        let codeCount = parts.blocks.count
 
-        // 判定标准（2026-10-31 第二次收紧，用户原话：
-        // 「我不需要的是把 ai 的聊天记录都当成产物」）：
-        //   **只有带代码块 / 文件内容块才算产物。**
-        //
-        // 上一版还允许「有编号列表、出现'步骤''清单'字样」也算，
-        // 结果只要 AI 正常解释一件事（"分三步：1、… 2、…"），
-        // 整段聊天就被存成 md —— 判定太松，等于没判定。
-        // 这不是产物，这是聊天记录，聊天记录本来就在会话里。
-        guard codeCount > 0 else { return }
+        // 判定标准（2026-11-02 第三次收紧，见 isRealDeliverable 里的详细说明）：
+        //   只有「点了名的文件名」或「成规模的代码块」才算交付物。
+        //   聊天过程里的解释、步骤、`dpkg -l` 这种行内引用、一两行示例命令，
+        //   一律不算 —— 用户明确说过「我们聊天的途中所有的对话不是产物」。
+        guard Self.isRealDeliverable(body, parts: parts) else { return }
 
         // 找这条回复对应的那个问题，做成文件标题
         var question = ""
@@ -1543,8 +1538,16 @@ final class ChatStore: ObservableObject {
         if !question.isEmpty {
             doc += "# \(question.replacingOccurrences(of: "\n", with: " "))\n\n"
         }
-        doc += Self.reassemble(parts)
-        doc += "\n"
+        let body2 = Self.reassemble(parts)
+        if body2.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            // 只有「正文里点了文件名」而没有代码块的情况（比如
+            // 「已经生成 cleanup.deb，放在 /var/mobile/…」）。
+            // 这时候产物本体不在回复里（可能由工具生成），
+            // 把正文原样留下作为记录，总比存一个只有标题的空文件强。
+            doc += body + "\n"
+        } else {
+            doc += body2 + "\n"
+        }
 
         let title = question.isEmpty
             ? (currentSessionTitle.isEmpty ? "产出" : currentSessionTitle)
@@ -1600,20 +1603,62 @@ final class ChatStore: ObservableObject {
         return out
     }
 
-    /// 没有代码块时，判断正文是不是「交付物形状」。
+    /// 判断一条 AI 回复「算不算真的交付了一个文件」。
     ///
-    /// ⚠️ 2026-10-31 起**已停用**（archiveReply 只认代码块）。
-    /// 保留在这里只是为了说明教训：靠「出现'步骤''清单'字样」来判断产物，
-    /// 任何一段正常解释都会被误判。真要做这层判断得靠模型返回结构化标记，
-    /// 不能靠关键词命中。
-    private static func hasDeliverableShape(_ s: String) -> Bool {
-        guard s.count >= 80 else { return false }   // 太短的一律当对话
-        let markers = ["1. ", "1、", "步骤", "清单", "保存为", "文件名",
-                       ".md", ".swift", ".py", ".json", ".sh", "—>", "->"]
-        var hits = 0
-        for mk in markers where s.contains(mk) { hits += 1 }
-        // 至少要像"列了几条要做的事"或者"给了文件名"，才当产物
-        return hits >= 2
+    /// ⚠️ 2026-11-02 用户第三次纠正，这次是**决定性**的（原话）：
+    ///   「我们的对话不要生成产物，只有像 [文件列表截图] 这类的才能是产物，
+    ///    比如我说让他给我做一个 deb 文件，我们聊天的途中所有的对话不是产物，
+    ///    只有他生成 deb 或者源码，或者文档之类的才算产物」
+    ///
+    /// 前两版的判定都不对，教训在这里：
+    ///   · 第一版「有编号列表/出现'步骤''清单'」→ 任何解释都是产物，等于没判定；
+    ///   · 第二版「有代码块就是产物」→ 聊天里随手写的 `` `dpkg -l` ``、
+    ///     一小段示例命令、一个没闭合的 ``` ，全都被当成产物存成 md。
+    ///     用户看到的就是「聊了两句就冒出个 1.3 KB 文件产物」。
+    ///
+    /// 现在的标准（同时看三样，任一成立才算）：
+    ///   1. **明确报了文件名**：正文里写了 `xxx.deb` / `xxx.md` / `xxx.sh`
+    ///      这类带扩展名的文件名 —— 这是"我真的产出/要产出这个文件"最硬的信号；
+    ///   2. **代码块成规模**：单个代码块 ≥ 8 行（不是一行两行的示例命令，
+    ///      也不是 `dpkg -l` 那种行内引用）；
+    ///   3. **多段代码块**：≥ 2 个代码块（说明在给一整份实现，不是贴个片段）。
+    ///
+    /// 只要都不满足 → 这就是聊天记录，不生成任何产物文件。
+    private static func isRealDeliverable(_ body: String,
+                                          parts: (prose: String, blocks: [(lang: String, code: String)])) -> Bool {
+        // 条件 1：正文里点名了具体文件名（带这些扩展名）
+        let fileExts = [".deb", ".md", ".swift", ".py", ".sh", ".json", ".zip",
+                        ".tar", ".gz", ".plist", ".m", ".h", ".js", ".html",
+                        ".css", ".yml", ".yaml", ".toml", ".txt", ".ps1", ".bat"]
+        let lower = body.lowercased()
+        for ext in fileExts {
+            // 形如 `名字.ext`：扩展名前面必须跟着字母/数字/下划线，
+            // 避免把 ".sh" 这种纯后缀词（"the .sh file"）误判；
+            // 也避免把网址里的 .html 算进来 —— 名字里不能有空格或斜杠。
+            var search = lower[lower.startIndex...]
+            while let r = search.range(of: ext) {
+                let before = lower[..<r.lowerBound]
+                // 取扩展名前面那一小段，判断是不是"像文件名"
+                let tail = before.suffix(24)
+                let nameChars = tail.reversed().prefix { $0.isLetter || $0.isNumber || $0 == "_" || $0 == "-" || $0 == "." }
+                if nameChars.count >= 2 {
+                    // 排除网址：https://xxx.html / www.xxx.html
+                    let isURL = before.hasSuffix("http:/") || before.hasSuffix("https:/") || before.hasSuffix("www.")
+                    if !isURL { return true }
+                }
+                search = lower[r.upperBound...]
+            }
+        }
+
+        // 条件 2 / 3：代码块要成规模
+        let blocks = parts.blocks
+        if blocks.count >= 2 { return true }
+        for b in blocks {
+            let lines = b.code.split(separator: "\n", omittingEmptySubsequences: false)
+            // 8 行以上才算"一份东西"；短于此的是示例命令，属于聊天内容
+            if lines.count >= 8 { return true }
+        }
+        return false
     }
 
     private static func stampText() -> String {

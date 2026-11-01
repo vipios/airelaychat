@@ -672,18 +672,47 @@ struct ChatView: View {
                         .padding(.top, 2)
                         .id("thinking")
                     }
+                    // 底部锚点：一个零高度的稳定 id。
+                    //
+                    // ⚠️ 2026-11-02：自动滚到底部一律滚到这个固定锚点，
+                    // 而不是滚到「最后一条消息的 id」。
+                    // 为什么：滚到 `last.id` 时，那条消息的高度还在随流式输出变化，
+                    // 每次 scrollTo 的目标位置都在动 —— 和内容变高互相拉扯，
+                    // 就是用户看到的「到底以后一直在抖」。
+                    // 滚到一个恒定的尾部锚点，目标位置不随内容变化，循环就断了。
+                    Color.clear.frame(height: 1).id("bottomAnchor")
                 }
                 .padding(.horizontal, 20)
                 .padding(.top, 16)
                 .padding(.bottom, 10)
             }
+            // ⚠️ 2026-11-02 抖动修复（用户：「到底以后他给我回复的会话会一秒抖好几十下」）。
+            //
+            // 真正的病根不在滚动，而在 SelectableText 的 sizeThatFits：
+            // 它量出来的高度会在 748 / 749 之间飘，每飘一次 SwiftUI 就重排一遍列表，
+            // 整屏消息跟着抖一下，一秒钟几十遍。那部分在 SelectableText.swift 里修
+            // （宽度就近量化 + 高度 stableHeight 死区）。
+            //
+            // 这里只做配套的两条：
+            //   1. 滚到恒定锚点「bottomAnchor」，不滚到最后一条消息 ——
+            //      后者的位置随流式内容一直在变，每次 scrollTo 的目标都在动，
+            //      和"内容变高"互相拉扯，是抖动的第二来源；
+            //   2. 只在「新消息进来」和「开始发送」这两个时刻滚，不做逐帧跟随 ——
+            //      逐帧跟随必然和用户的滑动打架。动画 0.15s 是为了让连续触发时
+            //      上一段动画尽快结束，不让多段动画叠在一起。
+            //
+            // 注意：这里**没有**做「只在接近底部时才滚」的判定。用户往上翻历史时
+            // 仍会被拉回底部，那是另一个待办，不要以为已经做了。
             .onChange(of: store.messages.count) { _ in
-                withAnimation(.easeOut(duration: 0.2)) {
-                    if let last = store.messages.last { proxy.scrollTo(last.id, anchor: .bottom) }
+                withAnimation(.easeOut(duration: 0.15)) {
+                    proxy.scrollTo("bottomAnchor", anchor: .bottom)
                 }
             }
             .onChange(of: store.sending) { v in
-                if v { proxy.scrollTo("thinking", anchor: .bottom) }
+                guard v else { return }
+                withAnimation(.easeOut(duration: 0.15)) {
+                    proxy.scrollTo("bottomAnchor", anchor: .bottom)
+                }
             }
             .scrollDismissesKeyboard(.interactively)
             .onTapGesture { inputFocused = false }
@@ -806,8 +835,16 @@ struct ChatView: View {
                     //      每次都重排一遍 UITextView 才是真的卡。等它说完再换成可选中的。
                     let streaming = store.sending && msg.id == store.messages.last?.id
                     if streaming {
+                        // ⚠️ 2026-11-02：`.lineSpacing(5)` 必须和 SelectableText 里的
+                        // `p.lineSpacing = 5` 完全一致。
+                        // 上一版这里没写行距，用的是系统默认（约 0~2pt）；
+                        // 等流式结束、控件从 Text 切到 SelectableText 时，
+                        // 同一段字的总高度会突然变高一截 —— 列表跟着重排，
+                        // 表现就是「回答快说完时整块跳一下」。
+                        // 两处行距对齐后，切换前后高度一致，不会再跳。
                         Text(msg.text.isEmpty ? " " : msg.text)
                             .font(.system(size: Theme.bodySize))
+                            .lineSpacing(5)
                             .foregroundStyle(.primary)
                             .fixedSize(horizontal: false, vertical: true)
                             .frame(maxWidth: .infinity, alignment: .leading)
