@@ -1570,7 +1570,7 @@ final class ChatStore: ObservableObject {
         let body = m.text.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !body.isEmpty else { return }
 
-        // 把回复拆成「正文」和「代码块」两部分（正文现在不写进文件，只用来判断）
+        // 把回复拆成「正文」和「代码块」两部分
         let parts = Self.splitCodeBlocks(body)
 
         // 判定标准（2026-11-02 第三次收紧，见 isRealDeliverable 里的详细说明）：
@@ -1587,39 +1587,184 @@ final class ChatStore: ObservableObject {
             i -= 1
         }
 
-        // 文件里**只放产物本身**：一行标题 + 代码块。
-        // 模型名、时间、解释性正文全部不写进去 ——
-        // 那些是对话过程，写进文件会让产物看起来还是聊天记录。
-        // 时间在文件名里已经有了（-20261031-001030），不重复。
-        var doc = ""
-        if !question.isEmpty {
-            doc += "# \(question.replacingOccurrences(of: "\n", with: " "))\n\n"
-        }
-        let body2 = Self.reassemble(parts)
-        if body2.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-            // 只有「正文里点了文件名」而没有代码块的情况（比如
-            // 「已经生成 cleanup.deb，放在 /var/mobile/…」）。
-            // 这时候产物本体不在回复里（可能由工具生成），
-            // 把正文原样留下作为记录，总比存一个只有标题的空文件强。
-            doc += body + "\n"
-        } else {
-            doc += body2 + "\n"
-        }
-
-        let title = question.isEmpty
+        let baseTitle = question.isEmpty
             ? (currentSessionTitle.isEmpty ? "产出" : currentSessionTitle)
             : String(question.replacingOccurrences(of: "\n", with: " ").prefix(30))
 
-        // sessionTitle 决定文件落在哪个文件夹：每个会话一个独立目录，
-        // 目录名就是会话名（带一小段 id 防同名覆盖）。
-        if let rec = FileStore.writeText(title: title,
-                                        body: doc,
-                                        ext: "md",
-                                        sessionId: currentSessionId,
-                                        sessionTitle: currentSessionTitle,
-                                        messageIndex: idx) {
-            FileLibrary.shared.add(rec)
+        // ⚠️ 2026-11-02 修（用户：「我让对话框的 ai 给我生成三个产物不同的格式，
+        // 他怎么就给我生成一个啊」）。
+        //
+        // 原来这个方法不管回复里有几个代码块，**最后只 calling 一次 writeText**，
+        // 把所有代码块用 ``` 拼进同一个 .md 文件。于是"生成 sh + py + json"
+        // 在文件库里只看到 1 个 md，用户以为没做出来。
+        //
+        // 现在改成一个代码块 = 一个独立文件，扩展名按代码块的语言标记推断。
+        // 正文（prose）不再单独存 —— 那是解释，属于对话，不是产物。
+        if parts.blocks.isEmpty {
+            // 只有「正文里点了文件名」而没有代码块的情况（比如
+            // 「已经生成 cleanup.deb，放在 /var/mobile/…」，文件由工具生成、
+            // 本体不在这条回复里）。这种情况仍然只留一份文本记录。
+            var doc = ""
+            if !question.isEmpty {
+                doc += "# \(question.replacingOccurrences(of: "\n", with: " "))\n\n"
+            }
+            doc += body + "\n"
+            if let rec = FileStore.writeText(title: baseTitle,
+                                            body: doc,
+                                            ext: "md",
+                                            sessionId: currentSessionId,
+                                            sessionTitle: currentSessionTitle,
+                                            messageIndex: idx) {
+                FileLibrary.shared.add(rec)
+            }
+            return
         }
+
+        // 正文里点名过的文件名，按出现顺序取出来给代码块用 ——
+        // 「生成三个文件：a.sh / b.py / c.json」这种写法很常见，
+        // 用真名比 「产出-1.sh」「产出-2.py」可读得多。
+        let named = Self.namedFileNames(in: body)
+
+        for (n, block) in parts.blocks.enumerated() {
+            // 太短的代码块当"示例命令"，不单独存。
+            // 和 isRealDeliverable 里 ≥8 行的口径一致，避免一份产物被拆成一堆碎片。
+            let lines = block.code.split(separator: "\n", omittingEmptySubsequences: false)
+            let ext = Self.extForBlock(lang: block.lang, code: block.code)
+            let isDeliverable = lines.count >= 8 || parts.blocks.count >= 2
+            guard isDeliverable else { continue }
+
+            // 标题优先级：正文点名的文件名 > 「提问-序号」
+            // 注意 named 里存的是完整文件名（含扩展名），写文件时要剥掉扩展名，
+            // 否则会变成 "deploy.sh-20261102-041500.sh" 这种重名。
+            var title = baseTitle
+            if n < named.count {
+                let full = named[n]
+                let stem = (full as NSString).deletingPathExtension
+                if !stem.isEmpty { title = stem }
+            } else if parts.blocks.count > 1 {
+                title = "\(baseTitle)-\(n + 1)"
+            }
+
+            // ⚠️ 同一条回复里出现同名不同格式（server.sh + server.py）时，
+            // 光靠标题分不开 —— 两个文件都叫 server-<时间戳>.{sh,py}，
+            // 在「我的文件」里并排两条一样的名字，用户看不出区别。
+            // 所以多产物的情况下统一把扩展名缀到标题后面。
+            // 单产物不缀（叫什么由提问决定了，多挂个 .sh 反而啰嗦）。
+            if parts.blocks.count > 1 {
+                title = "\(title)-\(ext)"
+            }
+
+            var doc = ""
+            if !question.isEmpty, parts.blocks.count == 1 {
+                // 只有一个产物时把提问留在文件头，方便以后看这文件是为什么生成的。
+                // 多个产物时不加 —— 三个文件里各贴一遍同样的问题很吵。
+                doc += "# \(question.replacingOccurrences(of: "\n", with: " "))\n\n"
+            }
+            doc += block.code
+            if !doc.hasSuffix("\n") { doc += "\n" }
+
+            if let rec = FileStore.writeText(title: title,
+                                            body: doc,
+                                            ext: ext,
+                                            sessionId: currentSessionId,
+                                            sessionTitle: currentSessionTitle,
+                                            messageIndex: idx) {
+                FileLibrary.shared.add(rec)
+            }
+        }
+    }
+
+    /// 从正文里按出现顺序找出「像文件名」的词（带已知扩展名）。
+    ///
+    /// 只认白名单里的扩展名：正文里随手出现的 `1.5`、`v2.0` 不能被当成文件名。
+    private static func namedFileNames(in s: String) -> [String] {
+        let exts = ["sh", "py", "js", "ts", "json", "yaml", "yml", "toml", "xml",
+                    "html", "css", "md", "txt", "swift", "m", "h", "c", "cpp",
+                    "java", "kt", "go", "rs", "rb", "php", "sql", "deb", "conf",
+                    "ini", "plist", "service", "lua", "ps1", "bat", "cmd"]
+        var out: [String] = []
+        var seen = Set<String>()
+        let chars = Array(s)
+        var i = 0
+        while i < chars.count {
+            if chars[i] == "." {
+                // 往后读扩展名字符
+                var j = i + 1
+                var ext = ""
+                while j < chars.count, chars[j].isLetter || chars[j].isNumber {
+                    ext.append(chars[j]); j += 1
+                }
+                if exts.contains(ext.lowercased()) {
+                    // 往前读文件名主干
+                    var k = i - 1
+                    var stem = ""
+                    while k >= 0, chars[k].isLetter || chars[k].isNumber
+                            || chars[k] == "_" || chars[k] == "-" || chars[k] == "." {
+                        stem = String(chars[k]) + stem
+                        k -= 1
+                    }
+                    let stemTrim = stem.trimmingCharacters(in: CharacterSet(charactersIn: ".-"))
+                    // ⚠️ 2026-11-02：主干必须**只有 ASCII**。
+                    //
+                    // 原来的判断只限制了长度（1~60），中文也算 `isLetter`，
+                    // 于是「生成 server.sh 和 server.py」会往前一路吃到
+                    // 「生成server」，再连同后面的「和server」拼成一个荒谬的文件名
+                    // （实测产出 "生成 server.sh 和 server.py-2-py" 这种标题）。
+                    //
+                    // 文件名基本只会是 ASCII（字母数字 _ - .），
+                    // 遇到中文/空格就说明那是句子，不是文件名，直接停。
+                    let allASCII = stemTrim.unicodeScalars.allSatisfy { $0.isASCII }
+                    // 纯数字不当文件名（"1.5"、"2024.12" 这种是版本号/数字）
+                    let hasLetter = stemTrim.contains { $0.isLetter }
+                    if allASCII, hasLetter, stemTrim.count >= 1, stemTrim.count <= 40 {
+                        let full = stemTrim + "." + ext
+                        if !seen.contains(full.lowercased()) {
+                            seen.insert(full.lowercased())
+                            out.append(full)
+                        }
+                    }
+                }
+                i = j
+            } else {
+                i += 1
+            }
+        }
+        return out
+    }
+
+    /// 代码块 → 文件扩展名。
+    ///
+    /// 先信语言标记（```bash / ```python / ```json 最准），
+    /// 标记为空或认不出来时再看内容特征兜底。
+    private static func extForBlock(lang: String, code: String) -> String {
+        let l = lang.lowercased().trimmingCharacters(in: .whitespaces)
+        let map: [String: String] = [
+            "sh": "sh", "bash": "sh", "shell": "sh", "zsh": "sh", "console": "sh",
+            "py": "py", "python": "py", "python3": "py",
+            "js": "js", "javascript": "js", "ts": "ts", "typescript": "ts",
+            "json": "json", "yaml": "yaml", "yml": "yaml", "toml": "toml",
+            "xml": "xml", "html": "html", "css": "css", "scss": "css",
+            "md": "md", "markdown": "md", "txt": "txt", "text": "txt",
+            "swift": "swift", "objc": "m", "objective-c": "m", "c": "c",
+            "cpp": "cpp", "c++": "cpp", "java": "java", "kotlin": "kt",
+            "go": "go", "rust": "rs", "ruby": "rb", "php": "php",
+            "sql": "sql", "lua": "lua", "powershell": "ps1", "ps1": "ps1",
+            "bat": "bat", "cmd": "bat", "ini": "ini", "conf": "conf",
+            "plist": "plist", "service": "service", "dockerfile": "dockerfile",
+        ]
+        if let e = map[l], !e.isEmpty { return e }
+        // 没标记：看内容猜
+        let t = code.trimmingCharacters(in: .whitespacesAndNewlines)
+        if t.hasPrefix("{") || t.hasPrefix("[") { return "json" }
+        if t.hasPrefix("<?xml") || t.hasPrefix("<plist") { return "xml" }
+        if t.hasPrefix("<!DOCTYPE") || t.hasPrefix("<html") { return "html" }
+        if t.hasPrefix("#!") {
+            let first = t.components(separatedBy: "\n").first ?? ""
+            if first.contains("python") { return "py" }
+            if first.contains("bash") || first.contains("sh") { return "sh" }
+            if first.contains("node") { return "js" }
+        }
+        return "txt"
     }
 
     /// 把一段文本拆出「去掉代码块的正文」和「所有代码块」
