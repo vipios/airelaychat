@@ -1459,6 +1459,18 @@ final class ChatStore: ObservableObject {
             }
         }
 
+        // 2026-11-02 用户：「让他回复我的时候别太墨迹，要简洁易懂啊，每次说话发一堆」。
+        //
+        // 这里之前**一条 system 消息都不发**，模型全靠自己的默认习惯 ——
+        // 而默认习惯就是先来一段"好的，我来帮你分析一下"，答案要翻三屏才看见。
+        //
+        // 插在 history 最前面（交接摘要也已经插过了，所以这里用 insert at 0，
+        // 让风格要求排在摘要前面 —— 越靠前的 system 越被当成总纲）。
+        let stylePrompt = settings.replySystemPrompt
+        if !stylePrompt.isEmpty {
+            history.insert(("system", stylePrompt, []), at: 0)
+        }
+
         let key = settings.key(for: p)
         // 2026-11-02：开流前把节流状态复位。
         // 这一步必须在 `client.stream` 之前 —— 否则上一轮的残余缓冲

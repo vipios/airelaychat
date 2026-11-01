@@ -68,6 +68,7 @@ struct SettingsView: View {
                     providerSection
                     currentLinkSection
                     modelSection
+                    styleSection
                     connectionSection
                     deviceSection
                     publicSection
@@ -285,6 +286,41 @@ struct SettingsView: View {
             Text("模型（按场景自动切换）")
         } footer: {
             Text("进软件时自动判断你在家还是在外面，然后自动用对应模型。不指定就跟随聊天界面里选的模型。")
+        }
+    }
+
+    // MARK: 回复风格
+
+    private var styleSection: some View {
+        Section {
+            Toggle(isOn: $settings.replyConcise) {
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("简洁模式")
+                    Text("先给结论，不铺垫、不复述、不总结")
+                        .font(.system(size: 12))
+                        .foregroundStyle(.secondary)
+                }
+            }
+            VStack(alignment: .leading, spacing: 6) {
+                Text("额外要求")
+                TextEditor(text: $settings.replyExtra)
+                    .font(.system(size: 14))
+                    .frame(minHeight: 64)
+                    .overlay(alignment: .topLeading) {
+                        if settings.replyExtra.isEmpty {
+                            Text("例如：回答里不要用表格")
+                                .font(.system(size: 14))
+                                .foregroundStyle(.tertiary)
+                                .padding(.top, 8)
+                                .padding(.leading, 5)
+                                .allowsHitTesting(false)
+                        }
+                    }
+            }
+        } header: {
+            Text("回复风格")
+        } footer: {
+            Text("简洁模式默认开启，让模型直接说结果、别发一堆客套话。想恢复原来的风格就关掉。终端命令和网址会自动单独成块，右上角有一键复制。")
         }
     }
 

@@ -849,14 +849,18 @@ struct ChatView: View {
                             .fixedSize(horizontal: false, vertical: true)
                             .frame(maxWidth: .infinity, alignment: .leading)
                     } else {
-                        SelectableText(
-                            text: msg.text.isEmpty ? " " : msg.text,
-                            allowRecall: false,
-                            fillsWidth: true,
-                            onRecall: {},
-                            onRecallAndEdit: {}
-                        )
-                        .frame(maxWidth: .infinity, alignment: .leading)
+                        // ⚠️ 2026-11-02：换成按代码块分段的富渲染。
+                        //
+                        // 用户拿了张截图要求：「像这种的直接就有明显的颜色区分
+                        // 后面还有一个小图标让我一键复制」。原来整条回复是
+                        // 一块 UITextView —— 代码和正文混在一段里，没法在右上角
+                        // 挂按钮，也没法给代码单独上色。
+                        //
+                        // 现在纯正文段仍是 SelectableText（选词/长按复制不变），
+                        // 代码块单独成卡片：左上角语言、右上角两本书图标一键复制、
+                        // 代码带语法配色、长命令横向滚动不换行。
+                        AssistantBody(text: msg.text.isEmpty ? " " : msg.text)
+                            .frame(maxWidth: .infinity, alignment: .leading)
                     }
                 }
 

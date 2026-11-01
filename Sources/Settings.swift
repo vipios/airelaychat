@@ -138,6 +138,17 @@ final class Settings: ObservableObject {
     /// 当前选中的来源（Provider.id）
     @Published var activeProvider: String { didSet { store() } }
 
+    /// 简洁模式（2026-11-02）。
+    ///
+    /// 用户原话：「让他回复我的时候别太墨迹，要简洁易懂啊，每次说话发一堆」。
+    ///
+    /// 默认**开**：之前 App 一个系统提示词都没发，模型全靠自己的默认习惯，
+    /// 而默认习惯就是先说一段"好的，我来帮你分析一下这个问题…"再给答案。
+    /// 手机上一条回复占三四屏，翻起来很累。
+    @Published var replyConcise: Bool { didSet { store() } }
+    /// 用户自己追加的回复要求（原样拼到系统提示词末尾）。空串表示没写。
+    @Published var replyExtra: String { didSet { store() } }
+
     private let key = "airelay.settings.v2"
     private let oldKey = "airelay.settings.v1"
 
@@ -165,6 +176,10 @@ final class Settings: ObservableObject {
         var gistOwner: String?
         var providers: [Provider]?
         var activeProvider: String?
+        /// 简洁模式。后加字段 → 必须可选，理由同 `lanPool`。
+        var replyConcise: Bool?
+        /// 用户自定义的回复要求。
+        var replyExtra: String?
     }
 
     /// 旧版只有中转站一个来源，迁移成 Provider
@@ -190,7 +205,8 @@ final class Settings: ObservableObject {
                        lastLanBase: nil, lastPubBase: nil, lanPool: nil, bootHost: nil,
                        gatewayKey: v1.gatewayKey, homeModel: v1.homeModel,
                        awayModel: v1.awayModel, port: v1.port, gistId: v1.gistId,
-                       gistOwner: v1.gistOwner, providers: nil, activeProvider: nil)
+                       gistOwner: v1.gistOwner, providers: nil, activeProvider: nil,
+                       replyConcise: nil, replyExtra: nil)
         }
 
         // 默认值故意留空：第一次打开会按常见网段依次并发试，谁通用谁并记住。
@@ -231,6 +247,11 @@ final class Settings: ObservableObject {
         providers = ps
         let active = s?.activeProvider ?? ""
         activeProvider = ps.contains(where: { $0.id == active }) ? active : (ps.first?.id ?? "")
+
+        // 默认值故意是 true：老用户升级上来也直接享受「说人话、别墨迹」，
+        // 想恢复原样在设置里关掉即可。缺字段时给 true，不是给 false。
+        replyConcise = s?.replyConcise ?? true
+        replyExtra = s?.replyExtra ?? ""
     }
 
     private func store() {
@@ -241,7 +262,8 @@ final class Settings: ObservableObject {
                        gatewayKey: gatewayKey,
                        homeModel: homeModel, awayModel: awayModel, port: port,
                        gistId: gistId, gistOwner: gistOwner,
-                       providers: providers, activeProvider: activeProvider)
+                       providers: providers, activeProvider: activeProvider,
+                       replyConcise: replyConcise, replyExtra: replyExtra)
         if let d = try? JSONEncoder().encode(s) {
             UserDefaults.standard.set(d, forKey: key)
         }
@@ -418,5 +440,41 @@ final class Settings: ObservableObject {
     func cap(for model: String, in p: Provider) -> ModelCap {
         if let o = p.capOverrides[model] { return o }
         return CapInfer.infer(model)
+    }
+
+    // MARK: 回复风格提示词
+
+    /// 拼出要放在对话最前面的那条 system 消息。空串表示不发。
+    ///
+    /// ⚠️ 2026-11-02 用户原话（两条，都很明确）：
+    ///   1.「让他回复我的时候别太墨迹，要简洁易懂啊，每次说话发一堆」
+    ///   2.「他要是给我发终端指令类的，连接类的，需要单独有一键复制那个图标」
+    ///
+    /// 第 2 条除了界面上的复制按钮，也得让模型**别把命令混在句子里**——
+    /// 一句话里带三条 `adb shell xxx` 的话，App 没法单独识别出来给按钮。
+    /// 所以这里要求它把每条能直接执行的命令放进独立代码块。
+    var replySystemPrompt: String {
+        var parts: [String] = []
+
+        if replyConcise {
+            parts.append("""
+            回答要简短直接：先给答案或结论，再给必要的补充。不要开场白、\
+            不要复述我的问题、不要总结你刚才说过的话、不要加"希望这能帮到你"这类客套。\
+            能一句说清就别写一段，能用列表就别写成大段文字。\
+            只有我明确要求详细解释时才展开。
+            """)
+        }
+
+        // 独立于「简洁」，这条始终生效：它同时关系到界面能不能给出复制按钮。
+        parts.append("""
+        需要我在手机或电脑上执行的命令（终端、shell、ssh、adb、curl 等）\
+        必须单独放进一个代码块里，一条命令一个块，块内只放命令本身、不要带解释文字。\
+        不要在正文句子里夹带命令。
+        """)
+
+        let extra = replyExtra.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !extra.isEmpty { parts.append(extra) }
+
+        return parts.joined(separator: "\n\n")
     }
 }
