@@ -416,6 +416,41 @@ final class FileLibrary: ObservableObject {
         FileStore.save(files)
     }
 
+    /// 删掉某个会话里、`messageIndex` 落在指定区间内的产物记录。
+    ///
+    /// 2026-11-02 加，给「重新生成」用：重答会重写那一条回复，
+    /// 它名下原来的产物就作废了。留着会变成"同一份东西出现两遍"。
+    ///
+    /// 只删**记录**，磁盘文件也一起删 —— 否则文件白白占着空间，
+    /// 而用户在任何界面上都看不到它了（等于垃圾）。
+    func dropArtifacts(sessionId: String, messageIndexRange: Range<Int>) {
+        let doomed = files.filter {
+            $0.sessionId == sessionId && messageIndexRange.contains($0.messageIndex)
+        }
+        guard !doomed.isEmpty else { return }
+        for f in doomed {
+            try? FileManager.default.removeItem(at: f.url)
+        }
+        files.removeAll { f in doomed.contains(where: { $0.id == f.id }) }
+        FileStore.save(files)
+    }
+
+    /// 裁掉若干条消息之后，把后面那些产物记录的 `messageIndex` 前移。
+    ///
+    /// 2026-11-02 加，同样是给「重新生成」用。
+    /// 不挪的话，产物卡片会挂到别人的回复下面（或者因为下标越界而消失）。
+    func shiftArtifactIndices(sessionId: String, removedFrom: Int, by count: Int) {
+        guard count > 0 else { return }
+        var changed = false
+        for i in files.indices {
+            guard files[i].sessionId == sessionId else { continue }
+            guard files[i].messageIndex >= removedFrom + count else { continue }
+            files[i].messageIndex -= count
+            changed = true
+        }
+        if changed { FileStore.save(files) }
+    }
+
     /// 某个会话的文件夹在磁盘上叫什么（给「我的文件」页显示路径用）
     func folderName(sessionTitle: String, sessionId: String) -> String {
         if let f = files.first(where: { $0.sessionId == sessionId && !$0.folder.isEmpty }) {

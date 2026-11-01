@@ -2283,15 +2283,31 @@ final class ChatStore: ObservableObject {
         let question = messages[q]
         let model = messages[i].model.isEmpty ? effectiveModel : messages[i].model
 
-        // 把「提问 + 回答」之后的所有消息摘下来
+        // 把「提问 + 回答」之后的所有消息摘下来。
+        // 用 `Array(...)` 存成一堆值拷贝 —— 这里必须复制，不能存引用下标，
+        // 因为下面 messages 会被裁剪，下标全部失效。
         let tail = Array(messages[(i + 1)...])
-        messages.removeSubrange((q + 1)...)      // 只留到提问为止
 
-        // 提问也摘掉：send() 会把 input 里的内容重新 append 成新消息，
+        // 提问和回答一起摘掉：send() 会把 input 里的内容重新 append 成新消息，
         // 留着会变成"问了两遍"。
+        //
+        // ⚠️ 只在**重答的不是最后一条**时才需要管 tail。
+        // 如果就是最后一条，tail 是空的，这一步等于什么都没做。
         input = question.text
         pending = question.attachments
         messages.removeSubrange(q...)
+
+        // ⚠️ 2026-11-02 必须同步清理产物归属。
+        //
+        // 产物记录里有 `messageIndex`（第几条消息产生的）。裁掉消息之后，
+        // 后面每一条的下标都会往前挪，而产物记录还记着老下标 ——
+        // 结果就是"产物卡片挂到了别人的回复下面"，或者干脆消失。
+        // 这里做两件事：
+        //   1. 这条被重答的回复名下的产物删掉（重答会重新生成，留着就是重复）
+        //   2. 后面那些消息名下的产物，下标整体前移
+        let removedCount = (i - q) + 1
+        reindexArtifacts(afterRemovingAt: q, count: removedCount)
+
         // 模型沿用这条回复当时用的那个（用户重答多半是想同样的模型再试一次，
         // 而不是换成当前选中的另一个）
         if !model.isEmpty { currentModel = model }
@@ -2299,6 +2315,25 @@ final class ChatStore: ObservableObject {
         // 尾段暂存，等这一轮说完再挂回去
         regenerateTail = tail
         send()
+    }
+
+    /// 重答裁消息后，把产物记录的 `messageIndex` 对齐。
+    ///
+    /// - Parameters:
+    ///   - from: 从哪条开始被裁掉
+    ///   - count: 裁掉了几条
+    private func reindexArtifacts(afterRemovingAt from: Int, count: Int) {
+        // 这一步做两件事，缺一不可：
+        //   1. 落在被裁区间里的产物 → 直接删（那条回复要重写，旧产物作废）
+        //   2. 落在区间之后的产物 → 下标前移 count
+        //
+        // 为什么要动 FileLibrary 里的一堆记录而不是"下次启动自然对上"：
+        // messageIndex 是持久化的，下次启动照样错位，而且用户当场就会看到
+        // 产物卡片挂错位置 —— 不能等重启。
+        FileLibrary.shared.dropArtifacts(sessionId: currentSessionId,
+                                         messageIndexRange: from..<(from + count))
+        FileLibrary.shared.shiftArtifactIndices(sessionId: currentSessionId,
+                                                removedFrom: from, by: count)
     }
 
     /// `regenerate` 摘下来、待恢复的后续消息。
