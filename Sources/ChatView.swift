@@ -85,6 +85,39 @@ struct ChatView: View {
     /// "它到底卡了还是只是慢"，一个在跳的秒数比一个转圈更让人放心。
     @State private var thinkingSince = Date()
 
+    /// 设置「是否贴在底部」，两份状态一起改。
+    ///
+    /// 为什么有两份：`atBottom` 是 `@State`，负责驱动界面（浮钮显隐）；
+    /// `gate.pinned` 存在引用类型里，给 `asyncAfter` 的收尾滚动读 ——
+    /// 闭包捕获 View struct 快照，读 `@State` 会拿到排队时的旧值。
+    /// 两者必须永远一致，所以只准通过这个方法改。
+    private func pinToBottom(_ pinned: Bool) {
+        gate.pinned = pinned
+        if atBottom != pinned { atBottom = pinned }
+    }
+
+    /// 滚动跟随的节流闸门。
+    ///
+    /// ⚠️ 为什么用 class 而不是几个 `@State`：
+    /// 收尾滚动是在 `DispatchQueue.main.asyncAfter` 里跑的，闭包捕获的是
+    /// **View struct 那一刻的快照** —— 读 `@State` 拿到的永远是排队时的旧值。
+    /// 换成引用类型后，闭包里读到的就是最新状态：
+    /// 「是不是已经有更新的一发接管了」「用户是不是已经翻上去了」两句判断
+    /// 才靠谱。
+    ///
+    /// 刻意不加 `@Published`：这些字段是纯控制量，不该触发 body 重算，
+    /// 每帧重算列表正是之前抖动的来源之一。
+    private final class FollowGate: ObservableObject {
+        /// 最近一次真正执行 `scrollTo` 的时刻。
+        var lastAt = Date.distantPast
+        /// 发号器。每次调用加一；到点发现号不是自己那一发，就静默退出。
+        var token = 0
+        /// 用户当前是否贴在底部（由 `onPreferenceChange` 维护）。
+        var pinned = true
+    }
+
+    @StateObject private var gate = FollowGate()
+
     var body: some View {
         ZStack(alignment: .topLeading) {
             mainColumn
@@ -322,7 +355,7 @@ struct ChatView: View {
         Group {
             if !atBottom, !store.messages.isEmpty {
                 Button {
-                    atBottom = true
+                    pinToBottom(true)
                     // 用一个计数器通知里层的 ScrollViewReader 滚到底。
                     // 为什么不用 NotificationCenter：滚动是纯视图行为，
                     // 走全局通知会跨页面误触发（另一个会话页也在听）。
@@ -714,11 +747,38 @@ struct ChatView: View {
     // MARK: - 消息区
 
     private var messagesArea: some View {
-        // 外层量一下视口高度，用来判断「底部锚点是不是已经落在屏幕里」。
+        // 外层只负责「量视口高度」。
+        //
+        // ⚠️ 2026-11-02 修（用户：「给 ai 下达指令的时候全屏文字和产物直接顶的最上面，
+        // 全屏时完全空白，我还要多滑动屏幕几次才能显示」）。
+        //
+        // 三个病根叠在一起，必须一起改：
+        //
+        // ① **LazyVStack 是延迟布局的** —— 这是主因。
+        //    它的内容总高度在滚动过程中是"估算"的，`scrollTo` 算目标偏移量时
+        //    拿到的就是估算值。流式内容每 0.05 秒变一次，每次估算都不一样，
+        //    于是滚到一个"当时以为对、下一帧就错"的位置。
+        //    表现正是用户说的：**画面被顶到内容之外，一片空白，得手滑几次才回来**。
+        //    聊天记录最多几十条，VStack 全量布局也就几毫秒，换来每次 scrollTo
+        //    都算在真实高度上。这是最关键的一处。
+        //
+        // ② **每来一段 delta 就滚一次**（20Hz 的 scrollTo）。
+        //    滚动本身是动画，后一发打断前一发，累积误差越滚越偏。
+        //    现在改成 0.12 秒节流（约 8Hz），肉眼是连续跟随，但不再自我打架。
+        //
+        // ③ **`vp.size.height` 可能是 0**。
+        //    GeometryReader 在 VStack 里，首帧还没算出高度；而判断"在底部"
+        //    用的是 `y <= 0 + 72`，结果恒为 false —— `atBottom` 一直是 false，
+        //    流式跟随从头到尾一次都不触发，内容一路往下长、视口不动 = 空白。
+        //    现在用 `max(vp.size.height, 1)`，高度未知时退化成"认为在底部"。
         GeometryReader { vp in
+            let viewportH = max(vp.size.height, 1)
             ScrollViewReader { proxy in
                 ScrollView {
-                    LazyVStack(alignment: .leading, spacing: 20) {
+                    // ⚠️ 从 LazyVStack 换成 VStack，见上面 ①。
+                    // 不要"为了性能"改回去：聊天记录量级很小，
+                    // 而延迟布局会让滚动位置算错，那个代价大得多。
+                    VStack(alignment: .leading, spacing: 20) {
                         if store.messages.isEmpty { emptyHint }
                         ForEach(store.messages) { msg in
                             bubble(msg).id(msg.id)
@@ -738,18 +798,15 @@ struct ChatView: View {
                                 .id("thinking")
                                 .padding(.top, 2)
                         }
-                        // 底部锚点：一个零高度的稳定 id。
+                        // 底部锚点：一个**非零高度**的稳定 id。
                         //
-                        // ⚠️ 2026-11-02：自动滚到底部一律滚到这个固定锚点，
-                        // 而不是滚到「最后一条消息的 id」。
-                        // 为什么：滚到 `last.id` 时，那条消息的高度还在随流式输出变化，
-                        // 每次 scrollTo 的目标位置都在动 —— 和内容变高互相拉扯，
-                        // 就是用户看到的「到底以后一直在抖」。
-                        // 滚到一个恒定的尾部锚点，目标位置不随内容变化，循环就断了。
+                        // ⚠️ 为什么高度是 1 而不是 0：
+                        // 0 高度的视图在部分 iOS 版本上会被布局系统裁掉，
+                        // `scrollTo` 找不到锚点就什么都不做 —— 表现是"滚不动、停在半空"。
                         //
-                        // 2026-11-02 再加：挂一个 GeometryReader 把它的位置报上来，
-                        // 用来判断"用户现在是不是贴在底部"。这是流式跟随的前提 ——
-                        // 不判断的话，用户往上翻历史会被一直拽回去（老毛病）。
+                        // ⚠️ 为什么滚锚点而不是滚「最后一条消息的 id」：
+                        // 后者的高度随流式输出一直在变，每次 scrollTo 的目标都在动，
+                        // 和内容变高互相拉扯，就是之前那个"到底以后一直抖"。
                         Color.clear
                             .frame(height: 1)
                             .id("bottomAnchor")
@@ -761,6 +818,10 @@ struct ChatView: View {
                                     )
                                 }
                             )
+                        // 底部留白。**放在锚点之后**：
+                        // 这样"滚到锚点"就已经滚到内容末端，这段空白是额外给的余量，
+                        // 不会反过来把锚点位置算进去导致差一点点没到底。
+                        Color.clear.frame(height: 8)
                     }
                     .padding(.horizontal, 20)
                     .padding(.top, 16)
@@ -770,51 +831,84 @@ struct ChatView: View {
                 // 所以「锚点 y ≤ 视口高 + 一点余量」就等于「已经在底部附近」。
                 .coordinateSpace(name: "chatViewport")
                 .onPreferenceChange(BottomAnchorY.self) { y in
-                    guard y.isFinite, vp.size.height > 0 else { return }
-                    let near = y <= vp.size.height + 72
-                    if near != atBottom {
-                        atBottom = near
-                    }
+                    guard y.isFinite else { return }
+                    // 容差 120：列表底部还有留白和圆角，给少了会误判成
+                    // "用户已经滚上去了"，于是停止跟随 —— 那又变回空白。
+                    let near = y <= viewportH + 120
+                    pinToBottom(near)
                 }
+
                 // ⚠️ 2026-11-02 修（用户：「我给他发完消息全屏看不到字，
-                // 我还要往上滑动才能看见」）。
+                // 我还要往上滑动才能看见」+「全屏文字和产物直接顶的最上面，
+                // 全屏时完全空白，我还要去多滑动屏幕几次才能显示」）。
                 //
                 // 病根：滚动只在「消息数变化」和「开始发送」这两个时刻触发，
                 // **回复流式变长时完全没有跟随**。于是回复越写越长、内容一路往下长，
                 // 视口却钉在原地不动 —— 用户只能看到开头一句，
                 // 下面是整片空白，必须手动往上滑才追得上。
                 //
-                // 现在补一条：只要「用户贴在底部」，正文一有变化就跟着走。
+                // 后来补了"每段 delta 滚一次"，结果是 20Hz 的 scrollTo 互相打断，
+                // 仍然算错位置。现在统一走 `followBottom(_:animated:)`：
+                // **前导 + 收尾的 0.12 秒节流**（约 8Hz）——
+                // 到点立刻滚一次，紧接着来的高频更新只登记一次收尾，
+                // 保证"最后那一小段内容"也一定跟上，不会有残余偏差。
+                //
                 // 用 length 而不是全文做 key：字符串比较几 KB 也费，
                 // 而流式只会在末尾追加，长度变了就是有新内容。
                 .onChange(of: streamingText.count) { _ in
                     guard atBottom else { return }
-                    // **不加动画**。这是关键：流式每 0.05 秒来一次，
-                    // 每次都起一段 0.15 秒动画，动画永远播不完、互相打断，
-                    // 屏幕上就是一顿一顿地抽。直接跳到底反而看起来是连续上滚的。
-                    proxy.scrollTo("bottomAnchor", anchor: .bottom)
+                    followBottom(proxy, animated: false)
                 }
-                // 新消息进来 / 开始发送：这两下必须滚，而且要带动画 ——
+                // 新消息进来：必须滚，而且要带动画 ——
                 // 这是"我发了消息，请把镜头带过去"的语义，没有动画会觉得突兀。
+                //
+                // ⚠️ 必须再补几次 `settleScroll`：新插入的气泡是 `SelectableText`，
+                // 它的高度要等 UITextView 建好、文本灌进去才量得准。
+                // 只滚一次会滚到"旧高度"对应的位置，画面停在内容之外 = 空白。
                 .onChange(of: store.messages.count) { _ in
-                    atBottom = true
-                    withAnimation(.easeOut(duration: 0.15)) {
-                        proxy.scrollTo("bottomAnchor", anchor: .bottom)
-                    }
+                    pinToBottom(true)
+                    followBottom(proxy, animated: true, force: true)
+                    settleScroll(proxy, delays: [0.05, 0.18, 0.40])
                 }
                 .onChange(of: store.sending) { v in
                     if v { thinkingSince = Date() }
-                    guard v else { return }
-                    atBottom = true
-                    withAnimation(.easeOut(duration: 0.15)) {
-                        proxy.scrollTo("bottomAnchor", anchor: .bottom)
-                    }
+                    pinToBottom(true)
+                    // 开始 / 结束都强制滚一次：结束那下是兜底，
+                    // 把节流跳过的最后一点点内容补齐，保证收尾一定贴在底部。
+                    followBottom(proxy, animated: true, force: true)
+                    // 结束那一下尤其要补：产物卡片紧接着就插进来了（见下面
+                    // artifactCount），而且这时正文刚从流式状态定型成静态文本，
+                    // 高度会再变一次。两个补滚叠在一起也没关系，幂等的。
+                    settleScroll(proxy, delays: [0.06, 0.20, 0.45])
                 }
                 // 「回到底部」浮钮点了一下（见 scrollToBottomButton）
                 .onChange(of: scrollTick) { _ in
-                    withAnimation(.easeOut(duration: 0.22)) {
-                        proxy.scrollTo("bottomAnchor", anchor: .bottom)
-                    }
+                    pinToBottom(true)
+                    followBottom(proxy, animated: true, force: true)
+                    settleScroll(proxy, delays: [0.12, 0.35])
+                }
+                // 产物卡片是**回复说完之后**才插进来的（见 runSend 收尾顺序），
+                // 那一下没有任何滚动跟随 —— 卡片就落在视口下方，用户以为没生成。
+                // 这里单独盯住产物数，一变就补一次滚动。
+                //
+                // ⚠️ 必须延时：`sending` 刚转 false、`archiveReply` 才把产物写进库，
+                // 那一刻界面还停在旧布局上。给布局一点时间再滚，才滚到真实位置。
+                .onChange(of: artifactCount) { _ in
+                    pinToBottom(true)
+                    settleScroll(proxy, delays: [0.06, 0.22, 0.50])
+                }
+                // 切换会话：打开一段很长的历史对话时，同样会遇到"高度还没量准"，
+                // 只是这里更极端 —— 几十条消息要一次性建出几十个 UITextView。
+                // 所以第一次滚动提前到视图出现前后，之后再补三次，让它一层层追上。
+                .onChange(of: store.currentSessionId) { _ in
+                    pinToBottom(true)
+                    settleScroll(proxy, delays: [0.05, 0.15, 0.35, 0.70])
+                }
+                .onAppear {
+                    // 首次进入会话也走一遍（onChange 只在变化时触发，
+                    // 从别的 tab 切回来时不会再变，得单独兜一次）。
+                    pinToBottom(true)
+                    settleScroll(proxy, delays: [0.05, 0.20, 0.50])
                 }
                 .scrollDismissesKeyboard(.interactively)
                 .onTapGesture { inputFocused = false }
@@ -822,6 +916,9 @@ struct ChatView: View {
                 // 重新探测地址 + 拉一遍模型清单。断网回来、路由器换网段、
                 // 或者「一直显示未连接」时，往下拉一把比来回切页面快得多。
                 .refreshable { await store.bootstrap() }
+                // 页面走了就把已排队的收尾滚动作废（令牌加一即失效），
+                // 免得它对着一个已经离屏的 ScrollViewProxy 执行。
+                .onDisappear { gate.token &+= 1 }
             }
         }
     }
@@ -829,11 +926,111 @@ struct ChatView: View {
     /// 正在流式输出的那条回复的全文。
     ///
     /// 单独抽出来是为了给 `onChange` 一个稳定的观察目标：
-    /// 直接写 `store.messages.last?.text` 在 LazyVStack 里每次 body 重算都会变引用，
+    /// 直接写 `store.messages.last?.text` 在每次 body 重算时都会变引用，
     /// 容易漏掉或重复触发。空串表示当前没有在流。
     private var streamingText: String {
         guard store.sending, let m = store.messages.last, m.role == "assistant" else { return "" }
         return m.text
+    }
+
+    /// 当前会话的产物个数。
+    ///
+    /// ⚠️ 2026-11-02 加（用户：「测试的没有产物了」）。
+    ///
+    /// 排查结论：产物**确实生成了**（判定逻辑用离线脚本逐条复刻验证过，
+    /// 截图那条回复应产出 4 个文件）。问题出在**顺序**上 ——
+    /// `runSend` 收尾是：
+    ///   ① `sending = false`  → 触发一次滚到底（这时的滚动是准的）
+    ///   ② `syncCurrentSession()`
+    ///   ③ `archiveReply(at:)` → 产物在这里才插进文件库
+    ///
+    /// 也就是说产物卡片是在"最后一次滚动之后"才出现的，内容又长高了一截，
+    /// 而没有任何东西再滚一次 —— 卡片正好落在视口下方看不见的地方。
+    /// 用户看到的就是"没有产物"。
+    ///
+    /// 所以必须**单独盯住产物数**：一变就跟着滚到底。
+    private var artifactCount: Int {
+        lib.files.reduce(0) { $0 + ($1.sessionId == store.currentSessionId ? 1 : 0) }
+    }
+
+    /// 滚到底部，**带前导 + 收尾节流**。
+    ///
+    /// 为什么不能直接用 `proxy.scrollTo(...)`：
+    /// 流式 delta 是 20Hz 的。每来一段就起一段滚动动画，后一发打断前一发，
+    /// 动画永远播不完；更要命的是每次 `scrollTo` 都拿"此刻"的内容高度去算目标
+    /// 偏移量，而这个高度每 0.05 秒就变一次 —— 于是滚到一个"当时以为对、
+    /// 下一帧就错"的位置。用户看到的就是：**画面被顶到内容之外，全屏空白，
+    /// 得手滑几次才回来**。
+    ///
+    /// 节流规则：
+    /// - 距上次滚动 ≥ 0.12 秒 → 立刻滚（前导），并重置窗口；
+    /// - 窗口内再来 → 只登记一个收尾任务，窗口结束时补滚一次。
+    ///   保证流式停下时不会永远差最后一小段。
+    ///
+    /// - Parameters:
+    ///   - animated: 是否带动画。流式跟随不带动画（20Hz 上动画必然互相打断），
+    ///               而"我发了消息"「点了回到底部」这类一次性动作要动画。
+    ///   - force: 忽略节流窗口，立刻滚。用于消息数变化 / 收发状态切换 / 点浮钮。
+    private func followBottom(_ proxy: ScrollViewProxy,
+                              animated: Bool,
+                              force: Bool = false) {
+        let now = Date()
+        let gap = now.timeIntervalSince(gate.lastAt)
+
+        // 用 gate 而不是 self 捕获：闭包要读到**执行那一刻**的状态。
+        let g = gate
+        func commit() {
+            g.lastAt = Date()
+            if animated {
+                withAnimation(.easeOut(duration: 0.18)) {
+                    proxy.scrollTo("bottomAnchor", anchor: .bottom)
+                }
+            } else {
+                proxy.scrollTo("bottomAnchor", anchor: .bottom)
+            }
+        }
+
+        g.token &+= 1
+        let mine = g.token
+
+        if force || gap >= 0.12 {
+            commit()
+            return
+        }
+
+        // 窗口内：排一个收尾，把窗口剩下那点时间等满再滚。
+        // 只做丢弃式节流的话，流式突然停下时屏幕上会永远差最后一小段没到底。
+        DispatchQueue.main.asyncAfter(deadline: .now() + (0.12 - gap)) {
+            guard mine == g.token else { return }   // 已有更新的一发接管
+            guard g.pinned else { return }          // 用户主动上翻看历史，别拽他回来
+            commit()
+        }
+    }
+
+    /// 布局"稳定之后"再补几次滚动。
+    ///
+    /// ⚠️ 2026-11-02 加（用户：「全屏时完全空白的，我还要去多滑动屏幕几次才能显示」）。
+    ///
+    /// 为什么一次滚动不够：
+    /// 我们的正文是 `SelectableText`（包着 `UITextView`），高度走的是
+    /// `sizeThatFits(proposal:)` —— **要等 UIView 建出来、文本灌进去才能量准**。
+    /// 而 `scrollTo` 是在 body 重算那一帧就执行的，那一帧 `UITextView` 还是空的，
+    /// 量出来的高度偏小，于是"滚到底"滚到的是一个**旧高度对应的位置**。
+    /// 下一帧文本填进去、高度暴涨，滚动位置却已经定了 ——
+    /// 画面就停在内容之外，一片空白。手动滑一下触发重新布局，位置才修正，
+    /// 这正是用户说的"要多滑几次才显示"。
+    ///
+    /// 对策：在几个时间点各补一次（内容已经量准了，补滚是幂等的，
+    /// 已经在底部时再滚一次不会有任何视觉变化）。
+    private func settleScroll(_ proxy: ScrollViewProxy, delays: [Double]) {
+        let g = gate
+        for d in delays {
+            DispatchQueue.main.asyncAfter(deadline: .now() + d) {
+                guard g.pinned else { return }
+                g.lastAt = Date()
+                proxy.scrollTo("bottomAnchor", anchor: .bottom)
+            }
+        }
     }
 
     private var emptyHint: some View {
