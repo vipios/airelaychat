@@ -1126,7 +1126,10 @@ struct ChatView: View {
                 // 如果不重新校准，用户打完字一抬头就对着半屏空白。
                 // 而且这正是"给 ai 下达指令的时候全屏空白"最容易复现的时刻。
                 .onChange(of: viewportH) { _ in
-                    guard gate.pinned else { return }
+                    // 用户明显是在跟随时才重校准。
+                    // 他在翻历史时键盘弹出来不该把他拽回底部 ——
+                    // 那正是"看历史被打断"的恼人体验。
+                    guard gate.pinned, !gate.userScrolledAway else { return }
                     // 键盘动画大约 0.25 秒，等它落定再滚，否则滚到一半又变高。
                     settleScroll(proxy, delays: [0.08, 0.25, 0.45])
                 }
