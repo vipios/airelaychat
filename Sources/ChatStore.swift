@@ -1918,12 +1918,20 @@ final class ChatStore: ObservableObject {
             // 补的是 `-2`、`-3` 这样的序号，不是扩展名：
             // 文件本身已经带 .sh / .py 了，标题再挂一遍「-py」是重复信息，
             // 用户一眼看不出这是第二个还是不同类型的同一个。
-            if usedTitles.contains(title) {
+            //
+            // ⚠️ 2026-11-02 修：判重键必须带上扩展名。
+            // 上一版只比 `title`，于是用户那条「生成 4 个测试产物」里
+            // message_test.json / .yaml / .sql 三个**同主干不同格式**的文件
+            // 被判成撞名，落盘成了 message_test / message_test-2 / message_test-3 ——
+            // 后缀纯属噪音，用户看到会以为多了几个重复文件。
+            // 文件库里本来就是「名字 + 扩展名」一起区分的，判重也该照这个来。
+            let titleKey = "\(title).\(ext)"
+            if usedTitles.contains(titleKey) {
                 var k = 2
-                while usedTitles.contains("\(title)-\(k)") { k += 1 }
+                while usedTitles.contains("\(title)-\(k).\(ext)") { k += 1 }
                 title = "\(title)-\(k)"
             }
-            usedTitles.insert(title)
+            usedTitles.insert("\(title).\(ext)")
 
             var doc = ""
             if !question.isEmpty, parts.blocks.count == 1 {

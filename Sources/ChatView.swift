@@ -93,6 +93,7 @@ struct ChatView: View {
     /// 两者必须永远一致，所以只准通过这个方法改。
     private func pinToBottom(_ pinned: Bool) {
         gate.pinned = pinned
+        if pinned { gate.pinnedAt = Date() }
         if atBottom != pinned { atBottom = pinned }
     }
 
@@ -112,8 +113,54 @@ struct ChatView: View {
         var lastAt = Date.distantPast
         /// 发号器。每次调用加一；到点发现号不是自己那一发，就静默退出。
         var token = 0
+
         /// 用户当前是否贴在底部（由 `onPreferenceChange` 维护）。
         var pinned = true
+
+        /// 用户是否**手动**把列表拖离了底部。
+        ///
+        /// ⚠️ 2026-11-02 关键修正，这是"全屏空白"的真正的病根。
+        ///
+        /// 上一版用「锚点 y 是否超出容差」来判断要不要继续跟随。
+        /// 可是在流式输出时，**内容变长本身就会把锚点推到视口下方很远** ——
+        /// 一段话写下来能涨几百 pt，一下就越过 120pt 容差。
+        /// 于是判成"用户已经翻上去了"→ 停止跟随 → 内容继续长但视口不动
+        /// → 屏幕空白，而且**再也不会自己恢复**，只能手动滑一下
+        /// （滑到底后锚点回到容差内，才重新开始跟随）。
+        /// 这就是用户说的"要多滑几次才显示"。
+        ///
+        /// 现在把两件事彻底分开：
+        ///   · 内容变长导致锚点下移 → **不算**离开底部，继续跟随；
+        ///   · 只有用户真的用手拖了列表 → 才算离开底部，停止跟随。
+        ///
+        /// 怎么区分这两者（不用手势，避免和 ScrollView 抢手势）：
+        /// 「锚点往下走了，但内容一点没变」——内容没变它自己不会动，
+        /// 那就只能是用户把列表往上推了。反过来，内容一变就说明是它在长。
+        /// 判据见 `onPreferenceChange`。
+        var userScrolledAway = false
+
+        /// 上一帧锚点的 y，用来判"锚点是不是自己往下走了"。
+        var lastAnchorY: CGFloat = -1
+
+        /// 上一帧的内容指纹（流式字数 + 消息数 + 产物数）。
+        /// 和现在这个不一致 → 内容变过 → 锚点下移是内容长高的结果，不是用户滑的。
+        var lastContentKey = -1
+
+        /// 手指最后一次按在列表上拖动的时刻。
+        ///
+        /// 这是「用户意图」的**直接证据**，比靠数值推断可靠得多。
+        /// 必须同时具备它和内容指纹：只有内容指纹时，用户一边上滑、
+        /// 内容一边流式增长，会被误判成"正常跟随"，人被拽回底部。
+        var lastDragAt = Date.distantPast
+
+        /// 最近一次「我们主动要求贴底」的时刻。
+        ///
+        /// 用来区分两种"锚点离底部很远"：
+        ///   · 刚刚（< 1.5 秒）我们才滚过 → 说明 `scrollTo` **没生效**，要补滚；
+        ///   · 早就滚过了 → 是用户自己翻上去看历史，别动。
+        var pinnedAt = Date.distantPast
+        /// 补滚的防抖：别在锚点每帧报数时都补一次。
+        var lastRescueAt = Date.distantPast
     }
 
     @StateObject private var gate = FollowGate()
@@ -830,12 +877,109 @@ struct ChatView: View {
                 // 这个名字挂了 ScrollView 上，里面 frame(in:) 拿到的 y 会随滚动变化，
                 // 所以「锚点 y ≤ 视口高 + 一点余量」就等于「已经在底部附近」。
                 .coordinateSpace(name: "chatViewport")
+                // 用户手指按在列表上拖动 —— 这是"用户意图"的唯一可靠信号。
+                //
+                // 为什么必须用真手势，光看锚点 y 不够：
+                // 流式输出时，用户一边上滑看历史、内容一边在长，
+                // 两者同时发生，「锚点下移 + 内容变过」既可能是内容长高、
+                // 也可能是用户在拖 —— 光靠数值分不开。
+                // 只有手指本身知道答案。
+                //
+                // 用 `simultaneousGesture` 而不是 `gesture`：
+                // 前者与 ScrollView 自己的滚动手势**并行**识别，不会把它顶掉；
+                // 后者会抢走滚动，列表直接拖不动。
+                .simultaneousGesture(
+                    DragGesture(minimumDistance: 1)
+                        .onChanged { _ in
+                            gate.lastDragAt = Date()
+                        }
+                        .onEnded { _ in
+                            gate.lastDragAt = Date()
+                        }
+                )
                 .onPreferenceChange(BottomAnchorY.self) { y in
                     guard y.isFinite else { return }
                     // 容差 120：列表底部还有留白和圆角，给少了会误判成
                     // "用户已经滚上去了"，于是停止跟随 —— 那又变回空白。
                     let near = y <= viewportH + 120
-                    pinToBottom(near)
+
+                    // ⚠️ 2026-11-02 **核心修正**：区分「用户滑走的」和「内容变长的」。
+                    //
+                    // 只看 `near` 会把这两件事混为一谈，而它们在流式场景下
+                    // 表现完全不同：内容变长必须继续跟随，用户上滑必须停止跟随。
+                    //
+                    // 判据分两路，任一路成立就算"用户滑的"：
+                    //   ① 手指刚在拖（0.6 秒内）—— 直接证据；
+                    //   ② 锚点往下走了、但内容一个字都没变 —— 间接证据
+                    //      （内容没变，锚点不可能自己动，只能是列表被推了）。
+                    // 反过来内容变过、手指也没在拖 → 那就是内容长高的结果，
+                    // 属于正常跟随范围，**保持 pinned 不变**。
+                    let contentKey = streamingText.count &* 31 &+ store.messages.count &* 7 &+ artifactCount
+                    let contentChanged = contentKey != gate.lastContentKey
+                    let movedDown = gate.lastAnchorY >= 0 && y > gate.lastAnchorY + 1
+                    let movedUp = gate.lastAnchorY >= 0 && y < gate.lastAnchorY - 1
+                    gate.lastAnchorY = y
+                    gate.lastContentKey = contentKey
+
+                    let fingerOnScreen = Date().timeIntervalSince(gate.lastDragAt) < 0.6
+                    let pulledByFinger = fingerOnScreen || (movedDown && !contentChanged)
+
+                    if fingerOnScreen {
+                        // ⚠️ 手指优先，压过一切。
+                        //
+                        // 为什么连 `near` 也要让路：用户往上翻的时候，
+                        // 锚点会被推到视口下方很远（内容整体下移），
+                        // 和"内容长高"的表现一模一样 —— 光看 y 分不开。
+                        // 所以只要手指在屏幕上，就只认手指：
+                        // 他拖到哪算哪，我们的跟随逻辑完全不插手。
+                        //
+                        // 但**拖到底部就恢复跟随**：用户费力滑回底部，
+                        // 意思就是"我要跟着看"，这时 must 重新贴住。
+                        gate.userScrolledAway = !near
+                        pinToBottom(near)
+                    } else if near {
+                        // 没在拖、锚点又在视口内 = 真的到底了 → 恢复跟随。
+                        gate.userScrolledAway = false
+                        pinToBottom(true)
+                    } else if gate.userScrolledAway {
+                        // 用户此前主动翻走了，现在手指已松、也还没回到底部
+                        // → 尊重他的意图，继续保持不跟随。
+                        //
+                        // ⚠️ 这个分支必须在 `pulledByFinger` 之前判。
+                        // 否则漏掉了"松手后内容继续长高"这一拍：
+                        // 那一拍 `contentChanged` 为真、`movedDown` 也为真，
+                        // `pulledByFinger` 算出 false，于是掉进最后一个 else，
+                        // 沿用 pinned 的值 —— 而 pinned 此刻已经被 `near`
+                        // 或前几帧改过，结果就是用户滑回底部后又被判成不跟随。
+                        pinToBottom(false)
+                    } else if pulledByFinger {
+                        gate.userScrolledAway = true
+                        pinToBottom(false)
+                    } else if !contentChanged, !movedUp {
+                        // 内容没变、锚点也没动 → 维持现状。
+                        pinToBottom(gate.pinned)
+                    }
+                    // 其余情况（内容変过、手指也没拖、之前也没翻走）：
+                    // 锚点下移是内容长高的正常结果，
+                    // **保持 pinned 不变**，继续跟随。这就是修复本身。
+
+                    // ⚠️ 2026-11-02 加：**scrollTo 静默失败的兜底**。
+                    //
+                    // 这是用户说的"全屏空白、要多滑几次才显示"的最后一层保险。
+                    // `scrollTo` 不是保证成功的：目标还在延迟布局里、或者
+                    // 内容高度在调用那一刻还没算出来，它就什么都不做**且不报错**。
+                    // 于是程序以为"已经到底了"，实际视口停在内容之外。
+                    //
+                    // 判据：我们刚（1.5 秒内）主动要求过贴底、锚点却仍远在
+                    // 视口下方（差 200pt 以上）—— 说明那次滚动没生效，补一次。
+                    // 用户自己上翻时 `pinnedAt` 早就过期了，不会误抓他回来。
+                    guard !near, gate.pinned else { return }
+                    guard Date().timeIntervalSince(gate.pinnedAt) < 1.5 else { return }
+                    guard Date().timeIntervalSince(gate.lastRescueAt) > 0.3 else { return }
+                    guard y > viewportH + 200 else { return }
+                    gate.lastRescueAt = Date()
+                    gate.lastAt = Date()
+                    proxy.scrollTo("bottomAnchor", anchor: .bottom)
                 }
 
                 // ⚠️ 2026-11-02 修（用户：「我给他发完消息全屏看不到字，
