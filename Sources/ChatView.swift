@@ -146,12 +146,29 @@ struct ChatView: View {
         /// 和现在这个不一致 → 内容变过 → 锚点下移是内容长高的结果，不是用户滑的。
         var lastContentKey = -1
 
+        /// 上一帧内容**顶端**的 y。
+        ///
+        /// 这是区分"用户滚的"和"内容长的"最硬的证据：
+        /// 顶端变了 = 整块内容相对视口移动了 = 用户（或惯性）在滚；
+        /// 顶端没变 = 视口没动，只是内容在自己变长。
+        var lastTopY: CGFloat = .nan
+
         /// 手指最后一次按在列表上拖动的时刻。
         ///
         /// 这是「用户意图」的**直接证据**，比靠数值推断可靠得多。
         /// 必须同时具备它和内容指纹：只有内容指纹时，用户一边上滑、
         /// 内容一边流式增长，会被误判成"正常跟随"，人被拽回底部。
         var lastDragAt = Date.distantPast
+
+        /// 顶端最后一次移动的时刻。
+        ///
+        /// 顶端动了只有一个原因：整块内容相对视口位移了 ——
+        /// 用户手指在拖，或者松手后的惯性滚动还在跑。
+        /// 内容自己长高**不会**让顶端动，所以这个信号非常干净。
+        var topMovedAt = Date.distantPast
+
+        /// `settleScroll` 的发号器。见那个函数里的去重说明。
+        var settleToken = 0
 
         /// 最近一次「我们主动要求贴底」的时刻。
         ///
@@ -873,10 +890,41 @@ struct ChatView: View {
                     .padding(.horizontal, 20)
                     .padding(.top, 16)
                     .padding(.bottom, 10)
+                    // ⚠️ 2026-11-02 加：**顶部观测点**，用来区分
+                    // 「内容长高」和「用户上翻」。
+                    //
+                    // 原理（这是确定性的，不靠猜）：
+                    //   · 内容长高 → 内容顶端**不动**（新内容追加在下面），
+                    //     所以这个背景的 minY 不变；底部锚点往下跑。
+                    //   · 用户滚动 → 整块内容一起移动，minY 跟着变。
+                    //
+                    // 于是判据变成：**顶端动了 = 用户在滚；没动 = 内容在长**。
+                    //
+                    // 为什么必须补这一手：手指手势只在屏幕上有指头时有效，
+                    // 而 iOS 的**惯性滚动（手指已离开但列表还在滑）**拿不到手势，
+                    // 那段空白期只能靠它。挂在 background 上而不是塞一个
+                    // `Color.clear.frame(height:1)` 进 VStack：不影响布局高度，
+                    // 多出来的 21pt 间距会让每帧的滚动位置都差一点点。
+                    .background(
+                        GeometryReader { g in
+                            Color.clear.preference(
+                                key: TopAnchorY.self,
+                                value: g.frame(in: .named("chatViewport")).minY
+                            )
+                        }
+                    )
                 }
                 // 这个名字挂了 ScrollView 上，里面 frame(in:) 拿到的 y 会随滚动变化，
                 // 所以「锚点 y ≤ 视口高 + 一点余量」就等于「已经在底部附近」。
                 .coordinateSpace(name: "chatViewport")
+                // 顶端移动 = 用户（或惯性）在滚。见 TopAnchorY 的说明。
+                .onPreferenceChange(TopAnchorY.self) { ty in
+                    guard ty.isFinite else { return }
+                    if gate.lastTopY.isFinite, abs(ty - gate.lastTopY) > 0.5 {
+                        gate.topMovedAt = Date()
+                    }
+                    gate.lastTopY = ty
+                }
                 // 用户手指按在列表上拖动 —— 这是"用户意图"的唯一可靠信号。
                 //
                 // 为什么必须用真手势，光看锚点 y 不够：
@@ -908,11 +956,14 @@ struct ChatView: View {
                     // 只看 `near` 会把这两件事混为一谈，而它们在流式场景下
                     // 表现完全不同：内容变长必须继续跟随，用户上滑必须停止跟随。
                     //
-                    // 判据分两路，任一路成立就算"用户滑的"：
+                    // 判据三路，任一路成立就算"用户在滚"：
                     //   ① 手指刚在拖（0.6 秒内）—— 直接证据；
-                    //   ② 锚点往下走了、但内容一个字都没变 —— 间接证据
-                    //      （内容没变，锚点不可能自己动，只能是列表被推了）。
-                    // 反过来内容变过、手指也没在拖 → 那就是内容长高的结果，
+                    //   ② **内容顶端刚动过**（0.3 秒内）—— 惯性滚动也能抓到。
+                    //      顶端动了只可能是整块内容相对视口位移（用户/惯性在滚），
+                    //      内容自己长高不会动顶端，所以这个信号非常干净；
+                    //   ③ 锚点往下走了、但内容一个字都没变 —— 兜底
+                    //      （内容没变，锚点不可能自己动）。
+                    // 反过来内容变过、手指没拖、顶端也没动 → 那就是内容长高的结果，
                     // 属于正常跟随范围，**保持 pinned 不变**。
                     let contentKey = streamingText.count &* 31 &+ store.messages.count &* 7 &+ artifactCount
                     let contentChanged = contentKey != gate.lastContentKey
@@ -922,7 +973,11 @@ struct ChatView: View {
                     gate.lastContentKey = contentKey
 
                     let fingerOnScreen = Date().timeIntervalSince(gate.lastDragAt) < 0.6
-                    let pulledByFinger = fingerOnScreen || (movedDown && !contentChanged)
+                    // 顶端刚动 = 真的在滚（含惯性）。窗口给短一点：
+                    // 内容长高不会动顶端，所以不用长窗口；窗口太长会把
+                    // "刚滚完停手、内容接着长"的正常跟随也误判成用户滚动。
+                    let scrolling = Date().timeIntervalSince(gate.topMovedAt) < 0.3
+                    let pulledByFinger = fingerOnScreen || scrolling
 
                     if fingerOnScreen {
                         // ⚠️ 手指优先，压过一切。
@@ -1168,8 +1223,16 @@ struct ChatView: View {
     /// 已经在底部时再滚一次不会有任何视觉变化）。
     private func settleScroll(_ proxy: ScrollViewProxy, delays: [Double]) {
         let g = gate
+        // ⚠️ 去重：同一次"布局稳定"过程里，几个 onChange 可能同时调这个函数
+        // （比如 `sending` 转 false 和 `artifactCount` 变化前后脚发生）。
+        // 不去重就会排出十几发 scrollTo，它们互相打断 ——
+        // 又回到那个"滚动自己跟自己打架、位置算错"的老问题。
+        // 令牌一加，之前排的全作废，只留最新这批。
+        g.settleToken &+= 1
+        let mine = g.settleToken
         for d in delays {
             DispatchQueue.main.asyncAfter(deadline: .now() + d) {
+                guard mine == g.settleToken else { return }   // 被更新的一批取代
                 guard g.pinned else { return }
                 g.lastAt = Date()
                 proxy.scrollTo("bottomAnchor", anchor: .bottom)
@@ -2269,6 +2332,17 @@ private struct AdminTabPage: View {
 /// 用一个专门的 PreferenceKey 而不是 `@State` + `onAppear`：
 /// 滚动过程中这个值一直在变，只有 preference 能跟着滚动实时刷新。
 private struct BottomAnchorY: PreferenceKey {
+    static var defaultValue: CGFloat = 0
+    static func reduce(value: inout CGFloat, nextValue: () -> CGFloat) {
+        value = nextValue()
+    }
+}
+
+/// 内容**顶端**相对视口的 y。
+///
+/// 和 `BottomAnchorY` 配对使用：它是判断"内容长高"还是"用户滚动"的
+/// 确定性依据 —— 内容长高时顶端不动，滚动时两个锚点一起动。
+private struct TopAnchorY: PreferenceKey {
     static var defaultValue: CGFloat = 0
     static func reduce(value: inout CGFloat, nextValue: () -> CGFloat) {
         value = nextValue()
