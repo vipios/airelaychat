@@ -48,6 +48,15 @@ struct SettingsView: View {
     @State private var renameTarget: Provider?
     @State private var nameDraft = ""
 
+    /// 检查更新（2026-11-04 加）。
+    ///
+    /// 用户要求：「点击更新他就自动下载了，下载完成，自己就更新成功了」。
+    /// 实现见 UpdateChecker.swift 顶部的注释 —— 走的是 TrollStore 的
+    /// apple-magnifier://install 远程安装通道，不经过「文件」App。
+    @StateObject private var updater = UpdateChecker()
+    /// 走分享兜底时，待分享的那个本地 ipa
+    @State private var showShare = false
+
     var body: some View {
         NavigationStack {
             VStack(spacing: 0) {
@@ -734,16 +743,135 @@ struct SettingsView: View {
             HStack {
                 Text("版本")
                 Spacer()
-                Text(Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "1.0")
+                Text(updater.currentVersion)
                     .foregroundStyle(.secondary)
+            }
+
+            // 检查更新 / 立即更新。
+            // 用户要的是「点一下，下载完自己就装好」，所以这里点下去直接走
+            // TrollStore 的远程安装通道，不经过「文件」App、也不用分享菜单。
+            Button {
+                Task { await runUpdate() }
+            } label: {
+                HStack {
+                    // 忙碌时把图标换成转圈，避免"点了没反应"的错觉 ——
+                    // 用户之前就抱怨过填完密钥界面毫无变化。
+                    if case .checking = updater.phase {
+                        ProgressView().scaleEffect(0.8)
+                    } else if case .downloading = updater.phase {
+                        ProgressView().scaleEffect(0.8)
+                    } else {
+                        Image(systemName: "arrow.triangle.2.circlepath")
+                    }
+                    Text(updateButtonText)
+                    Spacer()
+                    if case .available(let info) = updater.phase {
+                        // 有新版本时右侧直接亮出目标版本号，不用点进去看
+                        Text("v\(info.version)")
+                            .font(.system(size: 13, weight: .semibold))
+                            .foregroundStyle(Theme.selection)
+                    }
+                }
+            }
+            .disabled(isUpdating)
+
+            if let note = updateNote {
+                Text(note)
+                    .font(.system(size: 12))
+                    .foregroundStyle(updateNoteIsError ? Color.red : Color.secondary)
+            }
+
+            // 已经下载好、只差交给别的 App 时，给一行明确的分享入口。
+            // （直装成功的话不会走到这里 —— 巨魔自己就把活干完了）
+            if case .readyToShare = updater.phase {
+                Button {
+                    showShare = true
+                } label: {
+                    HStack {
+                        Image(systemName: "square.and.arrow.up")
+                        Text("交给其他 App 安装")
+                        Spacer()
+                    }
+                }
             }
         } header: {
             Text("关于")
+        } footer: {
+            Text("「检查更新」会看 GitHub 上最新的安装包。装了 TrollStore 的话，点「立即更新」会直接交给它装好，不用先存到「文件」App 再分享；没装巨魔时才会退回下载 + 分享。")
         }
-        // 原来的 footer「AIRelayChat · 家里的 AI 中转站客户端」已按用户要求删掉
+        .sheet(isPresented: $showShare) {
+            if case .readyToShare(let u) = updater.phase {
+                ShareSheet(items: [u])
+            }
+        }
     }
 
     // MARK: 动作
+
+    /// 更新按钮上显示的文字
+    private var updateButtonText: String {
+        switch updater.phase {
+        case .idle:           return "检查更新"
+        case .checking:       return "正在检查…"
+        case .available:      return "立即更新"
+        case .upToDate:       return "已是最新版本"
+        case .downloading:    return "正在下载安装包…"
+        case .readyToShare:   return "已下载，选择安装方式"
+        case .failed:         return "重新检查"
+        }
+    }
+
+    /// 更新区下方的提示文字
+    private var updateNote: String? {
+        switch updater.phase {
+        case .idle, .checking, .upToDate, .downloading:
+            return nil
+        case .available(let info):
+            // 顺手告诉用户"这次会不会一步装好"。
+            // 用户最怕的就是点下去又绕回「文件」App，提前说清楚能省一轮试错。
+            if UpdateChecker.hasTrollStore() {
+                return "发现新版 v\(info.version)（\(info.sizeText)）。点「立即更新」会直接交给 TrollStore 装好，不用存到「文件」App。"
+            }
+            return "发现新版 v\(info.version)（\(info.sizeText)）。这台手机没检测到 TrollStore，点「立即更新」会先下载，再让你选交给哪个 App 装。"
+        case .readyToShare:
+            return "安装包已下载好。这台手机没检测到 TrollStore，所以需要用分享菜单交给安装工具。"
+        case .failed(let m):
+            return m
+        }
+    }
+
+    private var updateNoteIsError: Bool {
+        if case .failed = updater.phase { return true }
+        return false
+    }
+
+    private var isUpdating: Bool {
+        switch updater.phase {
+        case .checking, .downloading: return true
+        default: return false
+        }
+    }
+
+    /// 点更新按钮的完整流程：
+    ///   没查过 → 查；查到有新版 → 装；装完/失败 → 再查一次
+    private func runUpdate() async {
+        switch updater.phase {
+        case .available(let info):
+            // 有新版：走安装。
+            // 装了 TrollStore 的话，这一步 open 一条 URL 就结束了 ——
+            // 巨魔会自己下载、自己弹安装框、自己装完。
+            await updater.install(info)
+            // 直装成功时 phase 保持 .available（巨魔在前台，我们什么都不用做）
+            // 只有降级到下载时 phase 才会变成 .readyToShare
+            if case .readyToShare = updater.phase {
+                showShare = true
+            }
+        case .readyToShare:
+            showShare = true
+        default:
+            await updater.check()
+        }
+    }
 
     private func refreshModels() async {
         loadingModels = true
