@@ -274,6 +274,23 @@ final class Settings: ObservableObject {
     /// 内网基地址（用户没填时给个兜底显示值）
     var lanBase: String { "http://\(lanHost.isEmpty ? "192.168.1.88" : lanHost):\(port)" }
 
+    /// 这个地址是不是「要过 VPN 隧道」的那类（ZeroTier / Tailscale / CGNAT）。
+    ///
+    /// 2026-11-04 加。起因是用户直接指出来的问题：
+    /// 「WiFi 状态下不是家路由器的 ip」—— 截图里 WiFi 通着，
+    /// 面板顶部显示的却是 `10.47.67.100`（ZeroTier 的地址），不是家里的 192.168.x.x。
+    ///
+    /// 为什么这很要命：ZeroTier 那条路在**连着家里 WiFi 时反而更慢更不稳**
+    /// （要绕到公网再打回来），而且一旦它被 `learnLan` 学成 `lanHost`，
+    /// 就会一直霸占候选第一位，把真正该走的直连挤到后面。
+    static func isTunnelAddress(_ host: String) -> Bool {
+        let p = host.split(separator: ".").compactMap { Int($0) }
+        guard p.count == 4 else { return false }
+        if p[0] == 10 { return true }                       // ZeroTier 常用 10.x
+        if p[0] == 100, p[1] >= 64, p[1] <= 127 { return true }  // CGNAT / Tailscale
+        return false
+    }
+
     /// 在家判定要试的内网地址，按优先级排列。
     ///
     /// 顺序很重要（2026-10-29 修正）：
@@ -283,6 +300,18 @@ final class Settings: ObservableObject {
     /// 曾经把 192.168.2.1 排在第一位，结果它是路由器 LAN 侧地址，
     /// 手机连光猫 WiFi 拿到的是 192.168.1.x，根本到不了 192.168.2.x，
     /// 每次冷启动都要在这个死地址上空等两秒 —— 这就是"未连接"的直接原因。
+    ///
+    /// ⚠️ 2026-11-04 再修一层（用户：「WiFi 状态下不是家路由器的 ip」）：
+    ///
+    /// 上一轮修完后 `lanHost` 仍可能是 ZeroTier 的 `10.47.67.100` ——
+    /// 因为 `learnLan()` 只要这条通了就会把它写成 `lanHost`，而它一旦当上
+    /// `lanHost` 就永远排第一（第 1 步"用户手填的最可信"）。
+    ///
+    /// 结果：**连着家里 WiFi 时反而优先走 VPN 隧道**，绕远路、还容易抖。
+    /// 界面顶部显示的那个地址也就成了 10.47.67.100，用户一看就知道不对。
+    ///
+    /// 现在：把 VPN 段单独拎出来，只在「没连 WiFi」时才排到前面；
+    /// 连着 WiFi 时它们退到最后，让直连地址先上。
     var lanCandidates: [String] {
         var list: [String] = []
         func add(_ h: String) {
@@ -291,18 +320,26 @@ final class Settings: ObservableObject {
             list.append(t)
         }
 
+        // 连着 WiFi 时，直连地址排前面、VPN 地址垫后；没连 WiFi 就反过来。
+        let onWiFi = NetInfo.hasUsableWiFi()
+
         // 1) 用户手动填的，最可信（他填了就是他知道）
-        add(lanHost)
+        //    但如果填的是 VPN 地址、而此刻正连着 WiFi —— 先放一放，
+        //    等直连候选都试过了再落到它身上。
+        if !(onWiFi && Self.isTunnelAddress(lanHost)) {
+            add(lanHost)
+        }
 
         // 2) 学到过的地址池：这些**真的连通过**，比任何猜测都可靠。
         //    路由器换网段时，旧地址会在这里被跳过，新学到的地址排最前面。
-        for h in lanPool { add(h) }
+        //    同样按「直连优先」分流。
+        for h in lanPool where !(onWiFi && Self.isTunnelAddress(h)) { add(h) }
 
         // 3) 手机当前 WiFi 网段推导（最能反映"现在这个 WiFi 是哪一段"）
         //
         //    2026-10-31 扩充：原来只试 88/250/1 三个尾巴，只覆盖了很小一部分路由器。
         //    现在补上家用设备常见的其它尾巴（2/254/100/10/8/18/3），
-        //    并且这些都只是并发候选，多一个不增加总耗时（最坏也就等一个 0.9 秒）。
+        //    并且这些都只是并发候选，多一个不增加总耗时（最坏也就等一个超时）。
         if let myIP = NetInfo.wifiIPv4() {
             let parts = myIP.split(separator: ".")
             if parts.count == 4 {
@@ -321,6 +358,14 @@ final class Settings: ObservableObject {
         for h in ["192.168.1.88", "10.47.67.100", "192.168.1.250", "192.168.2.1"] {
             add(h)
         }
+
+        // 5) 兜底：连着 WiFi 时，把刚才被压下去的 VPN 地址补回队尾。
+        //    不能直接丢掉 —— 万一这个 WiFi 就是通过 VPN 才能到路由器（公司网、
+        //    出差酒店）呢？留着当最后一根稻草，代价只是并发多探一个地址。
+        if onWiFi {
+            if Self.isTunnelAddress(lanHost) { add(lanHost) }
+            for h in lanPool where Self.isTunnelAddress(h) { add(h) }
+        }
         return list
     }
 
@@ -331,6 +376,15 @@ final class Settings: ObservableObject {
     ///
     /// 只学 IPv4 字面量：`lanHost` 这个字段是被当作 `http://<host>:<port>`
     /// 拼接的，塞进去一个域名或 IPv6 会把地址拼坏。
+    ///
+    /// ⚠️ 2026-11-04 修（用户：「WiFi 状态下不是家路由器的 ip」）：
+    ///
+    /// 原实现只要探通就把它写成 `lanHost`。而 ZeroTier 的 `10.47.67.100`
+    /// 在家里 WiFi 下也能通（只是绕远），于是它经常被学成 `lanHost` 并霸占第一位，
+    /// 界面顶部显示的地址就成了 VPN 地址而不是 192.168.x.x。
+    ///
+    /// 现在：VPN 类地址照进池子（在外面要靠它），但**不抢 `lanHost`** ——
+    /// `lanHost` 是「家里的路由器地址」这个语义，让直连地址占着才对。
     func learnLan(_ host: String) {
         let h = host.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !h.isEmpty, !h.contains(":"), h.contains(".") else { return }
@@ -338,10 +392,22 @@ final class Settings: ObservableObject {
         guard !h.hasPrefix("127."), !h.hasPrefix("169.254.") else { return }
 
         var next = lanPool.filter { $0 != h }
-        next.insert(h, at: 0)
+        // 直连地址插最前，VPN 地址插在后面 —— 池子本身也体现"直连优先"。
+        if Self.isTunnelAddress(h) {
+            next.append(h)
+        } else {
+            next.insert(h, at: 0)
+        }
         if next.count > 8 { next = Array(next.prefix(8)) }
         if next != lanPool { lanPool = next }
-        if lanHost != h { lanHost = h }
+
+        // VPN 地址不当 lanHost；只有当 lanHost 还是空的（从没学到过直连地址）时
+        // 才让它顶上，保证至少有个能用来显示的地址。
+        if Self.isTunnelAddress(h) {
+            if lanHost.trimmingCharacters(in: .whitespaces).isEmpty { lanHost = h }
+        } else if lanHost != h {
+            lanHost = h
+        }
     }
 
     // MARK: 来源

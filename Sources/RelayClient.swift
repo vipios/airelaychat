@@ -130,19 +130,34 @@ private enum ProbeHit {
 /// 为什么要并发：串行时每个不通的地址都要等满自己的超时（内网 2 秒、公网 4 秒），
 /// 在外冷启动最坏要等 2+2+2+4+4 ≈ 14 秒才有结果，用户会以为卡死。
 /// 并发后总耗时约等于一个超时周期。
+///
+/// `perIndexTimeout` 可选：给每个地址单独定超时。
+/// 2026-11-04 加，因为同一批候选里混着两类完全不同的地址 ——
+/// 同网段 IPv4 几十毫秒就回，ZeroTier/CGNAT 要过隧道、往返 180ms 起且抖动明显，
+/// 用同一个超时值必然误伤其中一类。传 nil 就退回原来的「全部用 timeout」。
 private func firstAlive(_ bases: [String], timeout: TimeInterval,
-                        session: URLSession) async -> (index: Int, base: String, health: HealthInfo)? {
+                        session: URLSession,
+                        perIndexTimeout: ((Int) -> TimeInterval)? = nil) async -> (index: Int, base: String, health: HealthInfo)? {
     guard !bases.isEmpty else { return nil }
+    // 先把每个地址的超时算成数组，再进 TaskGroup。
+    // 为什么不在 addTask 里现算：闭包 `perIndexTimeout` 不是 Sendable，
+    // 在并发闭包里捕获它会触发 Swift 6 的并发检查警告；
+    // 提前摊平成 [TimeInterval]（纯值类型）就完全没这个问题。
+    let timeouts: [TimeInterval] = bases.indices.map { i in
+        guard let f = perIndexTimeout else { return timeout }
+        return f(i)
+    }
     if bases.count == 1 {
-        if let h = await probeHealth(bases[0], timeout: timeout, session: session) {
+        if let h = await probeHealth(bases[0], timeout: timeouts[0], session: session) {
             return (0, bases[0], h)
         }
         return nil
     }
     return await withTaskGroup(of: (Int, String, HealthInfo)?.self) { group in
         for (i, b) in bases.enumerated() {
+            let t = timeouts[i]
             group.addTask {
-                if let h = await probeHealth(b, timeout: timeout, session: session) {
+                if let h = await probeHealth(b, timeout: t, session: session) {
                     return (i, b, h)
                 }
                 return nil
@@ -175,10 +190,26 @@ final class RelayClient {
     /// 专门给内网探测用的会话：超时短、不走缓存。
     /// 单独一个的好处是 request 级 timeoutInterval 不会被连接复用后的行为影响，
     /// 探测结果更接近真实耗时。
+    ///
+    /// ⚠️ 2026-11-04 修（这是「WiFi 下转圈、手动刷新也失败」的真正元凶之一）：
+    ///
+    /// 原来这里写死 `timeoutIntervalForResource = 1.5`。这是个**会话级硬上限**：
+    /// 单个请求里写的 `req.timeoutInterval` 只能在它之下生效，永远不会更长。
+    /// 于是后面不管是 probeLAN 的 0.9 秒、还是我给 ZeroTier 放宽的 4 秒，
+    /// 统统被这 1.5 秒掐死 —— 放宽超时的代码写了等于没写。
+    ///
+    /// 实测数据（手机 → 路由器，2026-11-04）：
+    ///   · 同网段 IPv4：20~50 ms
+    ///   · 走 ZeroTier：往返 182 ms，路由器自己 ping 抖动到 141 ms
+    ///   · 走 5G 再叠一层：经常 800ms~1.5s
+    /// 1.5 秒的上限正好卡在「正常但稍慢」的边界上，一抖就失败。
+    ///
+    /// 现在放到 6 秒（只是天花板，真正等多久由每个请求自己的 timeout 决定），
+    /// 既不会让快地址变慢，也不会把慢地址误判成不通。
     private let lanSession: URLSession = {
         let c = URLSessionConfiguration.ephemeral
-        c.timeoutIntervalForRequest = 1.0
-        c.timeoutIntervalForResource = 1.5
+        c.timeoutIntervalForRequest = 6.0
+        c.timeoutIntervalForResource = 8.0
         c.waitsForConnectivity = false
         c.requestCachePolicy = .reloadIgnoringLocalCacheData
         c.httpShouldUsePipelining = true
@@ -194,13 +225,30 @@ final class RelayClient {
     /// 内网通了 = 在家。比读 WiFi 名字可靠得多，也不需要定位权限。
     /// 按多个候选地址并发试：不同 WiFi 下手机拿到的网段不同，只试一个会误判成"在外"。
     ///
-    /// 超时压到 0.9 秒：同一网段的路由器 20~50 毫秒就回，0.9 秒还不回来
-    /// 基本可以断定不在这个网段，继续等只是浪费用户时间。
+    /// ⚠️ 2026-11-04 修（用户实测：「WiFi 下显示连接成功、输入密码又说无效」
+    ///    「关掉 WiFi 手动点刷新还是失败」）。
+    ///
+    /// 原来所有候选统一给 0.9 秒。这个值只对**同网段 IPv4**（实测 20~50ms）够用，
+    /// 对**走 ZeroTier 的地址**远远不够。设备实测数据：
+    ///   · 路由器 ping 手机：82 / 111 / 141 ms（抖动近一倍）
+    ///   · 手机经 ZeroTier 打完整 HTTP 往返：**182 ms**
+    ///   · 走 5G 时再叠一层移动网络 RTT，经常 800ms ~ 1.5s
+    /// 一抖就破 900ms，于是明明连通却被判「未连上」，界面回退去走公网/报错。
+    ///
+    /// 现在按地址类型分级：
+    ///   · 同网段 IPv4（192.168./10.x/172.16-31.）→ 0.9 秒，该秒回的就得秒回
+    ///   · ZeroTier 的 CGNAT 段 → 4 秒，这条路本来就要过隧道
+    /// 并发探测下，只有「确实不通」时才多等那几秒；通了一秒内照样立刻返回。
     func probeLAN() async -> (base: String, health: HealthInfo)? {
         let hosts = await MainActor.run { settings.lanCandidates }
         let port = await MainActor.run { settings.port }
         let bases = hosts.map { "http://\($0):\(port)" }
-        guard let hit = await firstAlive(bases, timeout: 0.9, session: lanSession) else { return nil }
+        let timeouts = hosts.map { Self.lanProbeTimeout(for: $0) }
+        let cap = timeouts.max() ?? 0.9
+        guard let hit = await firstAlive(bases, timeout: cap, session: lanSession,
+                                        perIndexTimeout: { i in
+            i < timeouts.count ? timeouts[i] : cap
+        }) else { return nil }
         let host = hosts[hit.index]
 
         // 记住这次能通的地址，并且在池子里把它提到最前面 —— 下次优先试它。
@@ -213,6 +261,30 @@ final class RelayClient {
             if settings.lastLanBase != hit.base { settings.lastLanBase = hit.base }
         }
         return (hit.base, hit.health)
+    }
+
+    /// 按地址类型给探测超时。
+    ///
+    /// 判据只看「这条路要不要过隧道/VPN」，不看是不是私有地址 ——
+    /// ZeroTier 的 10.47.67.x 本身也是私有段，但它和 192.168.1.x 完全不是一回事：
+    /// 前者要绕到公网再打回来，后者在二层就能到。
+    ///
+    /// 实测（2026-11-04，手机 → 家里路由器）：
+    ///   192.168.1.250 / 192.168.2.1  → 20~50 ms
+    ///   10.47.67.100（ZeroTier）     → 182 ms，抖动可到 140ms 以上
+    /// 所以给 VPN 类地址 4 秒，给同网段 0.9 秒。
+    static func lanProbeTimeout(for host: String) -> TimeInterval {
+        // ZeroTier 默认网段是 10.147.17.0/24，但用户这台被设成了 10.47.67.x。
+        // 与其写死一整个段（换网络就失效），不如认「10. 开头但不在常见家用段里的」——
+        // 家用 10.x 极少见，何况就算是，多等 3 秒也只发生在探测失败时。
+        let parts = host.split(separator: ".").compactMap { Int($0) }
+        if parts.count == 4 {
+            // ZeroTier / Tailscale 这类 CGNAT：10.x、100.64-127.x
+            if parts[0] == 10 { return 4.0 }
+            if parts[0] == 100, parts[1] >= 64, parts[1] <= 127 { return 4.0 }
+        }
+        // 同网段 IPv4、以及其它一切：保持原来的快节奏
+        return 0.9
     }
 
     // MARK: - 预热
@@ -345,13 +417,22 @@ final class RelayClient {
     /// `http://[IPv6]:8080`，这条走 `https://域名`（443 + 证书），
     /// 拼装规则完全不同。
     ///
-    /// 超时给 8 秒：隧道是设备主动外连、经 Cloudflare 边缘中转，
-    /// 首次握手实测 1~3 秒，8 秒足够；比内网的 0.9 秒宽，但比不带域名的
-    /// IPv6 直连（4 秒×N 个地址串行）总耗时短得多。
+    /// 超时给 12 秒。
+    ///
+    /// 2026-11-04 从 8 秒放宽（用户实测「在外面要等很久才连上，有时直接失败」）。
+    /// 本机实测这个域名的 /health 冷启动耗时：
+    ///   第 1 次 5.69s / 第 2 次 2.78s / 第 3 次 1.62s
+    /// 5.69 秒已经逼近原来的 8 秒，再加上手机 5G 的 RTT、Cloudflare 边缘调度，
+    /// 很容易一脚踩过线 → 判「连不上」→ 退回全套探测 → 用户看到的就是一直转圈。
+    ///
+    /// 加长不怕慢：`publicCandidate()` 里它是和裸 IPv6 并发跑的，
+    /// 而且 `cachedCandidate()` 会先拿上次成功的地址快速验一次。
+    /// 真正会走这条路的场景是「彻底重查」和冷启动首连，那时候多等两秒
+    /// 也远好过判失败再重来一轮。
     func probeDomain() async -> (base: String, health: HealthInfo)? {
         let base = await MainActor.run { settings.domainBase }
         guard let base = base else { return nil }
-        if let h = await probeHealth(base, timeout: 8.0, session: session) {
+        if let h = await probeHealth(base, timeout: 12.0, session: session) {
             await MainActor.run {
                 if settings.lastPubBase != base { settings.lastPubBase = base }
                 // 2026-10-31：如果中转站上报了自己的内网地址，就学进来。
@@ -428,7 +509,11 @@ final class RelayClient {
         let hit = await withTaskGroup(of: (Int, String)?.self) { group -> (Int, String)? in
             if tryLan {
                 group.addTask {
-                    let alive = await probeHealth(lan, timeout: 0.9, session: lanS) != nil
+                    // 2026-11-04 修：这里原来写死 0.9 秒，和 probeLAN 是同一个毛病 ——
+                    // 缓存的地址可能是 ZeroTier 的（实测往返 182ms、抖动到 1.5s），
+                    // 0.9 秒一样会误判成"不通"，然后白走一遍全套探测。
+                    let t = Self.lanProbeTimeout(for: URL(string: lan)?.host ?? lan)
+                    let alive = await probeHealth(lan, timeout: t, session: lanS) != nil
                     return alive ? (0, lan) : nil
                 }
             }

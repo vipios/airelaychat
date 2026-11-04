@@ -1,4 +1,6 @@
 import SwiftUI
+import UIKit
+import Combine   // .onReceive + NotificationCenter.publisher（网络变化时自动刷新设备状态）
 
 // MARK: - 设置
 
@@ -14,6 +16,8 @@ struct SettingsView: View {
     @State private var loadingModels = false
     @State private var gistResult: String?
     @State private var gistLoading = false
+    /// 2026-11-03：刚复制了哪个地址（点了变绿勾，1.5 秒后还原）
+    @State private var copiedHint: String?
     @State private var editing: Provider?
 
     // 重启路由器
@@ -65,13 +69,18 @@ struct SettingsView: View {
                 }
 
                 Form {
+                    // 2026-11-03 按用户截图要求重排：
+                    //  · 「路由器状态」（已运行 / 可用内存 / 负载 / 交换区）提到最上面
+                    //    —— 这是打开设置第一眼最想确认的东西：路由器还活着吗、内存够不够；
+                    //  · 「公网地址 + Gist」从最底下搬到模型区块后面（原来是「备用模型」
+                    //    的位置），因为它是出问题时第一个要查的东西，埋在最后要滚很久。
+                    deviceSection
                     providerSection
                     currentLinkSection
                     modelSection
+                    publicSection
                     styleSection
                     connectionSection
-                    deviceSection
-                    publicSection
                     aboutSection
                 }
                 // 2026-11-01 用户：「所有的按键加一个震动反馈」。
@@ -131,6 +140,28 @@ struct SettingsView: View {
             }
             .task { await refreshModels() }
             .task { await loadDevice() }
+            // ⚠️ 2026-11-04 修（用户：「点关闭 wifi 还是不自动刷新 ip，
+            //    手动点击刷新后还是失败」）。
+            //
+            // 原来只有上面那条 `.task { await loadDevice() }` ——
+            // 它只在视图**第一次出现**时跑一次。之后无论 WiFi 开关、换网、
+            // 开/关 ZeroTier，这块面板都不会自己动。
+            //
+            // 用户的实际操作是：开着面板 → 关掉 WiFi → 等地址变
+            //   → 界面上还是老地址、还是"未连上" → 只能手动点刷新
+            //   → 而手动刷新走的是 `store.bootstrap()`，它更新的是聊天用的
+            //     base，面板显示要的 `loadDevice()` 未必跟着重跑，
+            //     所以经常"点了也没用"。
+            //
+            // 现在挂网络监听：WiFi 一连一断就自动重判 + 重新取设备状态，
+            // 用户不用再手动点，地址会自己变。
+            .onReceive(NotificationCenter.default.publisher(
+                for: .networkPathChanged)) { _ in
+                Task {
+                    await store.bootstrap(loadModels: false)
+                    await loadDevice()
+                }
+            }
         }
     }
 
@@ -476,9 +507,34 @@ struct SettingsView: View {
                     .font(.system(size: 13)).foregroundStyle(.secondary)
             } else {
                 ForEach(settings.publicAddrs, id: \.self) { ip in
-                    Text(ip)
-                        .font(.system(size: 12, design: .monospaced))
-                        .textSelection(.enabled)
+                    // 2026-11-03：地址本身可点复制。以前只能选中拖蓝再复制，
+                    // 手机上拖 IPv6 那种带很多冒号的长串很难选干净。
+                    Button {
+                        UIPasteboard.general.string = ip
+                        copiedHint = ip
+                        // 1.5 秒后把绿勾还原成复制图标。
+                        // 用 Task + sleep 而不是 DispatchQueue：这个 View 可能被
+                        // 快速切走，Task 会跟着 view 生命周期一起取消。
+                        Task {
+                            try? await Task.sleep(nanoseconds: 1_500_000_000)
+                            if copiedHint == ip { copiedHint = nil }
+                        }
+                    } label: {
+                        HStack(alignment: .top, spacing: 8) {
+                            Text(ip)
+                                .font(.system(size: 12, design: .monospaced))
+                                .foregroundStyle(.primary)
+                                .multilineTextAlignment(.leading)
+                            Spacer(minLength: 0)
+                            Image(systemName: copiedHint == ip
+                                  ? "checkmark.circle.fill" : "doc.on.doc")
+                                .font(.system(size: 12))
+                                .foregroundStyle(copiedHint == ip ? Color.green : Color.secondary)
+                        }
+                        .contentShape(Rectangle())
+                    }
+                    .buttonStyle(.plain)
+                    .textSelection(.enabled)
                 }
             }
             HStack {
@@ -506,7 +562,7 @@ struct SettingsView: View {
         } header: {
             Text("公网地址")
         } footer: {
-            Text("路由器的 IPv6 前缀可能被运营商换掉。它每 5 分钟把最新地址写进 Gist，连不上时软件会自动去拉。")
+            Text("路由器的 IPv6 前缀可能被运营商换掉。它每 5 分钟把最新地址写进 Gist，连不上时软件会自动去拉。\n\n第一个地址带 ::1 的是路由器自己的固定地址，第二个是它当前的上网地址。点一下就能复制。")
         }
     }
 
@@ -665,9 +721,9 @@ struct SettingsView: View {
                     .foregroundStyle(waitingBack ? Color.secondary : Color.red)
             }
         } header: {
-            Text("设备")
+            Text("路由器状态与重启")
         } footer: {
-            Text("重启指令直接发给路由器，**不经过中转站** —— 中转站卡死、打不开后台的时候照样能重启。\n重启后约 40 秒自动恢复，App 会自己重新连上。")
+            Text("「重启中转站（不断网）」只重启 relay.py，1 秒生效，日常优先用这个；「重启路由器」会断网约 40 秒，只在服务重启后仍然卡死时才需要。\n\n重启指令直接发给路由器，不经过中转站 —— 中转站卡死、打不开后台的时候照样能重启。\n\n看数字的方法：可用内存低于 3MB、负载超过 8、交换区到 95% 会标红。交换区长期 80% 以上说明中转站把内存吃满了（这台只有 116MB），表现是后台打开慢、聊天首字慢，重启中转站服务就能放出来。")
         }
     }
 

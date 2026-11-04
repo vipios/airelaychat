@@ -36,6 +36,13 @@ struct AIRelayChatApp: App {
                     // 走到这里说明 WiFi 连上/断开、或者换了网 —— 立刻重新判定。
                     // 用户要的就是"连 WiFi 自动在家、断 WiFi 自动在外面"，
                     // 光靠切前台触发不够：手机在兜里走动时也可能切网。
+                    //
+                    // 2026-11-04：除了自己重连，再广播一条通知。
+                    // 设置页那块「路由器状态与重启」面板要跟着刷新地址和设备状态
+                    // （用户：「点关闭 wifi 还是不自动刷新 ip」）。
+                    // 用通知而不是让它自己再起一个 NWPathMonitor：多一个监听器
+                    // 就多一份耗电，而根层这个本来就已经在跑了，顺手带一脚最省。
+                    NotificationCenter.default.post(name: .networkPathChanged, object: nil)
                     Task { await store.refreshIfNeeded() }
                 })
                 // 深色模式下顶部状态文字要看清
@@ -45,6 +52,15 @@ struct AIRelayChatApp: App {
 }
 
 // MARK: - 网络变化监听
+
+extension Notification.Name {
+    /// 网络路径变了（WiFi 连上/断开/换网）。
+    ///
+    /// 2026-11-04 加：根层的 NWPathMonitor 探测到变化后广播这一条，
+    /// 让其它页面（比如设置页的「路由器状态与重启」）能跟着刷新，
+    /// 而不必各自再起一个监听器。多一个 NWPathMonitor 就多一份常驻耗电。
+    static let networkPathChanged = Notification.Name("airelay.networkPathChanged")
+}
 
 /// 监听默认路由的变化。WiFi 断开、连上、换网都会触发。
 /// 用它而不是"每 N 秒轮询"：不耗电，也不会在没变化时瞎重连。
