@@ -17,6 +17,11 @@ jobs:
     runs-on: macos-15
     timeout-minutes: 30
 
+    # 发 Release 需要写权限。默认 GITHUB_TOKEN 是只读的，
+    # 少了这一段会在创建 release 那步报 403。
+    permissions:
+      contents: write
+
     steps:
       - name: 拉取代码
         uses: actions/checkout@v4
@@ -127,3 +132,35 @@ jobs:
           name: AIRelayChat-ipa
           path: AIRelayChat.ipa
           retention-days: 90
+
+      # ---- 发布滚动 Release（固定 tag "latest"）----
+      #
+      # 2026-11-04 加。用户问「之前怎么能直接刷新到更新」——
+      # 因为 TrollStore / 巨魔那类安装器是**轮询一个固定下载地址**来判断有没有新版，
+      # 而不是读 artifact。TrollAgent 一直这么做（tag 固定为 latest），
+      # 所以它每次推完代码，手机上打开 TrollStore 就能看到「有新版本」。
+      #
+      # 这个聊天 App 之前只有 upload-artifact：artifact 是 CI 内部产物，
+      # 90 天后过期，安装器根本不知道它存在 —— 手机自然永远刷不出更新。
+      # 现在补上同样的发布步骤，地址变成固定的：
+      #   https://github.com/vipios/airelaychat/releases/download/latest/AIRelayChat.ipa
+      #
+      # 为什么每次先删再建：Release 的 tag 不能复用同名附件，
+      # 用 --clobber 也可以，但删掉重建更干净（旧附件不会越积越多）。
+      - name: 发布 latest Release（供 TrollStore 自动更新）
+        if: success()
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          VER=$(/usr/libexec/PlistBuddy -c "Print CFBundleShortVersionString" \
+                build/Build/Products/Release-iphoneos/AIRelayChat.app/Info.plist)
+          echo "版本：$VER"
+          gh release delete latest --yes --cleanup-tag 2>/dev/null || true
+          gh release create latest AIRelayChat.ipa \
+            --title "AIRelayChat latest (v$VER)" \
+            --notes "滚动构建（main 分支最新）。供 TrollStore / 巨魔自动更新使用。
+
+          - 版本：$VER
+          - 未签名，TrollStore 直接装，或用证书自签
+          - 下载：https://github.com/${GITHUB_REPOSITORY}/releases/download/latest/AIRelayChat.ipa" \
+            || gh release upload latest AIRelayChat.ipa --clobber
